@@ -1,7 +1,4 @@
-// Shared client for POST /settings/tts/preview, used by VoicePreviewButton and
-// VoicePicker so both audition through the same request shape. The endpoint
-// bypasses the on-air persona AND the silent engine fallback, so an unavailable
-// engine returns a real error rather than quietly playing Piper. No React, no DOM.
+// Previews bypass persona selection and silent engine fallback, returning an error for unavailable engines.
 import type { AdminAuth } from '../../../lib/adminAuth';
 import { AdminResponseError, adminResponse } from '../../../lib/admin-query';
 
@@ -21,6 +18,7 @@ export interface PreviewParams {
   // Free-text on-air language ("Turkish", "Türkçe"); the server renders the sample
   // sentence in it, falling back to English when it doesn't recognize it.
   language?: string;
+  voiceStyle?: string;
   // Explicit sample text, overriding both the default sentence and the
   // language-localized one. Truncated server-side at PREVIEW_TEXT_MAX (200).
   text?: string;

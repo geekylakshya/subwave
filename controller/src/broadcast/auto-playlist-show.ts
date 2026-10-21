@@ -1,12 +1,8 @@
-// Which show the auto.m3u fallback was built for (#1111). The scheduler stamps
-// this identity and compares it at every show boundary, so a show change
-// between refresh ticks rebuilds instead of coasting on the outgoing show.
-//
-// The key covers every field the pool build reads, not just the show id —
-// editing the live show's pinned playlist or era window changes what the
-// fallback should contain. Lists are sorted, so re-ordering never rebuilds.
+// Stamp the show fields used to build auto.m3u so boundaries and edits trigger a refresh. Sort
+// lists so reordering alone does not rebuild. #1111.
 
 export interface AutoPlaylistShow {
+  preparationIdentity?: string;
   id?: unknown;
   name?: unknown;
   genres?: unknown;
@@ -17,6 +13,7 @@ export interface AutoPlaylistShow {
   filtersStrict?: unknown;
   playlistIds?: unknown;
   playlistStrict?: unknown;
+  playlistExhaust?: unknown;
   excludedPlaylistIds?: unknown;
   maxTrackSeconds?: unknown;
   minTrackLengthSeconds?: unknown;
@@ -39,6 +36,7 @@ const eras = (v: unknown): string[] =>
 export function autoPlaylistShowKey(show: AutoPlaylistShow | null | undefined): string {
   if (!show) return 'default';
   return JSON.stringify({
+    preparationIdentity: show.preparationIdentity ?? '',
     id: typeof show.id === 'string' ? show.id : '',
     genres: strings(show.genres),
     eras: eras(show.eras),
@@ -48,6 +46,8 @@ export function autoPlaylistShowKey(show: AutoPlaylistShow | null | undefined): 
     filtersStrict: show.filtersStrict === true,
     playlistIds: strings(show.playlistIds),
     playlistStrict: show.playlistStrict === true,
+    // A full rotation's coast is its longest-waiting tracks, not a sample (#1919).
+    playlistExhaust: show.playlistExhaust === true,
     excludedPlaylistIds: strings(show.excludedPlaylistIds),
     maxTrackSeconds: typeof show.maxTrackSeconds === 'number' ? show.maxTrackSeconds : null,
     // Changes WHICH tracks the fallback may contain (#1573), so it rebuilds.
@@ -64,14 +64,8 @@ export function autoPlaylistShowLabel(show: AutoPlaylistShow | null | undefined)
 }
 
 /**
- * Tracks which show identity the file on disk was built for. Ordering is the
- * whole point:
- *   - `built(show)` is stamped only at the end of a refresh that LANDED; a
- *     refresh that threw must not stamp, so the next boundary retries.
- *   - `claim(show)` is taken before awaiting an in-flight rebuild so two
- *     boundaries in the same second don't both fan out Navidrome queries; it
- *     returns a rollback for the rebuild that fails.
- *   - initial `null` reads as "needs a rebuild".
+ * Stamp built only after a successful refresh. claim prevents concurrent rebuilds and provides
+ * rollback; initial null requires a rebuild.
  */
 export function createShowBuildTracker() {
   let builtFor: string | null = null;

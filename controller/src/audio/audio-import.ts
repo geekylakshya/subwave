@@ -1,9 +1,5 @@
-// Shared helpers for operator-imported audio (jingles + sound effects).
-// Imports go through ffmpeg so the library stays uniform with the generated
-// assets (jingles WAV, effects MP3); ffmpeg also validates the upload by exiting
-// non-zero on undecodable audio. Without ffmpeg (a bare-host dev box) the raw
-// bytes are stored under their original extension instead; preview routes pick
-// the content type off the extension either way.
+// ffmpeg validates and normalizes uploads to WAV jingles or MP3 effects.
+// Without ffmpeg, preserve raw bytes and their original extension for previews.
 
 import { spawn } from 'node:child_process';
 import { writeFile, mkdir, unlink } from 'node:fs/promises';
@@ -116,7 +112,8 @@ function runFfmpeg(args: string[]): Promise<void> {
 // piped) so seek-dependent containers like m4a/mp4 decode correctly. `loudnorm`
 // is EBU R128 levelling, on for speech-length jingles and off for short
 // transient effects where one-pass loudnorm under 2s is unreliable.
-// `sampleRate`/`channels` pin the output shape.
+// `sampleRate`/`channels` pin the output shape. With loudnorm, set sampleRate:
+// its dynamic mode upsamples to 192 kHz, including the output unless -ar is set.
 export async function transcodeAudio(
   input: Buffer,
   { outPath, format, loudnorm = false, atempo, sampleRate, channels }: {

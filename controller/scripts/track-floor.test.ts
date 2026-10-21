@@ -17,14 +17,15 @@
 // Run: npm test -- track-floor
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { coldLoadSettings } from './test-utils/settings.js';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 // STATE_DIR is redirected at a throwaway dir BEFORE the first import of
 // anything config-derived.
-const stateRoot = mkdtempSync(path.join(tmpdir(), 'subwave-track-floor-'));
+const stateRoot = createTempDir(path.join(tmpdir(), 'subwave-track-floor-'));
 process.env.STATE_DIR = stateRoot;
 
 const { applyTrackFloor, belowTrackFloor, trackLengthSeconds } =
@@ -36,14 +37,8 @@ const { PICKER_MIN_TRACK_LENGTH_BOUNDS } = await import('../src/schemas/settings
 const { SHOW_MIN_TRACK_LENGTH_MAX } = await import('../src/schemas/show.js');
 const { durationSeconds } = await import('../src/music/recency.js');
 
-const SETTINGS_PATH = path.join(stateRoot, 'settings.json');
 
-async function coldLoad(stored: Record<string, unknown>) {
-  writeFileSync(SETTINGS_PATH, JSON.stringify(stored));
-  setCache(null);
-  await settings.load();
-  return settings.get();
-}
+async function coldLoad(stored: Record<string, unknown>) { return (await coldLoadSettings(stored)); }
 
 // ── the pure policy ────────────────────────────────────────────────────────
 

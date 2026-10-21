@@ -5,17 +5,18 @@
 import * as settings from '../../settings.js';
 import { defineAgent } from '../../llm/agent.js';
 import { buildPickerTools, type PickerScope } from '../../llm/tools.js';
-import { pickSchema, pickSystem, requestSchema, requestSystem } from './schemas.js';
+import { agenticDiscoverySchema, pickSystem, requestSchema, requestSystem } from './schemas.js';
 import { agentDeadline } from './breaker.js';
 import type { Persona } from '../queue/types.js';
 
-// What pickViaAgent hands the picker each run. `scope` is the whole constraint
+// What pickViaSelectionRoute hands the picker each run. `scope` is the whole constraint
 // set as ONE value, passed through to the discovery tools untouched. Do not
 // unpack it into per-field keys: a lock named in one list and forgotten in
 // another silently stops being enforced on the agent path while the pool
 // picker still honours it. See llm/internal/tools/picker/scope.ts.
 export interface PickerRunArgs {
   scope: PickerScope;
+  editorial?: string;
   // Forecast air time for the pick's link, prompt only — not a discovery
   // constraint, so it stays outside the scope.
   showAt?: Date | null;
@@ -37,7 +38,7 @@ export const pickerAgent = defineAgent<PickerRunArgs, PickerExtras>({
   kind: 'djAgentPick',
   // Function form: resolved per run so the transition coaching follows the
   // on-air persona's djMode and the say length its scriptLength.
-  schema: () => pickSchema(),
+  schema: () => agenticDiscoverySchema(),
   // Advisory floor only — on the done-tool path the cap is DERIVED per provider
   // (gatedMaxStepsFor in provider/capabilities.ts), so this reaches the model
   // only as the Math.max floor on the native leg.
@@ -46,7 +47,12 @@ export const pickerAgent = defineAgent<PickerRunArgs, PickerExtras>({
   // since a caller's pinned step cap can be load-bearing.
   providerDiscoveryBudget: true,
   timeoutMs: agentDeadline,
-  buildSystem: ({ showAt, scope }) => pickSystem(showAt ?? null, !!scope?.playlistTracks?.length),
+  // Discovery deliberately has no Musical Leanings. They are applied exactly
+  // once by the constrained final selector after this tool loop has surfaced
+  // its real candidate set.
+  buildSystem: ({ showAt, scope, editorial }) => pickSystem(showAt ?? null, !!scope?.playlistTracks?.length, false, { host: null, guest: null, promptValue: null })
+    + (scope.episodeSource ? '\nLead with episodeArtistTracks; choose only the prepared artist catalogue.' : '')
+    + (editorial ?? ''),
   buildTools: ({ scope }) => {
     const { tools, seen } = buildPickerTools(scope);
     return { tools, extras: { seen } };
@@ -79,4 +85,3 @@ export const requestAgent = defineAgent<RequestRunArgs, PickerExtras>({
   // Same native-path acceptance as pickerAgent.
   validateObject: (object, extras) => !!(object?.id && extras?.seen?.has(object.id)),
 });
-

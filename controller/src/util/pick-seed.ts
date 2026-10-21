@@ -1,12 +1,5 @@
-// The seed-vs-pick rule, plus classification of an agent pick whose id no tool
-// surfaced (#1247). Every pick event hands the agent the ON-AIR track's id to
-// seed discovery, and the tools exclude it from their results, so it is the one
-// well-formed id in context that no tool returned — the most available wrong
-// answer when a model is cornered.
-//
-// Policy chokepoint: the clause below is the ONE wording, shared by the
-// pick/request schema field descriptions and the empty-tool-result rule the
-// model sees. Never inline a second copy.
+// The on-air seed is excluded from tool results and cannot be the next pick (#1247).
+// Share this wording across pick/request schemas and empty-result rules.
 export const SEED_NOT_A_PICK_CLAUSE =
   'The track already playing is only the SEED you pass to the discovery tools — its id is never a valid answer, even when a tool comes back empty.';
 
@@ -23,10 +16,29 @@ export interface PickFailure {
 }
 
 export function classifyPickFailure(
-  { pickedId, seedId, candidates, toolCalls }:
-  { pickedId: string | null; seedId: string | null; candidates: number; toolCalls: number },
+  { pickedId, seedId, candidates, toolCalls, shortlist }:
+  {
+    pickedId: string | null; seedId: string | null; candidates: number; toolCalls: number;
+    // Present on the Track Shortlist route, where the controller runs the
+    // sources and an empty list means no model was asked at all. `returned` is
+    // what the sources handed back before the show's filters.
+    shortlist?: { returned: number };
+  },
 ): PickFailure {
   const echoed = !!pickedId && !!seedId && pickedId === seedId;
+
+  // The Shortlist runs its own sources, so neither agent message fits: there
+  // was no answer to mismatch and no model failing to call tools. Name what
+  // actually emptied the list, so a thin show reads as a library question.
+  if (shortlist && candidates === 0) {
+    return {
+      kind: 'no-candidates',
+      message: shortlist.returned > 0
+        ? `Track Shortlist had nothing to choose from: ${toolCalls} source run(s) returned ${shortlist.returned} track(s) and none passed this show's filters (genre/era locks, track length, recent plays, blocklist), so no model was asked`
+        : `Track Shortlist had nothing to choose from: ${toolCalls} source run(s) returned no tracks for this show, so no model was asked`,
+      countsAgainstBreaker: false,
+    };
+  }
 
   // `toolCalls` counts real discovery calls (the synthetic `done` is excluded),
   // so zero means the model never explored: a harness failure, not a coverage

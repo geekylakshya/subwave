@@ -8,6 +8,8 @@ import * as llmProvider from '../../llm/provider.js';
 import { probeEmbeddingConfig } from '../../music/embeddings.js';
 import { requireAdmin } from '../../middleware/auth.js';
 import { SECRET_ENV_KEYS } from '../../setup/secrets.js';
+import { applyCustomHeadersPatch } from '../../settings/vocab.js';
+import type { EmbeddingCfg } from '../../llm/provider.js';
 import { listenbrainzApiBase } from '../../broadcast/scrobble.js';
 import { generateText, createGateway } from 'ai';
 import { createAnthropic } from '@ai-sdk/anthropic';
@@ -16,7 +18,8 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createDeepSeek } from '@ai-sdk/deepseek';
 import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import { fetchWithTimeout } from '../../util/fetch-timeout.js';
-import { probeFishKey } from '../../llm/speech.js';
+import { elevenLabsTtsModelIds, probeFishKey } from '../../llm/speech.js';
+import { elevenLabsKey } from '../../audio/elevenlabs.js';
 
 // Mounted onto the parent settings router in ../settings.ts.
 export const router = express.Router();
@@ -319,7 +322,7 @@ router.post('/settings/llm/probe-compat', requireAdmin, async (req, res) => {
       maxOutputTokens: 32,
       abortSignal: AbortSignal.timeout(15000),
     });
-    res.json({ ok: true, message: '✓ Bearer token accepted · model responded', latencyMs: Date.now() - t0 });
+    res.json({ ok: true, message: '✓ Model responded', latencyMs: Date.now() - t0 });
   } catch (err: unknown) {
     res.json({ ok: false, message: briefLlmError(err), latencyMs: Date.now() - t0 });
   }
@@ -378,6 +381,13 @@ router.get('/settings/llm/models', requireAdmin, async (req, res) => {
         const apiKey = settings.llmKeyFor(provider);
         const headers: Record<string, string> = {};
         if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+        const saved = settings.get().llm;
+        const fallback = saved?.fallback;
+        const isFallback = fallback?.provider === provider && fallback?.baseUrl === url;
+        const configured = isFallback ? fallback?.headers : saved?.headers;
+        if ((isFallback || (saved?.provider === provider && saved?.baseUrl === url)) && configured) {
+          Object.assign(headers, llmProvider.customHeaders({ headers: configured }));
+        }
         const r = await fetch(`${url}/models`, { signal: ctrl.signal, headers });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = (await r.json()) as { data?: unknown };
@@ -462,6 +472,22 @@ router.get('/settings/llm/models', requireAdmin, async (req, res) => {
         break;
       }
 
+      // Cloud TTS only: the model field under Settings → TTS.
+      case 'elevenlabs': {
+        // Same resolution as voice discovery and speech: a key saved in
+        // Settings counts when ElevenLabs is the cloud provider, else the env.
+        await settings.load();
+        const apiKey = elevenLabsKey().trim();
+        if (!apiKey) throw new Error('ElevenLabs API key not set');
+        const r = await fetch('https://api.elevenlabs.io/v1/models', {
+          signal: ctrl.signal,
+          headers: { 'xi-api-key': apiKey },
+        });
+        if (!r.ok) throw new Error(`ElevenLabs HTTP ${r.status}`);
+        models = elevenLabsTtsModelIds(await r.json());
+        break;
+      }
+
       case 'openrouter': {
         const url = scope === 'embedding'
           ? 'https://openrouter.ai/api/v1/models?output_modalities=embeddings'
@@ -535,10 +561,20 @@ router.get('/settings/llm/models', requireAdmin, async (req, res) => {
 // query params so the bearer token never rides a URL access logs capture.
 // Always 200s with { ok, dim, code, message }.
 router.post('/settings/embedding/probe', requireAdmin, async (req, res) => {
-  const overrides: Record<string, string> = {};
-  for (const k of ['provider', 'model', 'baseUrl', 'ollamaUrl', 'apiKey']) {
+  const overrides: Partial<EmbeddingCfg> = {};
+  for (const k of ['provider', 'model', 'baseUrl', 'ollamaUrl', 'apiKey'] as const) {
     const v = (req.body || {})[k];
     if (typeof v === 'string' && v.trim()) overrides[k] = v.trim();
+  }
+  if ((req.body || {}).headers !== undefined) {
+    try {
+      const saved = settings.get().embedding?.headers || {};
+      // An empty map inherits the chat leg's headers only when the probe
+      // targets the same service — resolveEmbeddingCfg owns that rule.
+      overrides.headers = applyCustomHeadersPatch(saved, req.body.headers, 'embedding');
+    } catch (err: unknown) {
+      return res.json({ ok: false, dim: null, code: 'invalid', message: (err as Error).message });
+    }
   }
   try {
     const r = await probeEmbeddingConfig(overrides);
@@ -554,5 +590,3 @@ router.post('/settings/embedding/probe', requireAdmin, async (req, res) => {
     res.json({ ok: false, dim: null, code: 'unknown', message: (err as { message?: string })?.message || 'probe failed' });
   }
 });
-
-

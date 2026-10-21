@@ -4,6 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import type { RequestEnvelope } from 'ask-sdk-model';
 
 process.env.STATE_DIR = mkdtempSync(join(tmpdir(), 'subwave-alexa-'));
 process.env.SITE_URL = 'https://radio.example';
@@ -19,7 +20,7 @@ const skillId = 'amzn1.ask.skill.4e261dd3-03ee-4139-8e6c-8d89d7f09355';
 function envelope(
   request: Record<string, unknown>,
   applicationId = skillId,
-): Record<string, unknown> {
+): RequestEnvelope {
   return {
     version: '1.0',
     session: {
@@ -32,12 +33,12 @@ function envelope(
       System: {
         application: { applicationId },
         user: { userId: 'amzn1.ask.account.test' },
-        device: { supportedInterfaces: { AudioPlayer: {} } },
+        device: { deviceId: 'amzn1.ask.device.test', supportedInterfaces: { AudioPlayer: {} } },
         apiEndpoint: 'https://api.amazonalexa.com',
       },
     },
     request,
-  };
+  } as unknown as RequestEnvelope;
 }
 
 function launch() {
@@ -215,7 +216,7 @@ test('the connection test parses an unsaved enabled draft before the global JSON
     await settings.update({ alexa: { enabled: false, skillId } });
     const address = server.address();
     assert.ok(address && typeof address === 'object');
-    const auth = process.env.ADMIN_USER && process.env.ADMIN_PASS
+    const auth: Record<string, string> = process.env.ADMIN_USER && process.env.ADMIN_PASS
       ? { authorization: `Basic ${Buffer.from(`${process.env.ADMIN_USER}:${process.env.ADMIN_PASS}`).toString('base64')}` }
       : {};
     const response = await originalFetch(`http://127.0.0.1:${address.port}/alexa/connection/test`, {
@@ -236,7 +237,7 @@ test('the connection test parses an unsaved enabled draft before the global JSON
 
 test('Alexa connection test accepts a reachable unsigned webhook probe', async () => {
   const calls: string[] = [];
-  let webhookBody: Record<string, any> | null = null;
+  let webhookBody: any = null;
   const result = await testAlexaConnection({
     ...runtime,
     getSettings: () => ({ ...runtime.getSettings(), listenerAuth: false }),
@@ -307,7 +308,7 @@ test('Alexa connection test defers the first webhook probe until the skill is sa
 });
 
 test('Alexa connection test validates the unsaved draft instead of saved settings', async () => {
-  let webhookBody: Record<string, any> | null = null;
+  let webhookBody: any = null;
   const result = await testAlexaConnection({
     ...runtime,
     getSettings: () => ({ ...runtime.getSettings(), skillId: 'amzn1.ask.skill.11111111-1111-4111-8111-111111111111' }),

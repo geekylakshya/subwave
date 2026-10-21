@@ -1,8 +1,10 @@
 'use client';
 
+import { preparationStatusSchema } from '@/lib/schemas.generated';
+import { z } from 'zod';
 import type { QueryClient } from '@tanstack/react-query';
 import { adminJson, type AdminFetch } from '@/lib/admin-query';
-import { useAdminQuery } from '@/lib/admin-query';
+import { useAdminMutation, useAdminQuery } from '@/lib/admin-query';
 import { settingsKeys } from '../settings/queries';
 import type {
   CommunityShow,
@@ -28,7 +30,9 @@ export const showKeys = {
   genres: () => ['shows', 'genres'] as const,
   playlists: () => ['shows', 'playlists'] as const,
   community: () => ['shows', 'community'] as const,
+  preparation: () => ['shows', 'preparation'] as const,
   blocklist: () => ['shows', 'blocklist'] as const,
+  playlistPosition: (showId: string) => ['shows', 'playlist-position', showId] as const,
 };
 
 export function patchShowSettings(
@@ -144,4 +148,61 @@ export async function fetchShowCandidates(
   const body = await response.json().catch(() => ({})) as CandidateDiagnostic & { error?: string };
   if (!response.ok) throw new Error(body.error || `failed (${response.status})`);
   return body;
+}
+
+export type PreparationStatus = z.output<typeof preparationStatusSchema>;
+export function useShowPreparationQuery(adminFetch: AdminFetch, enabled: boolean) {
+  return useAdminQuery<PreparationStatus>({
+    key: showKeys.preparation(), adminFetch, enabled, refetchInterval: 5000,
+    request: async (fetcher, signal) => {
+      const body = await adminJson<{ status: unknown }>(fetcher, '/dj/show-preparation', undefined, signal);
+      return preparationStatusSchema.parse(body.status);
+    }, toastOnError: false,
+  });
+}
+export function useRetryShowPreparation(adminFetch: AdminFetch) {
+  return useAdminMutation<PreparationStatus, void>({
+    adminFetch,
+    request: async (_vars, fetcher) => {
+      const body = await adminJson<{ status: unknown }>(fetcher, '/dj/show-preparation/retry', { method: 'POST' });
+      return preparationStatusSchema.parse(body.status);
+    },
+    onDone: (status, _vars, client) => { client.setQueryData(showKeys.preparation(), status); },
+  });
+}
+
+/** Play in order: where a saved show's walk through its playlist stands. */
+export interface PlaylistPosition {
+  /** The SAVED show plays in order. False while the switch is only on in the draft. */
+  inOrder: boolean;
+  /** The track its next in-order pick would choose; index is 0-based. */
+  next: { index: number; total: number; title: string | null; artist: string | null } | null;
+  /** Why there is no next track (anchor unresolved, everything filtered out…). */
+  reason?: string;
+}
+
+export function usePlaylistPositionQuery(adminFetch: AdminFetch, showId: string, enabled: boolean) {
+  return useAdminQuery<PlaylistPosition>({
+    key: showKeys.playlistPosition(showId),
+    adminFetch,
+    enabled,
+    refetchInterval: 5000,
+    request: (fetcher, signal) => adminJson<PlaylistPosition>(
+      fetcher, `/shows/${encodeURIComponent(showId)}/playlist-position`, undefined, signal,
+    ),
+    toastOnError: false,
+  });
+}
+
+/** Back to the top: the show's next in-order pick is track 1. */
+export function useResetPlaylistPositionMutation(adminFetch: AdminFetch) {
+  return useAdminMutation<{ ok: boolean }, string>({
+    adminFetch,
+    request: (showId, fetcher) => adminJson<{ ok: boolean }>(
+      fetcher, `/shows/${encodeURIComponent(showId)}/playlist-position`, { method: 'DELETE' },
+    ),
+    onDone: async (_data, showId, client) => {
+      await client.invalidateQueries({ queryKey: showKeys.playlistPosition(showId), exact: true });
+    },
+  });
 }

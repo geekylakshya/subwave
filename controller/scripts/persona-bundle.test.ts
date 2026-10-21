@@ -20,7 +20,7 @@
 //    go through personas/install.ts, so the roster cap and the duplicate-name
 //    refusal cannot disagree between them.
 //  - An adopted filename is pinned to a CHARACTER CLASS. A jingle filename
-//    becomes a LINE of jingles.m3u, which Liquidsoap reloads on watch, so a
+//    becomes a LINE of jingles.m3u, which Liquidsoap reloads after every write, so a
 //    newline inside one adds a rotation entry nobody chose. A bundle is a file
 //    from another operator; an extension test is not a filename check.
 //  - A REFUSED import writes NOTHING — and "nothing" has to be checked against
@@ -36,13 +36,12 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
-  mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync,
-} from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const root = mkdtempSync(join(tmpdir(), 'subwave-persona-bundle-'));
+const root = createTempDir(join(tmpdir(), 'subwave-persona-bundle-'));
 process.env.STATE_DIR = root;
 // These would move the voice folder out from under the test.
 delete process.env.TTS_VOICE_DIR;
@@ -233,15 +232,7 @@ test('a persona whose clone sample is GONE is refused, not shipped mute', async 
 
 // ── Import ───────────────────────────────────────────────────────────────────
 
-test('re-importing the same DJ is refused by the SHARED duplicate-name rule', async () => {
-  const outcome = await applyPersonaBundle(exported);
-  assert.equal(outcome.ok, false);
-  assert.equal((outcome as any).status, 409);
-  assert.match((outcome as any).error, /already in the roster/);
-  // Refused BEFORE any audio landed — a refused import must not litter the
-  // state dirs with files the operator cannot see.
-  assert.deepEqual(readdirSync(VOICES).sort(), ['nova.wav']);
-});
+
 
 test('a station backup is named as such rather than refused generically', async () => {
   const zip = new AdmZip();
@@ -368,7 +359,7 @@ function bundleOf(
 
 test('a NEWLINE in a jingle member name is refused and writes nothing', async () => {
   // rewritePlaylist joins DIR + filename with '\n', and Liquidsoap reloads
-  // jingles.m3u on watch — so a name carrying its own newline used to append a
+  // jingles.m3u after every write — so a name carrying its own newline used to append a
   // second, attacker-chosen line to the station's rotation. The bundle is a
   // file the operator was handed by someone else; this is untrusted input.
   const before = stateSnapshot();
@@ -435,6 +426,7 @@ test('a duplicate name refuses without writing the audio that came with it', asy
   ));
   assert.equal(outcome.ok, false);
   assert.equal((outcome as any).status, 409);
+  assert.match((outcome as any).error, /already in the roster/);
   assert.equal(stateSnapshot(), before);
 });
 
@@ -486,4 +478,33 @@ test('a jingle text from the manifest is bounded like every operator string', as
   const sidecar = JSON.parse(readFileSync(join(root, 'jingles.json'), 'utf8'));
   const stored = (outcome as any).jingles[0];
   assert.equal(sidecar.items[stored].text.length, pure.JINGLE_TEXT_MAX);
+});
+
+test('persona.json and manifest.json are capped before they are inflated', async () => {
+  // Both are read into memory and parsed. Padding with whitespace keeps each
+  // one VALID JSON, so only the size cap can refuse it.
+  const pad = ' '.repeat(pure.MAX_BUNDLE_JSON_BYTES);
+  const before = stateSnapshot();
+
+  const fatPersona = new AdmZip(bundleOf({ name: 'Fat Persona' }));
+  fatPersona.updateFile('persona.json', Buffer.from(
+    fatPersona.getEntry('persona.json')!.getData().toString('utf8') + pad,
+  ));
+  const p = await applyPersonaBundle(fatPersona.toBuffer());
+  assert.equal(p.ok, false);
+  assert.match((p as any).error, /persona\.json is too large/);
+
+  const fatManifest = new AdmZip(bundleOf({ name: 'Fat Manifest' }));
+  fatManifest.updateFile('manifest.json', Buffer.from(
+    fatManifest.getEntry('manifest.json')!.getData().toString('utf8') + pad,
+  ));
+  const m = await applyPersonaBundle(fatManifest.toBuffer());
+  assert.equal(m.ok, false);
+  assert.match((m as any).error, /manifest\.json is too large/);
+  assert.equal(stateSnapshot(), before);
+
+  // The DECLARED size decides, so an over-cap member is never inflated at all.
+  const { readZipEntryCapped } = await import('../src/util/zip-entry.js');
+  const lying = { header: { size: pure.MAX_BUNDLE_JSON_BYTES + 1 }, getData: () => { throw new Error('inflated'); } };
+  assert.equal(readZipEntryCapped(lying as any, pure.MAX_BUNDLE_JSON_BYTES), null);
 });

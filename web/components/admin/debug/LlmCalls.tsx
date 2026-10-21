@@ -17,6 +17,34 @@ import { oneLine } from './format';
 import { CallSection, FilterChip, JsonBlock, JsonOrText } from './bits';
 import { mapChatRole } from './TtsPanels';
 import { debugKeys } from './queries';
+import BackupRouteNote from './BackupRouteNote';
+
+function callUsesMusicalLeanings(call: {
+  ok?: boolean;
+  kind?: string;
+  response?: string;
+  agentPickResolution?: { usedMusicalLeanings?: boolean };
+  shortlistResolution?: { usedMusicalLeanings?: boolean };
+}): boolean {
+  if (call.ok === false) return false;
+  const agentic = call.kind === 'djAgentPick' || call.kind === 'djAgentLeaningsReview';
+  const shortlist = call.kind === 'djShortlistPick' || call.kind === 'djShortlistRepick' || call.kind === 'djShortlistLeaningsReview';
+  if (!agentic && !shortlist) return false;
+  // Agentic influence is controller-derived after guards and enqueue. Never
+  // resurrect the old self-reported model flag from the raw response.
+  if (agentic) return call.agentPickResolution?.usedMusicalLeanings === true;
+  return call.shortlistResolution?.usedMusicalLeanings === true;
+}
+
+function isShortlistCall(kind?: string): boolean {
+  return kind === 'djShortlistPick' || kind === 'djShortlistRepick' || kind === 'djShortlistLeaningsReview';
+}
+
+function leaningsBadgeTitle(kind?: string): string {
+  return isShortlistCall(kind)
+    ? 'Track Shortlist: a separate Musical Leanings review changed the initial choice, and that exact replacement passed the guards and reached the queue'
+    : 'Agentic Tools: Musical Leanings changed the preliminary choice, and that exact replacement passed the guards and reached the queue';
+}
 
 function MessageList({ messages }: { messages: Array<{ role?: string; content?: unknown }> }) {
   return (
@@ -162,7 +190,12 @@ export function LlmCalls({ llm }: { llm: DebugLlm | undefined }) {
   return (
     <Card
       title="LLM recent calls"
-      sub={`${calls.length} calls · ${llm?.provider || '—'} / ${llm?.activeModel || '—'}`}
+      sub={
+        <>
+          {`${calls.length} calls · ${llm?.provider || '—'} / ${llm?.activeModel || '—'}`}
+          {llm?.routedToBackup ? <>{' '}<BackupRouteNote routing={llm.routedToBackup} /></> : null}
+        </>
+      }
       right={
         <div className="flex flex-wrap items-center justify-end gap-1">
           <FilterChip active={filter === 'all'} onClick={() => setFilter('all')}>
@@ -222,15 +255,24 @@ export function LlmCalls({ llm }: { llm: DebugLlm | undefined }) {
                 i === 0 && filter === 'all' ? 'bg-[var(--ink-softer)]' : 'bg-transparent',
               )}
             >
-              {/* minmax(0,1fr), not 1fr: an unbroken kind like `djAgentSegment` takes
-                  its min-content width and shoves the ms/clock cells off the card. */}
               <summary className="grid cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto_auto_auto] items-center gap-2 px-2.5 py-2 sm:gap-2.5">
                 <span className={cn('font-bold', c.ok ? 'text-vermilion' : 'text-[var(--danger)]')}>
                   {c.ok ? '✓' : '✗'}
                 </span>
-                <span className="truncate text-[12px] font-bold">{c.kind}</span>
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="truncate text-[12px] font-bold">{c.kind}</span>
+                  {callUsesMusicalLeanings(c) && (
+                    <span className="shrink-0 border border-vermilion/40 bg-vermilion/10 px-1 py-px text-[8px] font-bold tracking-[0.08em] text-vermilion" title={leaningsBadgeTitle(c.kind)}>
+                      LEANINGS
+                    </span>
+                  )}
+                </span>
                 <span className="caption text-[10px] whitespace-nowrap">
-                  {c.toolCalls?.length ? `🔧 ${c.toolCalls.length}` : ''}
+                  {c.toolCalls?.length
+                    ? isShortlistCall(c.kind)
+                      ? `◈ ${c.toolCalls.length}`
+                      : `🔧 ${c.toolCalls.length}`
+                    : ''}
                   {c.steps != null ? `${c.toolCalls?.length ? ' · ' : ''}${c.steps} steps` : ''}
                 </span>
                 <span className="mono-num text-[11px] text-muted">{c.ms}ms</span>
@@ -249,7 +291,6 @@ export function LlmCalls({ llm }: { llm: DebugLlm | undefined }) {
                 )}
                 {c.responseText && (
                   <CallSection label="model said instead" tone="err" preview={oneLine(c.responseText)}>
-                    {/* Model free text may contain markdown — the one MessageResponse call. */}
                     <MessageResponse className="whitespace-normal">
                       {c.responseText}
                     </MessageResponse>
@@ -283,6 +324,22 @@ export function LlmCalls({ llm }: { llm: DebugLlm | undefined }) {
                     <ToolList calls={c.toolCalls} />
                   </CallSection>
                 )}
+                {c.shortlistResolution?.final && (
+                  <CallSection
+                    label="verified selection"
+                    preview={[c.shortlistResolution.final.title, c.shortlistResolution.final.artist].filter(Boolean).join(' — ')}
+                  >
+                    <JsonBlock value={c.shortlistResolution} />
+                  </CallSection>
+                )}
+                {c.agentPickResolution?.final && (
+                  <CallSection
+                    label="verified selection"
+                    preview={[c.agentPickResolution.final.title, c.agentPickResolution.final.artist].filter(Boolean).join(' — ')}
+                  >
+                    <JsonBlock value={c.agentPickResolution} />
+                  </CallSection>
+                )}
                 {c.response && (
                   <CallSection label="response" preview={oneLine(c.response)}>
                     <JsonOrText text={c.response} />
@@ -296,4 +353,3 @@ export function LlmCalls({ llm }: { llm: DebugLlm | undefined }) {
     </Card>
   );
 }
-

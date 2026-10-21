@@ -2,22 +2,19 @@
 // showSpan (position of an hour inside a show's consecutive schedule run —
 // drives which hour gets which feature and when the outro fires) and
 // planFeature (per-hour feature lookup with last-feature reuse).
-// Run: `tsx scripts/programme.test.ts`.
+// Run: `npm test -- programme.test.ts` (a substring match, so session-cap-keeps-programme.test.ts runs too).
 //
 // node:assert-via-tsx style, matching scripts/auto-pool.test.ts.
 
 import assert from 'node:assert/strict';
+import { emptyWeek as emptyScheduleWeek } from '../src/schemas/schedule.js';
 import { showSpan, overrideSpan, planFeature, beatWindow } from '../src/broadcast/programme-pure.js';
 // The stride is REQUIRED by beatWindow — a default there would be a second copy
 // of the constant talk-scheduler.ts imports (#1576).
 import { HANDOVER_OFFSET_STEP_MINUTES as STRIDE } from '../src/schemas/settings.js';
 
 // A 7×24 grid with every slot null.
-function emptyWeek(): Record<number, (string | null)[]> {
-  const week: Record<number, (string | null)[]> = {};
-  for (let d = 0; d < 7; d++) week[d] = Array(24).fill(null);
-  return week;
-}
+function emptyWeek(): Record<number, (string | null)[]> { return emptyScheduleWeek(); }
 
 // ── showSpan ─────────────────────────────────────────────────────────────────
 
@@ -141,7 +138,7 @@ function emptyWeek(): Record<number, (string | null)[]> {
   for (const handover of [5, 10, 15, 20]) {
     for (let offset = 0; offset < 60; offset += 15) {
       for (const [start, kind] of [[35, 'feature'], [60 - handover, 'outro']] as const) {
-        const hits = [];
+        const hits: number[] = [];
         for (let p = 0; p < 60; p += 5) {
           const stationMin = (p + offset) % 60;
           const w = beatWindow(stationMin, handover, STRIDE);

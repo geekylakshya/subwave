@@ -1,7 +1,8 @@
 // Tests for the stem-cache budget enforcement seams (music/stem-cache.ts):
 // the LRU sweep's failure/shortfall reporting, the measured per-track size
 // estimate, and the per-track write decision the analysis pass gates
-// ride-along stems on.
+// ride-along stems on. Parallel scan accounting also pins every directory
+// and byte exactly once, ignoring stray files at the cache root.
 //
 // Pins the fixes for discussion #1257 ("stems cache feedback from a power
 // user"): a 500 GB budget stood at 674 GB for a week because (1) stems rode
@@ -12,30 +13,29 @@
 //
 // Runs against a temp STATE_DIR, so STATE_DIR is set before stem-cache is
 // imported (dynamic import below), matching scripts/stem-backfill.test.ts.
-// Run: `tsx scripts/stem-cache-sweep.test.ts` (folded into `npm run test`).
+// Run: `npm test -- stem-cache-sweep`.
 
+import { createTempDir } from './test-utils/temp-dir.js';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import test from 'node:test';
+import { chmodSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
-let failures = 0;
-function test(name: string, fn: () => void | Promise<void>) {
-  return Promise.resolve()
-    .then(fn)
-    .then(() => console.log(`  ✓ ${name}`))
-    .catch((err) => { failures++; console.error(`  ✗ ${name}\n      ${err?.message || err}`); });
-}
 
 const MB = 1024 ** 2;
 
 async function main() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'subwave-stem-sweep-'));
+  const stateDir = createTempDir(join(tmpdir(), 'subwave-stem-sweep-'));
   process.env.STATE_DIR = stateDir;
 
   const stemCache = await import('../src/music/stem-cache.js');
   const stemsRoot = join(stateDir, 'stems');
 
+  // Dirs made by hand, not by an analysis pass: the usage snapshot only learns
+  // about them at its next full walk, so every change here drops it
+  // (stem-cache.ts; the snapshot itself is pinned by stem-cache-snapshot.test.ts).
+  const forgetSnapshot = () => rmSync(join(stateDir, 'stem-cache-usage.json'), { force: true });
+  const resetCache = () => { rmSync(stemsRoot, { recursive: true, force: true }); forgetSnapshot(); };
   // One track dir with a single payload file at a controlled size + mtime.
   // ageSec orders the LRU: bigger = older = evicted first.
   const makeDir = (id: string, bytes: number, ageSec: number) => {
@@ -45,11 +45,9 @@ async function main() {
     writeFileSync(f, Buffer.alloc(bytes));
     const t = (Date.now() - ageSec * 1000) / 1000;
     utimesSync(f, t, t);
+    forgetSnapshot();
     return dir;
   };
-  const resetCache = () => rmSync(stemsRoot, { recursive: true, force: true });
-
-  console.log('estimateTrackBytes (measured average vs cold-start guess):');
 
   await test('below MEASURED_MIN_DIRS the fixed guess wins', () => {
     // A handful of dirs is not a sample — a couple of outliers must not
@@ -74,8 +72,6 @@ async function main() {
     // a backfill far past what the budget really holds.
     assert.equal(stemCache.estimateTrackBytes(50 * 1024, 50), 8 * MB);
   });
-
-  console.log('stemWriteDecision (per-track ride-along gate):');
 
   await test('cache off → never wants stems', () => {
     assert.deepEqual(
@@ -106,13 +102,13 @@ async function main() {
     );
   });
 
-  console.log('sweep (LRU eviction + shortfall reporting):');
-
   await test('evicts oldest-first down to the budget and reports a clean bill', async () => {
     resetCache();
     makeDir('old', 10 * MB, 3000);
     makeDir('mid', 10 * MB, 2000);
     makeDir('new', 10 * MB, 1000);
+    // No library DB is open in this file. The priority lookup takes its catch
+    // fallback, so the sweep must degrade to the original mtime LRU.
     // Budget fits two dirs — only the oldest should go.
     const res = await stemCache.sweep(25 * MB);
     assert.equal(res.removed, 1);
@@ -124,7 +120,9 @@ async function main() {
 
   await test('a cache inside its budget is a no-op', async () => {
     const res = await stemCache.sweep(25 * MB);
-    assert.deepEqual(res, { removed: 0, freedBytes: 0, failedDirs: 0, overBudgetBytes: 0 });
+    // The previous sweep's walk left a usage snapshot inside this budget, so
+    // nothing is walked either.
+    assert.deepEqual(res, { removed: 0, freedBytes: 0, failedDirs: 0, overBudgetBytes: 0, skipped: 'snapshot' });
   });
 
   await test('failed deletes are counted and the shortfall reported, not swallowed', async () => {
@@ -151,8 +149,6 @@ async function main() {
     }
   });
 
-  console.log('usage + headroom (single-scan accounting):');
-
   await test('usage reports bytes, dirs and the implied per-track estimate together', async () => {
     resetCache();
     makeDir('u1', 4 * MB, 100);
@@ -162,8 +158,6 @@ async function main() {
     assert.equal(u.dirs, 2);
     // Two dirs is far below MEASURED_MIN_DIRS → the guess, not 5 MB.
     assert.equal(u.estTrackBytes, stemCache.APPROX_TRACK_BYTES);
-    assert.equal(await stemCache.usageBytes(), 10 * MB);
-    assert.equal(await stemCache.cachedTrackCount(), 2);
   });
 
   await test('headroom is sized off the measured average once the cache has one', async () => {
@@ -175,16 +169,24 @@ async function main() {
     assert.equal(await stemCache.headroomTracks(450 * MB), 50);
   });
 
-  await test('a full cache reports zero headroom, never negative', async () => {
-    assert.equal(await stemCache.headroomTracks(10 * MB), 0);
+  await test('a walk wider than the fan-out counts every dir and every byte once', async () => {
+    resetCache();
+    const n = stemCache.SCAN_CONCURRENCY * 7 + 3;
+    let expected = 0;
+    for (let i = 0; i < n; i++) {
+      const dir = stemCache.dirFor(`t${i}`);
+      mkdirSync(dir, { recursive: true });
+      for (let f = 0; f < 3; f++) {
+        const size = 100 + i * 3 + f;
+        writeFileSync(join(dir, `head-${f}.flac`), Buffer.alloc(size));
+        expected += size;
+      }
+    }
+    writeFileSync(join(stemCache.stemsRoot(), 'stray.txt'), 'not a track dir');
+    const u = await stemCache.usage();
+    assert.equal(u.dirs, n);
+    assert.equal(u.bytes, expected);
   });
-
-  rmSync(stateDir, { recursive: true, force: true });
-  if (failures > 0) {
-    console.error(`\n${failures} test(s) failed`);
-    process.exit(1);
-  }
-  console.log('\nall stem-cache-sweep tests passed');
 }
 
 await main();

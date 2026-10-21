@@ -15,16 +15,17 @@
 // The opposite must hold too: a declared knob the operator CLEARED stays
 // cleared, or the form could never delete a line.
 //
-// Run: `tsx scripts/skill-scaffold-preserve.test.ts`.
+// Run: `npm test -- skill-scaffold-preserve`.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // STATE_DIR must be set before config.js resolves it at import time — scaffold.ts
 // derives SKILLS_DIR from it at module scope.
-const stateDir = mkdtempSync(join(tmpdir(), 'skill-scaffold-test-'));
+const stateDir = createTempDir(join(tmpdir(), 'skill-scaffold-test-'));
 process.env.STATE_DIR = stateDir;
 
 const { writeSkillFile } = await import('../src/skills/scaffold.js');

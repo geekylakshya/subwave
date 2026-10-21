@@ -30,7 +30,6 @@ import {
   PERSONA_LIMIT as PERSONA_LIMIT_VALUE,
   PERSONA_LINK_STYLES,
   PERSONA_SCRIPT_LENGTHS,
-  PERSONA_SKILLS_LIMIT,
   PERSONA_SOUL_MAX,
   TTS_CHATTERBOX_VOICE_RE,
   TTS_CLOUD_PROVIDERS as TTS_CLOUD_PROVIDER_VALUES,
@@ -147,8 +146,9 @@ export const TTS_ENGINES: readonly string[] = TTS_ENGINE_VALUES;
 // re-exported: ttsVoiceSlotSchema's `allowInherit` is the only way in.
 export { PERSONA_TTS_INHERIT };
 
-// DJ-voice trim in dB via Liquidsoap's `liq_amplify` annotation. A manual dial,
-// not auto-normalisation.
+// DJ-voice trim in dB via Liquidsoap's `liq_amplify` annotation. The operator's
+// manual dial; opt-in clip levelling (audio/clip-level.ts) is added to it,
+// and the total stays inside this same range.
 export const TTS_GAIN_CLAMP_DB = TTS_GAIN_CLAMP_DB_VALUE;
 
 // Finite number clamped to ±TTS_GAIN_CLAMP_DB and rounded to 0.1 dB; garbage
@@ -249,6 +249,11 @@ export const LLM_PROVIDERS = [
   'gateway',
 ];
 
+// Longest inline `embedding.apiKey` update() accepts. A chat leg's inline key
+// may run to 1000 (applyInlineKey), so whatever copies one into the embedding
+// leg (the LLM swap's pin, settings/llm-swap.ts) must check this first.
+export const EMBEDDING_API_KEY_MAX = 200;
+
 // Subset of LLM_PROVIDERS that can produce text embeddings (#493, #522).
 export const EMBEDDING_PROVIDERS = [
   'ollama',
@@ -323,11 +328,12 @@ export function clampNoRepeatWindow(raw: unknown, def: number): number {
   return Math.min(1000, Math.max(0, Math.floor(raw)));
 }
 
-// Artist spacing in SLOTS (#1406), floored into [0, 25]; 0 leaves only the
-// always-on back-to-back guard. The low ceiling is deliberate: this is consulted
-// at the POINT OF CHOICE against the run's own candidates, so a large window
-// mostly buys re-pick calls that end in a waived window.
-export function clampArtistVarietyWindow(raw: unknown, def: number): number {
+// A variety window in SLOTS, floored into [0, 25]: artist spacing (#1406),
+// where 0 leaves only the always-on back-to-back guard, and the genre run
+// limit (#1897), where 0 is off. The low ceiling is deliberate: both are
+// consulted at the POINT OF CHOICE against the run's own candidates, so a
+// large window mostly buys re-pick calls that end in a waived window.
+export function clampVarietyWindow(raw: unknown, def: number): number {
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return def;
   return Math.min(25, Math.max(0, Math.floor(raw)));
 }
@@ -348,6 +354,12 @@ export function applyLlmLegPatch(target: Record<string, unknown>, patch: unknown
     const v = String(l.model).trim();
     if (v.length > 100) throw new Error(`${label}.model must be 0-100 chars`);
     target.model = v;
+  }
+  if (l.compatibleMode !== undefined) {
+    if (l.compatibleMode !== 'local' && l.compatibleMode !== 'hosted' && l.compatibleMode !== 'auto') {
+      throw new Error(`${label}.compatibleMode must be "local", "hosted" or "auto"`);
+    }
+    target.compatibleMode = l.compatibleMode;
   }
   // The inline API key is NOT handled here: applyInlineKey() routes it into
   // settings.llm.keys at the call site, after the provider is resolved, so one
@@ -402,38 +414,7 @@ export function applyLlmLegPatch(target: Record<string, unknown>, patch: unknown
   // Deliberately NOT keyed by provider the way baseUrl is: headers belong to one
   // server, so they follow the leg's inline API key instead.
   if (l.headers !== undefined) {
-    if (!l.headers || typeof l.headers !== 'object' || Array.isArray(l.headers)) {
-      throw new Error(`${label}.headers must be an object map of header name -> value`);
-    }
-    const incoming = l.headers as Record<string, unknown>;
-    const existing = (target.headers as Record<string, string> | undefined) ?? {};
-    const next: Record<string, string> = {};
-    for (const rawName of Object.keys(incoming)) {
-      const name = rawName.trim();
-      if (!LLM_HEADER_NAME_RE.test(name)) {
-        throw new Error(`${label}.headers has an invalid header name "${rawName}"`);
-      }
-      const raw = incoming[rawName];
-      if (raw === 'set') {
-        // Redacted on the way out: a row the operator did not retype must
-        // survive their save.
-        if (existing[name]) next[name] = existing[name];
-        continue;
-      }
-      const v = String(raw ?? '').trim();
-      if (!v) continue; // an emptied value drops the header, like providerBaseUrls
-      if (v.length > LLM_HEADER_VALUE_MAX) {
-        throw new Error(`${label}.headers.${name} must be 0-${LLM_HEADER_VALUE_MAX} chars`);
-      }
-      if (!LLM_HEADER_VALUE_RE.test(v)) {
-        throw new Error(`${label}.headers.${name} must be printable ASCII on a single line`);
-      }
-      next[name] = v;
-    }
-    if (Object.keys(next).length > LLM_HEADERS_MAX) {
-      throw new Error(`${label}.headers must have at most ${LLM_HEADERS_MAX} entries`);
-    }
-    target.headers = next;
+    target.headers = applyCustomHeadersPatch(target.headers, l.headers, label);
   }
   if (l.reasoning !== undefined) {
     target.reasoning = !!l.reasoning;
@@ -483,6 +464,41 @@ export function applyInlineKey(llmHost: { keys?: Record<string, string> }, provi
   if (!llmHost.keys || typeof llmHost.keys !== 'object') llmHost.keys = {};
   if (v) llmHost.keys[provider] = v;
   else delete llmHost.keys[provider];
+}
+
+// The chat and embedding editors use the same strict header rules and the same
+// redaction sentinel. A whole map replaces the previous one so Remove works.
+export function applyCustomHeadersPatch(existingRaw: unknown, incomingRaw: unknown, label: string): Record<string, string> {
+  if (!incomingRaw || typeof incomingRaw !== 'object' || Array.isArray(incomingRaw)) {
+    throw new Error(`${label}.headers must be an object map of header name -> value`);
+  }
+  const incoming = incomingRaw as Record<string, unknown>;
+  const existing = (existingRaw as Record<string, string> | undefined) ?? {};
+  const next: Record<string, string> = {};
+  for (const rawName of Object.keys(incoming)) {
+    const name = rawName.trim();
+    if (!LLM_HEADER_NAME_RE.test(name)) {
+      throw new Error(`${label}.headers has an invalid header name "${rawName}"`);
+    }
+    const raw = incoming[rawName];
+    if (raw === 'set') {
+      if (existing[name]) next[name] = existing[name];
+      continue;
+    }
+    const value = String(raw ?? '').trim();
+    if (!value) continue;
+    if (value.length > LLM_HEADER_VALUE_MAX) {
+      throw new Error(`${label}.headers.${name} must be 0-${LLM_HEADER_VALUE_MAX} chars`);
+    }
+    if (!LLM_HEADER_VALUE_RE.test(value)) {
+      throw new Error(`${label}.headers.${name} must be printable ASCII on a single line`);
+    }
+    next[name] = value;
+  }
+  if (Object.keys(next).length > LLM_HEADERS_MAX) {
+    throw new Error(`${label}.headers must have at most ${LLM_HEADERS_MAX} entries`);
+  }
+  return next;
 }
 
 // Lenient load-path read of a leg's stored `headers` map (#1618): repairs or
@@ -812,9 +828,6 @@ export { GUESTS_PER_SHOW, PLAYLISTS_PER_SHOW, EXCLUDED_PLAYLISTS_PER_SHOW };
 // name every library tag it wants. Keep in lockstep with FILTER_VALUES_MAX in
 // web/components/admin/shows/types.ts.
 export { SHOW_FILTER_VALUES_MAX };
-// Must comfortably exceed a realistic skill library: unticking one skill on an
-// "all skills" (null) persona materialises the full catalog minus one.
-export const SKILLS_PER_PERSONA_LIMIT = PERSONA_SKILLS_LIMIT;
 // djPrompts text bounds; keep in lockstep with PROMPT_MIN/PROMPT_MAX in
 // web/components/admin/personas/constants.ts.
 export const DJ_PROMPT_LIMIT = DJ_PROMPT_LIMIT_VALUE;
@@ -883,6 +896,7 @@ export interface NormalizedShow {
   pauseTalk: boolean;
   programme: boolean;
   segmentSkill: string;
+  preparationSkill: string;
   moods: string[];
   themeId: string;
   genres: string[];
@@ -901,6 +915,9 @@ export interface NormalizedShow {
   /** Full rotation (#1612): with playlistStrict on, every track in the anchor
    *  airs once before any of them repeats. Inert without it. */
   playlistExhaust: boolean;
+  /** Play in order: with playlistStrict on, picks walk the anchor in its own
+   *  order and resume across airings. Inert without it. */
+  playlistInOrder: boolean;
   excludedPlaylistIds: string[];
   /** Operator organisation tags. Filters the admin list; steers nothing on
    *  air, which is why resolveShow() does not carry them through. */

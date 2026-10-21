@@ -2,12 +2,12 @@
 // chokepoint), normalizeShows (lenient load) and the POST /shows middleware.
 // Accept-vs-reject and the returned shape are the contract; wording is not.
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-process.env.STATE_DIR = mkdtempSync(path.join(tmpdir(), 'subwave-show-schema-'));
+process.env.STATE_DIR = createTempDir(path.join(tmpdir(), 'subwave-show-schema-'));
 
 const { validateShowsStrict } = await import('../src/settings/validate.js');
 const { normalizeShows } = await import('../src/settings/normalize.js');
@@ -97,6 +97,20 @@ test('an unknown themeId is dropped to "", a known one preserved', () => {
   // palette id.
   assert.equal(strict({ themeId: 'vinyl' }).themeId, 'vinyl');
   assert.equal(strict({ themeId: 'sunset' }).themeId, '');
+  assert.equal(strict({ themeId: '' }).themeId, '');
+});
+
+test('a retired theme on a sibling cannot block a show edit (#917)', () => {
+  // update() validates the whole shows array on show and schedule saves. A
+  // sibling pinned to a renamed built-in palette used to brick every edit.
+  const out = validateShowsStrict([
+    show({ themeId: 'vinyl' }),
+    show({ name: 'Old Show', personaId: 'p_guest', themeId: 'sunset' }),
+  ], personas, themes, moodNames);
+  assert.equal(out.length, 2);
+  assert.equal(out[0].themeId, 'vinyl');
+  assert.equal(out[1].themeId, '');
+  assert.equal(out[1].name, 'Old Show');
 });
 
 test('maxTrackSeconds honours the crossfade-derived floor, and 0 always passes', () => {
@@ -133,6 +147,18 @@ test('booleans read as `=== true`, matching both paths before the schema', () =>
   assert.equal(strict({ banter: true }).banter, true);
   assert.equal(strict({ banter: 'yes' }).banter, false);
   assert.equal(strict({ programme: 1 }).programme, false);
+});
+
+test('playlist switches round-trip through strict saves and lenient loads', () => {
+  for (const value of [true, false, 'yes', undefined]) {
+    const raw = show({ playlistExhaust: value, playlistInOrder: value });
+    const saved = strict(raw);
+    const [loaded] = normalizeShows([raw], personaIds);
+    for (const field of ['playlistExhaust', 'playlistInOrder'] as const) {
+      assert.equal(saved[field], value === true);
+      assert.equal(loaded[field], saved[field]);
+    }
+  }
 });
 
 test('the array cap is enforced', () => {
@@ -248,6 +274,7 @@ test('load keeps an unknown themeId; the strict path drops it', () => {
   const [s] = normalizeShows([show({ themeId: 'sunset' })], personaIds);
   assert.equal(s.themeId, 'sunset');
   assert.equal(strict({ themeId: 'sunset' }).themeId, '');
+  assert.equal(strict({ themeId: '' }).themeId, '');
 });
 
 test('load caps the list at SHOWS_LIMIT', () => {
@@ -389,4 +416,14 @@ test('a show with no tags round-trips byte-identically apart from the empty list
   const [loaded] = normalizeShows([{ name: 'Breakfast', personaId: 'p_host' }], personaIds);
   assert.deepEqual(loaded.tags, []);
   assert.deepEqual(strict().tags, loaded.tags);
+});
+
+test('preparation references survive strict saves and lenient loads; duplicate feature usage is refused on save', () => {
+  assert.equal(strict({ preparationSkill: ' random-artist-pick ' }).preparationSkill, 'random-artist-pick');
+  assert.equal(strict({ preparationSkill: null }).preparationSkill, '');
+  assert.throws(() => strict({ preparationSkill: 'pick', segmentSkill: 'pick', programme: true }), /segmentSkill/);
+  const [loaded] = normalizeShows([show({ preparationSkill: 'pick', segmentSkill: 'pick' })], personaIds);
+  assert.ok(loaded, 'a hand-edited conflicting feature must not delete the entire show');
+  assert.equal(loaded.preparationSkill, 'pick');
+  assert.equal(loaded.segmentSkill, '');
 });

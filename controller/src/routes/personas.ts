@@ -1,21 +1,6 @@
-// Admin-gated persona routes: avatar upload/delete, the community install, and
-// the bundle export/import pair (#1620).
-//
-// Avatars are written to ${STATE_DIR}/persona-avatars/<personaId>.<ext>. The
-// browser resizes/crops the source image to 512×512 before POSTing it as a
-// data URL, so we only ever accept small (~50–300 KB) PNG/JPEG/WebP payloads.
-//
-// The dedicated upload route is the single writer; the basename is recorded on
-// the persona's `avatar` field via settings.update(), and the public
-// /persona-avatar/:id endpoint reads from that field. Magic-byte sniffing
-// rejects payloads whose decoded bytes don't match a supported image format,
-// so an operator can't smuggle anything else past the data-URL header.
-//
-// The two ways a persona can ARRIVE — a community install and a bundle import —
-// share one writer, personas/install.ts. They differ only in where the persona
-// object came from; the cap, the duplicate-name refusal, the strict validation
-// and the id minting are one decision, made once. The bundle packing/unpacking
-// itself lives in personas/bundle.ts.
+// Avatar upload is the sole file writer; settings stores the basename for public reads.
+// Validate image bytes, not data-URL headers. Community and bundle installs share
+// personas/install.ts; packing lives in personas/bundle.ts (#1620).
 
 import express from 'express';
 import { PERSONA_TTS_INHERIT } from '../schemas/persona.js';
@@ -59,8 +44,7 @@ function extForMime(mime: string): 'png' | 'jpg' | 'webp' {
   return 'png';
 }
 
-// Removes any existing avatar regardless of extension, so a JPEG uploaded over a
-// PNG does not orphan the PNG on disk.
+// Remove old extensions so a JPEG replacement cannot orphan a PNG.
 async function removeExisting(personaId: string) {
   try {
     const entries = await readdir(settings.PERSONA_AVATAR_DIR);
@@ -105,8 +89,7 @@ async function writeAvatar(personaId: string, dataUrl: string) {
   const filename = `${personaId}.${extForMime(sniffed)}`;
   await writeFile(`${settings.PERSONA_AVATAR_DIR}/${filename}`, buf);
 
-  // Resend the whole array: update() validates the full list, and its orphan
-  // sweep is what keeps the on-disk files consistent.
+  // Update the full persona array so validation and orphan cleanup remain shared.
   const nextPersonas = personas.map((p: any) =>
     p.id === personaId ? { ...p, avatar: filename } : p,
   );
@@ -163,6 +146,48 @@ router.delete('/personas/:id/avatar', requireAdmin, async (req, res) => {
   }
 });
 
+// Removes one persona, persisted immediately (#1950), the same shape as
+// DELETE /shows/:id. Reads the PERSISTED roster, never the panel's local copy,
+// so the operator's unsaved edits to other personas are neither saved nor lost
+// by a delete; the panel splices its own row out on success. One update() does
+// the whole cascade through its post-patch sweep: hosted shows go, with their
+// schedule hours and any takeover pinning one; guest seats are dropped;
+// activePersonaId is re-pointed if it named this persona; the avatar file is
+// collected. 404 is a persona the panel added and never saved, so the local
+// splice is enough. Deleting the last saved persona is refused here with the
+// reason, rather than as the schema's array-size message.
+router.delete('/personas/:id', requireAdmin, async (req, res) => {
+  const id = String(req.params.id);
+
+  await settings.load();
+  const existing = settings.get().personas || [];
+  const target = existing.find((p: any) => p.id === id);
+  if (!target) return res.status(404).json({ error: `no such persona: ${id}` });
+  const personas = existing.filter((p: any) => p.id !== id);
+  if (!personas.length) {
+    return res.status(409).json({
+      error: `“${target.name || id}” is the only saved persona. Save another persona before deleting this one.`,
+    });
+  }
+
+  try {
+    await settings.update({ personas });
+    const next = settings.get();
+    queue.log('scheduler', `[personas] "${id}" deleted via admin UI`);
+    res.json({
+      personas: next.personas,
+      activePersonaId: next.activePersonaId,
+      shows: next.shows,
+      schedule: next.schedule,
+      // GET /schedule's projection, so the panel caches the same shape.
+      scheduleOverride: settings.getScheduleOverride(),
+    });
+  } catch (err: any) {
+    queue.log('error', `DELETE /personas/${id} failed: ${err.message}`);
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // Installs a community persona as an ordinary roster entry, NOT on air
 // (activePersonaId is untouched). A full roster or a duplicate on-air name 409s.
 router.post('/personas/community/:slug/install', requireAdmin, async (req, res) => {
@@ -176,8 +201,7 @@ router.post('/personas/community/:slug/install', requireAdmin, async (req, res) 
     return res.status(404).json({ error: `no such community persona: ${slug}` });
   }
 
-  // A complete persona object — installPersona() hands it to settings.update(),
-  // which validates strictly and mints the id (no valid `id` supplied).
+  // settings.update validates the full object and mints its id.
   const persona = {
     name: cp.displayName,
     tagline: cp.tagline || '',
@@ -198,9 +222,7 @@ router.post('/personas/community/:slug/install', requireAdmin, async (req, res) 
   try {
     const result = await installPersona(persona);
     if (!result.ok) {
-      // A 409 is the operator being told the roster is full or the name is
-      // taken — expected, and not booth-log material. A 400 is the save itself
-      // refusing, which is what the old catch logged.
+      // 409 roster/name conflicts are expected; log save refusals reported as 400.
       if (result.status !== 409) {
         queue.log('error', `POST /personas/community/${slug}/install failed: ${result.error}`);
       }
@@ -231,8 +253,7 @@ router.get('/personas/:id/export', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: `invalid persona id: ${id}` });
     }
     const built = await buildPersonaBundle(id);
-    // A 409 here is the export refusing to ship a persona whose clone sample is
-    // gone from this station — the bundle would import 200 into a mute DJ.
+    // Reject missing clone samples so the exported persona cannot import as a mute DJ.
     if (!built.ok) return res.status(built.status).json({ error: built.error });
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader(

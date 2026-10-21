@@ -1,7 +1,8 @@
 // Real SDK adapters and local HTTP stubs exercise complete response consumption,
 // strategy recovery, failover attribution and the live admin health contract.
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createServer, type Server } from 'node:http';
@@ -10,7 +11,7 @@ import express from 'express';
 import { tool } from 'ai';
 import { z } from 'zod';
 
-process.env.STATE_DIR = mkdtempSync(path.join(tmpdir(), 'subwave-generation-http-'));
+process.env.STATE_DIR = createTempDir(path.join(tmpdir(), 'subwave-generation-http-'));
 process.env.ADMIN_USER = 'test';
 process.env.ADMIN_PASS = 'test';
 process.env.DEEPSEEK_API_KEY = 'unused';
@@ -19,6 +20,7 @@ const { setCache } = await import('../src/settings/store.js');
 const { djText, djObject, djAgent } = await import('../src/llm/sdk.js');
 const { recentCalls, generationHealthSnapshot } = await import('../src/llm/log.js');
 const { primaryLeg, probeLegReachable } = await import('../src/llm/provider.js');
+const { resetFailoverStickyForTest } = await import('../src/llm/internal/core/failover.js');
 const { checkLlm } = await import('../src/doctor/checks-services.js');
 const { router: doctorRouter } = await import('../src/routes/doctor.js');
 const { router: publicRouter } = await import('../src/routes/public.js');
@@ -35,6 +37,9 @@ async function listen(server: Server, t: TestContext) {
   return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 }
 async function fixture(t: TestContext, stallAt = 1, stallBody = true) {
+  // Each test starts with no primary marked down (the sticky window is process state).
+  resetFailoverStickyForTest();
+  t.after(() => resetFailoverStickyForTest());
   let primaryCalls = 0;
   let fallbackCalls = 0;
   let fallbackStalls = false;
@@ -89,6 +94,10 @@ test('text timeout covers a body stalled after headers, records both legs, and l
   const findings = await checkLlm(settings.get());
   assert.equal(findings.find((r) => r.label === 'provider')?.status, 'ok');
   assert.equal(findings.find((r) => r.label === 'generation health')?.status, 'fail');
+  // The timed-out primary is marked down, and the doctor says why calls go to the backup.
+  const routing = findings.find((r) => r.label === 'backup routing');
+  assert.equal(routing?.status, 'warn');
+  assert.match(routing?.detail ?? '', /^primary generation timed out — 1 call sent to .+; primary tried again in \d+ s$/);
 });
 
 test('object timeout skips semantic recovery, while fallback and pinned requests remain independently bounded', async (t) => {
@@ -100,6 +109,9 @@ test('object timeout skips semantic recovery, while fallback and pinned requests
   f.stallFallback();
   await assert.rejects(djObject({ prompt: 'test', schema, leg: 'fallback' }), { code: 'PROVIDER_REQUEST_TIMEOUT' });
   assert.deepEqual(f.counts(), [2, 2]);
+  // The first call's timeout marked the primary down (sticky window); clear it
+  // so the next unpinned call still measures the primary's own bound.
+  resetFailoverStickyForTest();
   await assert.rejects(djObject({ prompt: 'test', schema }), { code: 'PROVIDER_REQUEST_TIMEOUT' });
   assert.deepEqual(f.counts(), [3, 3]);
   settings.get().llm.fallback.enabled = false;
@@ -153,6 +165,7 @@ test('native object and native agent timeouts do not become schema repair or don
   t.after(() => { globalThis.fetch = original; });
   assert.deepEqual(await djObject({ prompt: 'test', schema }), { ok: true });
   assert.deepEqual(f.counts(), [1, 1]);
+  resetFailoverStickyForTest(); // the agent leg below must still start on the primary
   const result = await djAgent({ system: 'test', messages, tools, schema, timeoutMs: 2000 });
   assert.deepEqual(result.object, { ok: true });
   assert.deepEqual(f.counts(), [2, 3], 'object fallback then one agent fallback leg (discovery + done)');
@@ -167,7 +180,9 @@ test('live generation diagnostics require admin; public health remains liveness 
   assert.equal((await fetch(`${base}/doctor/llm`)).status, 401);
   const response = await fetch(`${base}/doctor/llm`, { headers: { Authorization: `Basic ${Buffer.from('test:test').toString('base64')}` } });
   assert.equal(response.status, 200);
-  const health = await response.json();
+  const health = z.object({
+    status: z.string(), inFlightCount: z.number(), scope: z.string(),
+  }).parse(await response.json());
   assert.equal(health.status, 'fail');
   assert.equal(health.inFlightCount, 0);
   assert.match(health.scope, /process-local/);

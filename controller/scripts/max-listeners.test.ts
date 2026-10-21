@@ -31,8 +31,10 @@
 // Run: `npm test -- max-listeners`.
 
 import assert from 'node:assert/strict';
+import { coldLoadSettings } from './test-utils/settings.js';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import path, { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -47,24 +49,17 @@ const docker = join(here, '..', '..', 'docker');
 
 // STATE_DIR is redirected at a throwaway dir BEFORE the first import of
 // anything config-derived (same pattern as scripts/llm-repeat-penalty.test.ts).
-const stateRoot = mkdtempSync(path.join(tmpdir(), 'subwave-max-listeners-'));
+const stateRoot = createTempDir(path.join(tmpdir(), 'subwave-max-listeners-'));
 process.env.STATE_DIR = stateRoot;
 
-const { setCache } = await import('../src/settings/store.js');
 const settings = await import('../src/settings.js');
 const { DEFAULTS } = await import('../src/settings/defaults.js');
 const { LIQ_ICECAST_MAX_CLIENTS_PATH } = await import('../src/settings/liquidsoap.js');
 const { STREAM_MAX_LISTENERS_BOUNDS, streamPatchSchema } = await import('../src/schemas/settings.js');
 
-const SETTINGS_PATH = path.join(stateRoot, 'settings.json');
 
 // Load a hand-written settings.json the way a controller restart would.
-async function coldLoad(stream: Record<string, unknown>) {
-  writeFileSync(SETTINGS_PATH, JSON.stringify({ stream }));
-  setCache(null);
-  await settings.load();
-  return settings.get().stream;
-}
+async function coldLoad(stream: Record<string, unknown>) { return (await coldLoadSettings({ stream })).stream; }
 
 test('an absent setting coerces to the ceiling the entrypoint always defaulted to', async () => {
   const stream = await coldLoad({});
@@ -133,7 +128,7 @@ const SUPERVISORS = [
   { name: 'aio/supervisor.sh', path: join(docker, 'aio', 'supervisor.sh'), lib: 'SUBWAVE_SUPERVISOR_LIB' },
 ] as const;
 
-const shellTmp = mkdtempSync(join(tmpdir(), 'subwave-max-listeners-sh-'));
+const shellTmp = createTempDir(join(tmpdir(), 'subwave-max-listeners-sh-'));
 let caseNo = 0;
 
 // Drive resolve_max_clients() against a scratch state dir. `set -eu` is set

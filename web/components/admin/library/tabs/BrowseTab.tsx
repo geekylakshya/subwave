@@ -64,6 +64,9 @@ export default function BrowseTab({
       return `/library/browse?${params}`;
     },
     toastOnError: true,
+    // A search answered while its keys were still being rebuilt may be missing
+    // tracks: ask again until the answer is whole, rather than keep it as final.
+    refetchInterval: query => (query.state.data?.reindexing ? 2000 : false),
   });
   const browse = browseQuery.data ?? null;
 
@@ -110,6 +113,10 @@ export default function BrowseTab({
         yearFrom={yearFrom} setYearFrom={setYearFrom}
         yearTo={yearTo} setYearTo={setYearTo}
         q={q} setQ={setQ}
+        // Feedback only for the text in the box now, not an older keystroke's.
+        queryError={browse?.searched === q.trim() ? browse.queryError ?? null : null}
+        readsAs={browse?.searched === q.trim() ? browse.readsAs ?? '' : ''}
+        reindexing={browse?.searched === q.trim() && !!browse.reindexing}
         sort={sort} setSort={setSort}
       />
 
@@ -147,9 +154,7 @@ export default function BrowseTab({
         sub={browse ? `${num(browse.total)} match${browse.total === 1 ? '' : 'es'}` : ''}
         bodyClass="!p-0"
       >
-        {/* isFetching, not isLoading: isLoading is false on a cached-then-
-            revalidating page, which would drop the spinner during a page
-            change. isFetching is what browseLoading tracked. */}
+        {/* isFetching includes cached pages being revalidated. */}
         <RowsTable tab="browse" rows={browse?.rows || []} loading={browseQuery.isFetching} />
       </Card>
 

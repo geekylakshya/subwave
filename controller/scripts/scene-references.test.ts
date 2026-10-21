@@ -7,14 +7,14 @@
 // Run: npm test -- scene-references
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { listen as listenHttp } from './test-utils/http.js';
+import { writeFileSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-const STATE = mkdtempSync(join(tmpdir(), 'subwave-scene-refs-'));
+const STATE = createTempDir(join(tmpdir(), 'subwave-scene-refs-'));
 process.env.STATE_DIR = STATE;
 
 // The three stores are read from disk, so they are written before their importers.
@@ -79,8 +79,8 @@ const settings = await import('../src/settings.js');
 const blocklist = await import('../src/music/blocklist.js');
 const sceneVocab = await import('../src/music/scene-vocab.js');
 
-type SceneFilter = refs.SceneFilter;
-type SceneReferenceRow = refs.SceneReference;
+type SceneFilter = import('../src/music/scene-references.js').SceneFilter;
+type SceneReferenceRow = import('../src/music/scene-references.js').SceneReference;
 
 const show = (id: string, name: string, values: string[]): SceneFilter =>
   ({ kind: 'show', mode: 'genre', id, name, values });
@@ -331,12 +331,10 @@ db.upsertTrackMeta('t2', { title: 't2', artist: 'Someone', album: 'A Record', ge
 const app = express();
 app.use(express.json());
 app.use(router);
-const server = createServer(app);
-await new Promise<void>(r => { server.listen(0, '127.0.0.1', () => r()); });
+const { server, url: base } = await listenHttp(app);
 // unref, or the listening socket holds the event loop open and the test FILE
 // never exits — which under run-tests.ts (concurrency 1) wedges the suite.
 server.unref();
-const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
 const post = async (path: string, body: unknown) => {
   const res = await fetch(`${base}${path}`, {

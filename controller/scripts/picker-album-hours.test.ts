@@ -13,14 +13,15 @@
 // Run: npm test -- picker-album-hours
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { coldLoadSettings } from './test-utils/settings.js';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 // STATE_DIR is redirected at a throwaway dir BEFORE the first import of
 // anything config-derived.
-const stateRoot = mkdtempSync(path.join(tmpdir(), 'subwave-album-hours-'));
+const stateRoot = createTempDir(path.join(tmpdir(), 'subwave-album-hours-'));
 process.env.STATE_DIR = stateRoot;
 
 const { setCache } = await import('../src/settings/store.js');
@@ -28,14 +29,8 @@ const settings = await import('../src/settings.js');
 const { queue } = await import('../src/broadcast/queue.js');
 const { albumKey } = await import('../src/music/recency.js');
 
-const SETTINGS_PATH = path.join(stateRoot, 'settings.json');
 
-async function coldLoad(picker: Record<string, unknown> | undefined) {
-  writeFileSync(SETTINGS_PATH, JSON.stringify(picker === undefined ? {} : { picker }));
-  setCache(null);
-  await settings.load();
-  return settings.get().picker as { albumHours: number };
-}
+async function coldLoad(picker: Record<string, unknown> | undefined) { return (await coldLoadSettings(picker === undefined ? {} : { picker })).picker as { albumHours: number }; }
 
 // ── the dial ───────────────────────────────────────────────────────────────
 

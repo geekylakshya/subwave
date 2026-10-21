@@ -63,6 +63,7 @@ import {
   streamPatchSchema,
   timezoneSchema,
   transitionsPatchSchema,
+  ttsPatchSchema,
   uiPatchSchema,
   weatherMoodsSchema,
   weatherPatchSchema,
@@ -72,6 +73,7 @@ import {
   activeDjPromptIdSchema,
   djPromptTextSchema,
   maxTrackSecondsSchema,
+  maxTrackLengthModeSchema,
   themePatchSchema,
 } from '../schemas/settings.js';
 import {
@@ -112,6 +114,7 @@ export const SETTINGS_PATCH_KEYS = [
   'crossfadeDuration',
   'ducking',
   'handover',
+  'maxTrackLengthMode',
   'maxTrackSeconds',
   'maxTrackMinutes',
   'archive',
@@ -243,6 +246,7 @@ export const SETTINGS_PATCH_SCHEMAS: Readonly<Partial<Record<SettingsPatchKey, S
   alexa: alexaPatchSchema,
   privacy: privacyPatchSchema,
   requests: requestsPatchSchema,
+  tts: ttsPatchSchema,
   // Both are validated by the SAME schema update() reaches through
   // validatePersonasStrict / validateDjPromptsStrict. Their branches are NOT
   // switched to parseSettingsPatchKey, because both need a server-only step the
@@ -259,6 +263,7 @@ export const SETTINGS_PATCH_SCHEMAS: Readonly<Partial<Record<SettingsPatchKey, S
   // library. Registering the pure half is still worth it: it is what gives these
   // inputs a `fieldErrors` key, and it moves the refusal to the boundary.
   theme: themePatchSchema,
+  maxTrackLengthMode: maxTrackLengthModeSchema,
   maxTrackSeconds: maxTrackSecondsSchema(MAX_TRACK_SECONDS_BOUNDS),
   activeDjPromptId: activeDjPromptIdSchema,
   djPrompt: djPromptTextSchema({ min: DJ_PROMPT_TEXT_MIN, max: DJ_PROMPT_TEXT_MAX }),

@@ -1,9 +1,9 @@
 """web/scripts/verify-forms.py
 
 Drives the isolated verify stack (controller :7791, web :7793) through every
-form converted to react-hook-form. Not part of CI — web/ has no test suite
-and the merge gate is lint. This is the evidence for a forms PR; run it
-after touching any converted form.
+form converted to react-hook-form. Not part of CI — the merge gate is lint,
+and `npm test` covers form logic but not the rendered wiring. This is the
+evidence for a forms PR; run it after touching any converted form.
 
 Usage: SUBWAVE_VERIFY_ALLOW_DESTRUCTIVE=1 python3 web/scripts/verify-forms.py [check ...]
 Every check in CHECKS runs with no args; name one or more to run a subset.
@@ -285,6 +285,60 @@ def check(fn):
 
 
 TAKEOVER_SHOW_NAME = "Verify Takeover Show"
+
+
+@check
+def music_selection(page):
+    """Selection saves and section Discard preserve independent LLM controls."""
+    original = json.loads(api("/settings"))["values"]["llm"]
+    keys = ["trackSelection", "shortlistPasses", "shortlistSearchPreparation", "requestMatching", "segmentRuntime"]
+    try:
+        api_write("POST", "/settings", {"llm": {
+            "trackSelection": "agentic", "shortlistPasses": 3, "shortlistSearchPreparation": False,
+            "requestMatching": "agentic", "segmentRuntime": "agentic",
+        }})
+        page.goto(f"{WEB}/admin/settings?section=selection")
+        shortlist = page.get_by_role("radio", name="Track Shortlist", exact=True)
+        shortlist.wait_for()
+        shortlist.click()
+        page.get_by_role("radio", name="5", exact=True).click()
+        preparation = page.locator(".field").filter(has=page.get_by_text("Prepare targeted searches", exact=True))
+        preparation.get_by_role("radio", name="On", exact=True).click()
+        with page.expect_response(
+            lambda r: r.url.endswith("/settings") and r.request.method == "POST"
+        ) as saved:
+            page.get_by_role("button", name="Save music selection", exact=True).click()
+        assert saved.value.status == 200
+        page.get_by_role("button", name="Discard", exact=True).wait_for(state="hidden")
+        llm = json.loads(api("/settings"))["values"]["llm"]
+        assert llm["trackSelection"] == "shortlist" and llm["shortlistPasses"] == 5
+        assert llm["pickerAgent"] is False
+        assert llm["shortlistSearchPreparation"] is True
+        assert llm["requestMatching"] == "agentic" and llm["segmentRuntime"] == "agentic"
+
+        page.reload()
+        shortlist.wait_for()
+        assert shortlist.get_attribute("aria-checked") == "true"
+        assert preparation.get_by_role("radio", name="On", exact=True).get_attribute("aria-checked") == "true"
+        preparation.get_by_role("radio", name="Off", exact=True).click()
+        page.get_by_role("radio", name="Agentic Tools", exact=True).click()
+        page.get_by_role("button", name=re.compile(r"DJ behaviour.*speech", re.I)).click()
+        direct = page.get_by_role("radio", name="Direct", exact=True)
+        direct.click()
+        page.get_by_role("button", name=re.compile(r"LLM provider.*model routing", re.I)).click()
+        assert page.get_by_role("button", name="Discard", exact=True).count() == 0
+        assert page.get_by_text("Next-track picker", exact=True).count() == 0
+
+        page.get_by_role("button", name=re.compile(r"Music selection.*agentic", re.I)).click()
+        page.get_by_role("button", name="Discard", exact=True).click()
+        assert shortlist.get_attribute("aria-checked") == "true"
+        assert preparation.get_by_role("radio", name="On", exact=True).get_attribute("aria-checked") == "true"
+        page.get_by_role("button", name=re.compile(r"DJ behaviour.*speech", re.I)).click()
+        assert direct.get_attribute("aria-checked") == "true"
+        page.get_by_role("button", name="Discard", exact=True).click()
+        assert page.get_by_role("radio", name="Agentic", exact=True).get_attribute("aria-checked") == "true"
+    finally:
+        api_write("POST", "/settings", {"llm": {key: original[key] for key in keys}})
 
 
 @check
@@ -1584,6 +1638,70 @@ def personas(page):
 
 
 @check
+def gemini_persona_style(page):
+    """Save/reload delivery style and audition unsaved edits through both controls."""
+    import copy
+    before = json.loads(api("/settings"))["values"]
+    personas = copy.deepcopy(before["personas"])
+    speaker = next(p for p in personas if p["name"] == "Wren")
+    speaker["tts"].update({"engine": "gemini", "voice": "Puck"})
+    speaker["voiceStyle"] = "Warm and unhurried."
+    previews = []
+
+    def sample(route):
+        previews.append(route.request.post_data_json)
+        route.fulfill(status=200, content_type="audio/wav", body=preview_wav(seconds=1))
+
+    page.route("**/settings/tts/preview", sample)
+    try:
+        api_write("POST", "/settings", {"personas": personas})
+        page.goto(f"{WEB}/admin/personas")
+        page.get_by_role("button", name="Edit Wren").click()
+        dialog = page.get_by_role("dialog")
+        style = dialog.get_by_label("Delivery style")
+        assert style.input_value() == "Warm and unhurried."
+        assert style.get_attribute("maxlength") == "300"
+        style.evaluate("el => el.removeAttribute('maxlength')")
+        style.fill("x" * 301)
+        wait_for_invalid(page, style)
+        assert_aria(page, style)
+        assert dialog.get_by_role("button", name="Save persona").is_disabled()
+        style.fill("Dry and understated.")
+        with page.expect_response("**/settings/tts/preview"):
+            dialog.get_by_role("button", name="Play sample", exact=True).click()
+        assert previews[-1]["voiceStyle"] == "Dry and understated."
+        assert next(p for p in json.loads(api("/settings"))["values"]["personas"]
+                    if p["id"] == speaker["id"])["voiceStyle"] == "Warm and unhurried."
+
+        # The picker has its own preview path, which must carry the same edit.
+        dialog.get_by_role("button", name=re.compile("^Puck")).click()
+        with page.expect_response("**/settings/tts/preview"):
+            page.get_by_role("option", name=re.compile("Puck")).get_by_role("button", name="Play preview").click()
+        assert len(previews) == 2
+        assert previews[-1]["voiceStyle"] == "Dry and understated."
+        page.keyboard.press("Escape")
+        dialog.get_by_role("button", name="Save persona").click()
+        dialog.wait_for(state="detached")
+        saved = json.loads(api("/settings"))["values"]["personas"]
+        assert next(p for p in saved if p["id"] == speaker["id"])["voiceStyle"] == "Dry and understated."
+        page.reload()
+        page.get_by_role("button", name="Edit Wren").click()
+        assert page.get_by_label("Delivery style").input_value() == "Dry and understated."
+
+        # Inheritance must expose the style when the station resolves to Gemini.
+        inherited = next(p for p in saved if p["id"] == speaker["id"])
+        inherited["tts"].update({"engine": "inherit", "voice": ""})
+        api_write("POST", "/settings", {"personas": saved, "tts": {"defaultEngine": "gemini"}})
+        page.reload()
+        page.get_by_role("button", name="Edit Wren").click()
+        assert page.get_by_label("Delivery style").input_value() == "Dry and understated."
+    finally:
+        page.unroute("**/settings/tts/preview", sample)
+        api_write("POST", "/settings", {"personas": before["personas"],
+                  "tts": {"defaultEngine": before["tts"]["defaultEngine"]}})
+
+
+@check
 def persona_preview_rate(page):
     """A persona preview auditions engine speed × persona speed.
 
@@ -1847,7 +1965,7 @@ def shows(page):
         dialog = page.get_by_role("dialog")
         dialog.wait_for()
 
-        host_field = dialog.get_by_label("persona owner")
+        host_field = dialog.get_by_role("combobox", name="Host", exact=True)
         wait_for_invalid(page, host_field)
         assert_aria(page, host_field)
         assert_field_error(page, host_field, "must reference an existing persona")
@@ -1884,7 +2002,7 @@ def shows(page):
 
         # Host defaults to the roster's first persona; pin it explicitly so the
         # guest-overlap scenario below is deterministic regardless of roster order.
-        host_field = dialog.get_by_label("persona owner")
+        host_field = dialog.get_by_role("combobox", name="Host", exact=True)
         host_field.click()
         page.get_by_role("option", name="Marlowe").click()
 
@@ -2277,8 +2395,9 @@ def assert_throwaway_stack():
     So the load-bearing check is now a plain opt-in: the caller must set
     `SUBWAVE_VERIFY_ALLOW_DESTRUCTIVE=1` (or any other truthy-looking value —
     see `_env_truthy`) before running this file at all, which the product
-    never sets on its own. `.claude/skills/verify/SKILL.md`'s documented
-    isolated-controller boot is the one place that should ever export it.
+    never sets on its own. Export it by hand only in the shell that booted
+    the isolated stack from `.claude/skills/verify/SKILL.md`; the skill
+    itself does not set it.
 
     The old credential + roster checks are kept, but now purely as a
     SECONDARY sanity check that runs only once the opt-in has already been

@@ -494,6 +494,29 @@ export const PICKER_ALBUM_HOURS_BOUNDS: SettingsNumericBound = { min: 0, max: 72
 // separate declarations of one number and must move together.
 export const PICKER_MIN_TRACK_LENGTH_BOUNDS: SettingsNumericBound = { min: 0, max: 3600 };
 
+// Track Shortlist discovery passes (#1687): how many controller-run source
+// calls build one shortlist. Unlike the agent's discoverySteps, 0 has no
+// meaning here, because one pass is the smallest real shortlist.
+export const SHORTLIST_PASSES_BOUNDS: SettingsNumericBound = { min: 1, max: 5 };
+export const SHORTLIST_PASSES_DEFAULT = 3;
+
+// Which of the three model routes run an agent tool loop (#1687): track
+// selection, listener-request matching and segment delivery each choose
+// independently. The agent deadline, the context-window floor and the
+// output-cap warning apply to whichever of them are agentic, so every reader
+// (DJ Doc, the Music selection form) asks here instead of re-deriving it.
+// Absent values read as the shipped default, which is agentic for all three.
+export function settingsAgentRoutes(llm: {
+  trackSelection?: unknown;
+  requestMatching?: unknown;
+  segmentRuntime?: unknown;
+} | null | undefined) {
+  const picks = llm?.trackSelection !== 'shortlist';
+  const requests = llm?.requestMatching !== 'direct';
+  const segments = llm?.segmentRuntime !== 'direct';
+  return { picks, requests, segments, any: picks || requests || segments };
+}
+
 export const SETTINGS_STATION_DEFAULT_NAME = 'SUB/WAVE';
 export const SETTINGS_STATION_NAME_MAX = 80;
 export const SETTINGS_STATION_DESCRIPTION_MAX = 200;
@@ -853,6 +876,16 @@ export const djTalkOnlyBetweenTracksSchema = z.boolean({
   error: 'djTalkOnlyBetweenTracks must be a boolean',
 });
 
+export const ttsVoiceLevellingSchema = z.boolean({
+  error: 'tts.voiceLevelling must be a boolean',
+});
+
+// Only this new flag is stateless; the other TTS fields retain their merged-state validation.
+export const ttsPatchSchema = settingsBlockOf({
+  voiceLevelling: ttsVoiceLevellingSchema,
+});
+export type TtsPatch = z.infer<typeof ttsPatchSchema>;
+
 // The floor a rendered skill segment must clear before an opted-in show gives
 // it a real gap instead of a duck. settingsIntLike, like every other numeric
 // settings key: it accepts the admin form's string and truncates a float rather
@@ -875,6 +908,7 @@ export const DJ_RECAP_CHARS_BOUNDS: SettingsNumericBound = { min: 40, max: 1000 
 // one stable home in Settings. A missing block remains the pre-existing off.
 export const djBehaviourPatchSchema = settingsBlockOf({
   showWelcome: z.boolean({ error: 'djBehaviour.showWelcome must be a boolean' }),
+  previewNextShow: z.boolean({ error: 'djBehaviour.previewNextShow must be a boolean' }),
   sameHostAcknowledgement: z.boolean({ error: 'djBehaviour.sameHostAcknowledgement must be a boolean' }),
   extendedSleeveNotes: z.boolean({ error: 'djBehaviour.extendedSleeveNotes must be a boolean' }),
   releaseYearMentions: z.enum(['regular', 'occasional', 'rare'], {
@@ -1463,6 +1497,8 @@ export const themePatchSchema = z.preprocess(
   }),
 );
 
+export const maxTrackLengthModeSchema = z.enum(['cut', 'exclude'], { error: 'maxTrackLengthMode must be cut or exclude' });
+
 // ── maxTrackSeconds ──────────────────────────────────────────────────────────
 
 /**
@@ -1557,4 +1593,60 @@ export function djPromptTextSchema(bounds: { min: number; max: number }) {
       }
       return v;
     });
+}
+
+// ── Gemini Extended Voice Library default filter ──────────────────────────────
+// A BCP-47 language tag, used ONLY to decide which page of the voice catalogue
+// the admin browser opens on. It is not a constraint on a persona's voice and it
+// never reaches the engine — Gemini takes its accent from the voice itself.
+//
+// Deliberately NOT an enum of the languages Google currently serves. That
+// vocabulary changes under us, and a list here would silently exclude a voice
+// the operator can see in AI Studio (the failure being fixed). The shape is
+// checked instead; the real values are discovered at browse time.
+export const GEMINI_LIBRARY_LANGUAGE_MAX = 35;
+
+// language[-Script][-REGION][-variant…]: a 2-3 letter (or 5-8 letter) primary
+// subtag, then optional 4-letter script, 2-letter/3-digit region, and any number
+// of 1-8 alphanumeric subtags. Structural only — it proves the string is a tag,
+// never that Google serves it.
+const BCP47 = /^[a-z]{2,3}(-[a-z]{4})?(-([a-z]{2}|[0-9]{3}))?(-[a-z0-9]{1,8})*$/i;
+
+/** Canonicalise a BCP-47 tag so `en-au`, `EN-AU` and `en-AU` cannot become three
+ *  dropdown entries: primary subtag lowercase, script Titlecase, region
+ *  UPPERCASE. Google's filter is a case-insensitive exact match, so this is
+ *  safe, and an unrecognisable tag is returned trimmed rather than dropped. */
+export function normalizeGeminiLibraryLanguage(raw: unknown): string {
+  const v = String(raw ?? '').trim();
+  if (!v) return '';
+  // Index-safe rather than `parts[0]` / `p[0]`: this file is COPIED into the web
+  // bundle, which compiles it with `noUncheckedIndexedAccess`, and a mirror that
+  // does not typecheck is a mirror nobody can regenerate.
+  const out: string[] = [];
+  const parts = v.split('-');
+  for (let i = 0; i < parts.length; i += 1) {
+    const p = parts[i] ?? '';
+    // Empty segments are KEPT, not skipped. Skipping them turned the malformed
+    // `en-AU-` into the valid `en-AU`, so a typo was silently repaired into a
+    // setting the operator never typed — the exact silent-repair behaviour the
+    // patch-path rules forbid. Preserved, the trailing hyphen fails BCP47 below
+    // and the save is refused, which is the answer the operator needs.
+    if (i > 0 && /^[a-z]{4}$/i.test(p)) {
+      out.push(p.charAt(0).toUpperCase() + p.slice(1).toLowerCase());
+    } else if (i > 0 && /^([a-z]{2}|[0-9]{3})$/i.test(p)) {
+      out.push(p.toUpperCase());
+    } else {
+      out.push(p.toLowerCase());
+    }
+  }
+  return out.join('-');
+}
+
+/** Whether a value is a usable `libraryLanguage`. Empty is valid and means
+ *  "every language". Shared by the strict save path and the lenient load path
+ *  so a hand-edited settings.json cannot wedge boot — and mirrored, so the
+ *  admin form pre-flights with the same rule the route enforces. */
+export function isGeminiLibraryLanguage(raw: unknown): boolean {
+  const v = normalizeGeminiLibraryLanguage(raw);
+  return v === '' || (v.length <= GEMINI_LIBRARY_LANGUAGE_MAX && BCP47.test(v));
 }

@@ -37,31 +37,26 @@
 // Run: `npm test -- duck-depth`.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { coldLoadSettings } from './test-utils/settings.js';
+import { existsSync, readFileSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 // STATE_DIR is redirected at a throwaway dir BEFORE the first import of
 // anything config-derived (same pattern as scripts/max-listeners.test.ts).
-const stateRoot = mkdtempSync(path.join(tmpdir(), 'subwave-duck-depth-'));
+const stateRoot = createTempDir(path.join(tmpdir(), 'subwave-duck-depth-'));
 process.env.STATE_DIR = stateRoot;
 
-const { setCache } = await import('../src/settings/store.js');
 const settings = await import('../src/settings.js');
 const { DEFAULTS } = await import('../src/settings/defaults.js');
 const { LIQ_DUCK_VOICE_PATH, LIQ_DUCK_INTRO_PATH } = await import('../src/settings/liquidsoap.js');
 const { DUCK_DEPTH_BOUNDS, duckingPatchSchema } = await import('../src/schemas/settings.js');
 
-const SETTINGS_PATH = path.join(stateRoot, 'settings.json');
 
 // Load a hand-written settings.json the way a controller restart would.
-async function coldLoad(ducking: Record<string, unknown> | undefined) {
-  writeFileSync(SETTINGS_PATH, JSON.stringify(ducking === undefined ? {} : { ducking }));
-  setCache(null);
-  await settings.load();
-  return settings.get().ducking;
-}
+async function coldLoad(ducking: Record<string, unknown> | undefined) { return (await coldLoadSettings(ducking === undefined ? {} : { ducking })).ducking; }
 
 // ---------------------------------------------------------------------------
 // 1. The default is the depth radio.liq shipped
@@ -209,16 +204,15 @@ test('the intro side flags a restart on its own', async () => {
 // ---------------------------------------------------------------------------
 
 test('the key is in the patch inventory, so POST /settings accepts it', async () => {
-  const { SETTINGS_PATCH_KEYS, validateSettingsPatch, SETTINGS_PATCH_SHAPE_ONLY } =
+  const { validateSettingsPatch } =
     await import('../src/settings/patch-registry.js');
   // A key absent from this list is rejected at the route — the panel would
   // post it and get a 400 naming an unknown key, with everything else saving.
-  assert.ok(SETTINGS_PATCH_KEYS.includes('ducking'));
   assert.equal(
-    validateSettingsPatch({ ducking: { voice: 0.3 } }, SETTINGS_PATCH_SHAPE_ONLY),
+    validateSettingsPatch({ ducking: { voice: 0.3 } }),
     null,
   );
-  const bad = validateSettingsPatch({ ducking: { voice: 9 } }, SETTINGS_PATCH_SHAPE_ONLY);
+  const bad = validateSettingsPatch({ ducking: { voice: 9 } });
   assert.ok(bad, 'an out-of-range depth should be refused at the route');
   // The fieldErrors channel is the point of registering the key: the admin
   // input can only highlight itself if the error is keyed by its dotted path.

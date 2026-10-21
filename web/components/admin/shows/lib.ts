@@ -1,7 +1,3 @@
-// Pure show helpers: hydration and the payload / table-row projections.
-// Validation lives in ShowsPanel/ShowEditor via the shared schema; what stays
-// here is what the schema does not express — tolerance for a half-finished show
-// and showPayload's "only means something with" conditionals.
 
 import type { ShowFacet, ShowRow } from './ShowsTable';
 import { SHOW_COLORS } from '../schedule/lib';
@@ -46,9 +42,11 @@ export function hydrateShow(s: Partial<Show>): Show {
     playlistIds: Array.isArray(m.playlistIds) ? m.playlistIds : [],
     playlistStrict: m.playlistStrict ?? false,
     playlistExhaust: m.playlistExhaust ?? false,
+    playlistInOrder: m.playlistInOrder ?? false,
     excludedPlaylistIds: Array.isArray(m.excludedPlaylistIds) ? m.excludedPlaylistIds : [],
     programme: m.programme ?? false,
     segmentSkill: m.segmentSkill ?? '',
+    preparationSkill: m.preparationSkill ?? '',
     tags: Array.isArray(m.tags) ? m.tags.map(t => String(t).trim().toLowerCase()).filter(Boolean) : [],
   };
 }
@@ -120,15 +118,27 @@ export function showPayload(s: Show) {
     // Full rotation only means something behind strict: a soft anchor may leave
     // the playlist, so "every track once" has no set to be true of.
     playlistExhaust: (s.playlistIds?.length ?? 0) > 0 && s.playlistStrict && s.playlistExhaust,
+    // Same gate, same reason: a running order needs the playlist to be the
+    // show's whole universe.
+    playlistInOrder: (s.playlistIds?.length ?? 0) > 0 && s.playlistStrict && s.playlistInOrder,
     excludedPlaylistIds: s.excludedPlaylistIds || [],
     programme: s.programme ?? false,
     // A skill pin only means something in programme mode.
     segmentSkill: s.programme ? (s.segmentSkill || '') : '',
+    preparationSkill: s.preparationSkill || '',
     // No conditional: a tag is filing, so it survives every other field clearing.
     tags: s.tags || [],
   };
 }
 
+
+// In order supersedes full rotation (it already plays every track once a lap),
+// so the label names whichever is actually in force.
+function playlistOrderFacet(s: Pick<Show, 'playlistStrict' | 'playlistExhaust' | 'playlistInOrder'>): string {
+  if (!s.playlistStrict) return '';
+  if (s.playlistInOrder) return ' · in order';
+  return s.playlistExhaust ? ' · full rotation' : '';
+}
 
 // Visual counterpart to showFilterSummary(). Shared by the slate card and table row.
 export function showFacets(s: Show): ShowFacet[] {
@@ -143,7 +153,7 @@ export function showFacets(s: Show): ShowFacet[] {
   if (s.vocals) facets.push({ key: 'vocals', label: s.vocals === 'instrumental' ? 'instrumental' : 'vocals' });
   if (s.filtersStrict && hasAnyMusicFilter(s)) facets.push({ key: 'strict', label: 'strict', accent: true });
   const nPl = s.playlistIds?.length ?? 0;
-  if (nPl) facets.push({ key: 'playlists', label: `${nPl} playlist${nPl > 1 ? 's' : ''}${s.playlistStrict ? ' · strict' : ''}${s.playlistStrict && s.playlistExhaust ? ' · full rotation' : ''}` });
+  if (nPl) facets.push({ key: 'playlists', label: `${nPl} playlist${nPl > 1 ? 's' : ''}${s.playlistStrict ? ' · strict' : ''}${playlistOrderFacet(s)}` });
   const nEx = s.excludedPlaylistIds?.length ?? 0;
   if (nEx) facets.push({ key: 'excluded', label: `${nEx} excluded` });
   if (s.maxTrackSeconds != null) {

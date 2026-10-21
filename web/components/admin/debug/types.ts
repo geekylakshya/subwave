@@ -1,5 +1,3 @@
-// Shapes of the controller's /debug response. Admin endpoints return loose JSON,
-// so these are narrowed with optional-chaining at call sites, not trusted outright.
 
 import type { StationLocale } from '../../../lib/types';
 
@@ -101,16 +99,77 @@ interface LlmCall {
   systemPreview?: string;
   messages?: Array<{ role?: string; content?: unknown }>;
   toolCalls?: Array<{ name?: string; args?: unknown; result?: unknown }>;
+  shortlistResolution?: {
+    preliminary?: { id?: string; title?: string | null; artist?: string | null };
+    leaningsReview?: {
+      outcome?: 'not-run' | 'kept' | 'replaced' | 'invalid' | 'failed';
+      replacementId?: string | null;
+      track?: { id?: string; title?: string | null; artist?: string | null } | null;
+      leaningsBasis?: string | null;
+      leaningsSource?: 'host' | 'guest' | null;
+      baselineId?: string | null;
+      reviewedSelectedId?: string | null;
+      candidateIds?: string[];
+      leaningsOptions?: string[];
+      leaningsSources?: Array<{ phrase: string; source: 'host' | 'guest'; ownerName: string | null }>;
+      proposedReplacementId?: string | null;
+      rejectionReason?: 'unknown-candidate' | 'missing-leanings-basis' | 'basis-not-in-leanings' | 'basis-not-supported-by-candidate' | 'basis-already-supported-by-baseline' | 'not-flow-tie' | 'weak-musical-reason' | null;
+    };
+    guardOutcome?: 'none' | 'artist-repick' | 'album-repick' | 'artist-and-album-repick'
+      | 'genre-repick' | 'artist-and-genre-repick' | 'album-and-genre-repick' | 'artist-album-and-genre-repick'
+      | 'pool-rescue';
+    final?: { id?: string; title?: string | null; artist?: string | null };
+    reason?: string | null;
+    queued?: boolean;
+    usedMusicalLeanings?: boolean;
+    rejectionReason?: 'unknown-candidate' | 'missing-leanings-basis' | 'basis-not-in-leanings' | 'basis-not-supported-by-candidate' | 'basis-already-supported-by-baseline' | 'not-flow-tie' | 'weak-musical-reason' | 'queue-collision' | 'pool-rescue' | null;
+  };
   response?: string;
   /** What the model said INSTEAD of the expected structured output on a failed call.
    * From the controller's failureDiagnostics(); absent on success (see `response`). */
   responseText?: string;
   steps?: number;
+  /** Controller-verified Agentic diagnostic, settled after guards + enqueue. */
+  agentPickResolution?: {
+    preliminary?: { id?: string; title?: string | null; artist?: string | null };
+    leaningsReview?: {
+      outcome?: 'not-run' | 'kept' | 'replaced' | 'invalid' | 'failed';
+      replacementId?: string | null;
+      track?: { id?: string; title?: string | null; artist?: string | null } | null;
+      leaningsBasis?: string | null;
+      baselineId?: string | null;
+      reviewedSelectedId?: string | null;
+      candidateIds?: string[];
+      leaningsOptions?: string[];
+      leaningsSources?: Array<{ phrase: string; source: 'host' | 'guest'; ownerName: string | null }>;
+      leaningsSource?: 'host' | 'guest' | null;
+      proposedReplacementId?: string | null;
+      rejectionReason?: 'unknown-candidate' | 'missing-leanings-basis' | 'basis-not-in-leanings' | 'basis-not-supported-by-candidate' | 'basis-already-supported-by-baseline' | 'not-flow-tie' | 'weak-musical-reason' | null;
+    };
+    guardOutcome?: 'none' | 'artist-repick' | 'album-repick' | 'artist-and-album-repick'
+      | 'genre-repick' | 'artist-and-genre-repick' | 'album-and-genre-repick' | 'artist-album-and-genre-repick'
+      | 'pool-rescue';
+    final?: { id?: string; title?: string | null; artist?: string | null };
+    reason?: string | null;
+    queued?: boolean;
+    usedMusicalLeanings?: boolean;
+  };
 }
 
 export interface DebugLlm {
   activeModel?: string;
   provider?: string;
+  /** Set while LLM calls go to the backup instead of the primary (any failover); null/absent = normal routing. */
+  routedToBackup?: {
+    reason?: string;
+    since?: number;
+    lastAt?: number;
+    calls?: number;
+    lastOk?: boolean;
+    provider?: string;
+    model?: string;
+    retryPrimaryAt?: number;
+  } | null;
   budget?: DebugBudget;
   recentCalls?: LlmCall[];
   /** Raw-request capture status — drives the toggle + file-path hint. */
@@ -220,4 +279,4 @@ export interface DebugData {
   error?: string;
 }
 
-
+export type { PlaybackFailureHistory } from '../../../lib/schemas.generated';

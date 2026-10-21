@@ -21,15 +21,16 @@
 //      jingle takes, the jingle stands down for a scheduled segment, and a
 //      clip already rendered and waiting for a boundary holds it.
 //
-// Run: npx tsx scripts/jingle-rotate.test.ts (auto-discovered by npm test).
+// Run: `npm test -- jingle-rotate`.
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import type { TalkKind, TalkPlan } from '../src/broadcast/talk-scheduler.js';
 
-process.env.STATE_DIR = mkdtempSync(join(tmpdir(), 'subwave-jingle-rotate-'));
+process.env.STATE_DIR = createTempDir(join(tmpdir(), 'subwave-jingle-rotate-'));
 
 const {
   jingleRotateOwner,

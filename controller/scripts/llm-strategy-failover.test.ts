@@ -1,14 +1,14 @@
 // Run the actual primitives, replacing only model generation. Settings, SDK
 // validation, strategy recovery, failover and telemetry all remain real.
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import test, { after, type TestContext } from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { z } from 'zod';
+import type { MockLanguageModelV3 } from 'ai/test';
 
-const previousStateDir = process.env.STATE_DIR;
-const stateRoot = mkdtempSync(path.join(tmpdir(), 'subwave-strategy-failover-'));
+const stateRoot = createTempDir(path.join(tmpdir(), 'subwave-strategy-failover-'));
 process.env.STATE_DIR = stateRoot;
 
 const store = await import('../src/settings/store.js');
@@ -17,17 +17,10 @@ const { primaryLeg, fallbackLeg } = await import('../src/llm/internal/provider/l
 const { djObject, djAgent } = await import('../src/llm/sdk.js');
 const { recentCalls } = await import('../src/llm/log.js');
 const { GenerationCancelledError } = await import('../src/llm/internal/core/generation.js');
-const previousCache = store.peek();
+const { resetFailoverStickyForTest } = await import('../src/llm/internal/core/failover.js');
 const schema = z.object({ name: z.string() });
 const answer = { name: 'backup' };
 const tools = { sample: { inputSchema: z.object({}) } };
-
-after(() => {
-  store.setCache(previousCache);
-  if (previousStateDir === undefined) delete process.env.STATE_DIR;
-  else process.env.STATE_DIR = previousStateDir;
-  rmSync(stateRoot, { recursive: true, force: true });
-});
 
 function configure(t: TestContext, provider: string, backup = true) {
   const defaults = settings.getDefaults();
@@ -36,28 +29,33 @@ function configure(t: TestContext, provider: string, backup = true) {
     fallback: { ...defaults.llm.fallback, enabled: backup, provider: 'openai', model: 'strategy-backup' },
   } });
   recentCalls.length = 0;
+  resetFailoverStickyForTest();
+  t.after(() => resetFailoverStickyForTest());
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('unexpected provider traffic'); });
   return { primary: primaryLeg(), backup: fallbackLeg() };
 }
 
-function response(text: string, toolName?: string) {
+function response(text: string, toolName?: string): Awaited<ReturnType<MockLanguageModelV3['doGenerate']>> {
   return {
     content: toolName
       ? [{ type: 'tool-call', toolCallId: 'answer', toolName, input: text }]
       : [{ type: 'text', text }],
     finishReason: { unified: toolName ? 'tool-calls' : 'stop', raw: 'stop' },
-    usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
+    usage: {
+      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: { total: 1, text: 1, reasoning: 0 },
+    },
     warnings: [],
   };
 }
 
-function mockGeneration(t: TestContext, leg: ReturnType<typeof primaryLeg>, generate: () => Promise<ReturnType<typeof response>>) {
+function mockGeneration(t: TestContext, leg: ReturnType<typeof primaryLeg>, generate: (options?: { toolChoice?: { type?: string } }) => Promise<ReturnType<typeof response>>) {
   for (const model of new Set([leg.model, leg.noThinkModel])) {
     t.mock.method(model, 'doGenerate', generate);
   }
 }
 
-function nativeAgentAnswer() {
+function nativeAgentAnswer(): ReturnType<typeof response> {
   const result = response(JSON.stringify(answer));
   // Native output must include discovery to be accepted by the actual agent.
   return { ...result, content: [...result.content,
@@ -152,6 +150,21 @@ test('native-first djAgent still recovers from malformed output through the prim
   assert.equal(recentCalls[0].model, 'openai:strategy-primary');
 });
 
+const explorable = { sample: { inputSchema: z.object({}), execute: async () => ({ found: 1 }) } };
+
+test('the native pass forces a discovery call on its first step only, and finishes in two calls', async (t) => {
+  const { primary } = configure(t, 'openai');
+  const choices: unknown[] = [];
+  mockGeneration(t, primary, async (options) => {
+    choices.push(options?.toolChoice?.type);
+    return choices.length === 1 ? response('{}', 'sample') : response(JSON.stringify(answer));
+  });
+  const result = await djAgent({ system: 'Choose a name', messages: [{ role: 'user', content: 'Choose' }], tools: explorable, schema });
+  assert.deepEqual(result.object, answer);
+  assert.deepEqual(choices, ['required', 'auto'], 'step 0 must explore; later steps may answer');
+  assert.equal(recentCalls[0].via, 'ai-sdk:agent:native', 'native pass should have answered; the done-tool fallback ran');
+});
+
 test('a permanent error during agent terminal recovery reaches the backup without text salvage masking it', async (t) => {
   const legs = configure(t, 'ollama');
   const error = new Error('model strategy-primary has been retired');
@@ -167,4 +180,58 @@ test('a permanent error during agent terminal recovery reaches the backup withou
   const failure = recentCalls.find((call) => call.model === 'ollama:strategy-primary');
   assert.equal(failure?.error, error.message);
   assert.equal(failure?.via, 'ai-sdk:agent:terminal:failover→openai:strategy-backup');
+});
+
+test('tool-choice refusal preserves executed discovery and usage through terminal recovery', async t => {
+  const { primary } = configure(t, 'ollama', false);
+  let calls = 0;
+  let executions = 0;
+  let terminalPrompt = '';
+  const candidate = { name: 'verified-candidate-123' };
+  for (const model of new Set([primary.model, primary.noThinkModel])) {
+    t.mock.method(model, 'doGenerate', async options => {
+      calls++;
+      if (calls === 1) return response('{}', 'sample');
+      if (calls < 4) return response('I decline to call done.');
+      terminalPrompt = JSON.stringify(options.prompt);
+      return response(JSON.stringify(candidate), 'emit');
+    });
+  }
+  const result = await djAgent({
+    system: 'Choose a discovered candidate',
+    messages: [{ role: 'user', content: 'Choose' }],
+    tools: { sample: {
+      inputSchema: z.object({}),
+      execute: async () => { executions++; return [candidate]; },
+    } },
+    schema,
+  });
+  assert.deepEqual(result.object, candidate);
+  assert.equal(executions, 1, 'completed discovery must not execute again during recovery');
+  assert.equal(calls, 4, 'one discovery, one main refusal, one recovery refusal, one terminal call');
+  assert.ok(terminalPrompt.includes(candidate.name), 'the terminal prompt must carry the actual discovery result');
+  assert.deepEqual(result.toolCalls, [{ name: 'sample', args: {}, result: [candidate], round: 1 }]);
+  assert.deepEqual(recentCalls[0].usage, { input: 4, output: 4, total: 8 });
+  assert.equal(recentCalls[0].via, 'ai-sdk:agent:terminal');
+});
+
+test('context peaks include refused requests in a successful terminal recovery', async t => {
+  const { primary } = configure(t, 'ollama', false);
+  const inputs = [1000, 30_000, 20_000, 2000];
+  let calls = 0;
+  mockGeneration(t, primary, async () => {
+    const index = calls++;
+    const result = index === 0 ? response('{}', 'sample')
+      : index === 3 ? response(JSON.stringify(answer), 'emit') : response('I decline to call done.');
+    result.usage.inputTokens = { total: inputs[index], noCache: inputs[index], cacheRead: 0, cacheWrite: 0 };
+    return result;
+  });
+  const result = await djAgent({
+    kind: 'djAgentPick', system: 'Choose a discovered candidate', messages: [{ role: 'user', content: 'Choose' }],
+    tools: { sample: { inputSchema: z.object({}), execute: async () => [answer] } }, schema,
+  });
+  assert.deepEqual(result.object, answer);
+  assert.equal(calls, 4);
+  assert.equal(recentCalls[0].usage.input, 53_000);
+  assert.equal(recentCalls[0].contextPeakInput, 30_000);
 });

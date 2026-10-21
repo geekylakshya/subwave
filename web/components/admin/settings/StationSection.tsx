@@ -259,7 +259,7 @@ export function StationSection({ data, form, setForm, busy, saveSettings, fieldE
               <SelectGroup>
                 <SelectItem value="auto">Auto, server timezone ({serverTz})</SelectItem>
               </SelectGroup>
-              {/* Radix needs an item to show a zone outside the enumerated groups. */}
+              {/* Radix needs an item to display a zone outside these groups. */}
               {!tzInGroups ? (
                 <SelectGroup>
                   <SelectItem value={form.timezone}>{form.timezone}</SelectItem>
@@ -346,7 +346,7 @@ export function StationSection({ data, form, setForm, busy, saveSettings, fieldE
             />
             <div className="field-hint">
               Icecast checks every listener connect against the controller, on every
-              mount. Turning this on or off needs a mixer restart (danger zone) to
+              mount. Turning this on or off needs a mixer restart (Broadcast & mixer) to
               re-render the Icecast config; password changes apply live. While it&apos;s
               on, the tune-in files (<code>/listen.pls</code>, <code>/listen.m3u</code>)
               are disabled, and if the controller is down new listeners can&apos;t
@@ -366,8 +366,6 @@ export function StationSection({ data, form, setForm, busy, saveSettings, fieldE
               }
               className="w-[320px] max-w-full"
             />
-            {/* break-words: the tune-in URL below is one 48-char token, wider
-                than a phone card. */}
             <div className="field-hint break-words">
               One password for everyone, used by both locks above (Icecast is
               basic-auth only, so there are no per-user accounts). The web player asks

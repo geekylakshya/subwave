@@ -1,7 +1,7 @@
 import './globals.css';
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
-import { Fraunces, Plus_Jakarta_Sans, JetBrains_Mono, Doto, Space_Grotesk, Instrument_Serif, IBM_Plex_Mono, Space_Mono, Fira_Code, Anton, Chakra_Petch, Saira_Stencil_One, Courier_Prime, Overpass_Mono } from 'next/font/google';
+import { Fraunces, Plus_Jakarta_Sans, JetBrains_Mono, Doto, Space_Grotesk, Instrument_Serif, IBM_Plex_Mono, Space_Mono, Fira_Code, Anton, Chakra_Petch, Saira_Stencil, VT323, Bricolage_Grotesque, Courier_Prime, Overpass_Mono, DM_Mono } from 'next/font/google';
 import { GoogleAnalytics } from '@next/third-parties/google';
 import { THEME_INIT_SCRIPT } from '@/lib/theme';
 import { LITE_INIT_SCRIPT } from '@/lib/lite';
@@ -11,6 +11,7 @@ import { GA_ID } from '@/lib/ga';
 import ServiceWorkerRegister from '@/components/ServiceWorkerRegister';
 import MotionProvider from '@/components/MotionProvider';
 import ThemeProvider from '@/components/ThemeProvider';
+import ThemeFinishFilters from '@/components/ThemeFinishFilters';
 import JsonLd from '@/components/JsonLd';
 import { Toaster } from '@/components/ui/toaster';
 
@@ -62,11 +63,26 @@ const chakraPetch = Chakra_Petch({
   variable: '--font-chakra-petch',
 });
 
-const sairaStencilOne = Saira_Stencil_One({
+const sairaStencilOne = Saira_Stencil({
   subsets: ['latin'],
   weight: '400',
   display: 'swap',
+  adjustFontFallback: false,
   variable: '--font-saira-stencil-one',
+});
+
+const vt323 = VT323({
+  subsets: ['latin'],
+  weight: '400',
+  display: 'swap',
+  variable: '--font-vt323',
+});
+
+const bricolageGrotesque = Bricolage_Grotesque({
+  subsets: ['latin'],
+  axes: ['opsz'],
+  display: 'swap',
+  variable: '--font-bricolage-grotesque',
 });
 
 const plusJakarta = Plus_Jakarta_Sans({
@@ -116,6 +132,13 @@ const overpassMono = Overpass_Mono({
   subsets: ['latin'],
   display: 'swap',
   variable: '--font-overpass-mono',
+});
+
+const dmMono = DM_Mono({
+  subsets: ['latin'],
+  weight: ['400', '500'],
+  display: 'swap',
+  variable: '--font-dm-mono',
 });
 
 const DESCRIPTION =
@@ -186,26 +209,20 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html
       lang="en"
-      className={`${fraunces.variable} ${plusJakarta.variable} ${jetbrainsMono.variable} ${doto.variable} ${spaceGrotesk.variable} ${instrumentSerif.variable} ${anton.variable} ${chakraPetch.variable} ${sairaStencilOne.variable} ${ibmPlexMono.variable} ${spaceMono.variable} ${firaCode.variable} ${courierPrime.variable} ${overpassMono.variable}`}
+      className={`${fraunces.variable} ${plusJakarta.variable} ${jetbrainsMono.variable} ${doto.variable} ${spaceGrotesk.variable} ${instrumentSerif.variable} ${anton.variable} ${chakraPetch.variable} ${sairaStencilOne.variable} ${vt323.variable} ${bricolageGrotesque.variable} ${ibmPlexMono.variable} ${spaceMono.variable} ${firaCode.variable} ${courierPrime.variable} ${overpassMono.variable} ${dmMono.variable}`}
       suppressHydrationWarning
     >
       <head>
-        {/* Apply stored theme before paint to avoid a flash of the wrong
-            palette. Static constant from lib/theme, no untrusted input. */}
+        {/* Apply cached theme before paint. The script contains no untrusted input. */}
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
 
-        {/* Resolve low-power "lite" mode before paint so a pinned kiosk never
-            flashes the heavy build. Static constant from lib/lite. */}
         <script dangerouslySetInnerHTML={{ __html: LITE_INIT_SCRIPT }} />
 
-        {/* Hide the player shell before paint when this browser resolves to a
-            non-default skin. Static constant from lib/skin. */}
         <script dangerouslySetInnerHTML={{ __html: SKIN_INIT_SCRIPT }} />
 
         <JsonLd data={SITE_JSONLD} />
 
-        {/* Absolute share-card image tags -- see the metadata comment above for
-            why these bypass the Metadata API. */}
+        {/* Explicit image tags work around the Metadata API issue described above. */}
         <meta property="og:image" content={`${SITE_URL}/og`} />
         <meta property="og:image:type" content="image/png" />
         <meta property="og:image:width" content="1200" />
@@ -215,12 +232,12 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <meta name="twitter:image:alt" content={OG_IMAGE_ALT} />
       </head>
       <body suppressHydrationWarning>
+        <ThemeFinishFilters />
         <MotionProvider>
           <ThemeProvider>
             <ServiceWorkerRegister />
             {children}
-            {/* Mounted once at the root so every route has somewhere for
-                `notify()` to appear. Per-shell mounts duplicate the toaster. */}
+            {/* Keep one root toaster to avoid duplicate notifications. */}
             <Toaster />
           </ThemeProvider>
         </MotionProvider>

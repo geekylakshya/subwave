@@ -1,48 +1,18 @@
-// Pure spoken-text normalizer — the defensive layer between generated radio
-// copy and the TTS engines (issue #963). The DJ prompts already ask for
-// "spoken words only", but a model can still emit display text — weather
-// units, markdown emphasis, currency symbols — and engines read it literally
-// ("seventy-six F", or an awkward beat where the asterisks were). Every
-// booth-bound string converges on normalizeForSpeech() in audio/tts.ts, so
-// the rules here must stay conservative: real artist/title text rides the
-// same lines ("Ke$ha", "AC/DC", "P!nk" must survive untouched). Expressive
-// engines may use bracketed performance cues, but they are structural input:
-// closing, excess or trailing cues must never reach TTS.
-//
-// Plain quantities still belong to the engines. Years/decades are the narrow
-// exception: engines can read "1967" as a quantity instead of a date (#1669).
-// Spell those consistently for every engine, after operator corrections.
-//
-// TWO passes, and the split is load-bearing (issue #1186):
-//
-//   normalizeForDisplay() — markup + entity cleanup only. Safe for anything a
-//     PERSON reads: the booth log, the session the DJ remembers, the player's
-//     feed. Stripping `**bold**` makes a line more readable, never differently
-//     spelled.
-//   normalizeForSpeech()  — the above PLUS the pronunciation layer: operator
-//     corrections, year/decade and unit/symbol expansion, SUB/WAVE → "Subwave".
-//     These are spelled for an ENGINE's benefit, not a reader's — "Ye" reads
-//     as "Yay" only so the voice says it right, and a listener seeing "Yay"
-//     in the written line is a bug, not a feature. Speech-only spellings must
-//     never be persisted anywhere a human sees them.
-//
-// No imports — pure module, unit-pinned by scripts/speech-text.test.ts.
+// normalizeForDisplay removes markup only. normalizeForSpeech also applies
+// pronunciation corrections, year/decade and unit expansion, and station spelling.
+// Persist only display text; speech spellings belong exclusively to TTS (#963, #1186, #1669).
+// Preserve artist/title punctuation and validate structural performance cues.
+// Pure helpers; see scripts/speech-text.test.ts.
 
-// Operator-defined speech correction: replace `from` with `to` wherever it
-// appears in booth-bound text (settings.tts.corrections, admin → Settings →
-// TTS voice). The operator-extensible sibling of the built-in SUB/WAVE →
-// "Subwave" rule below, for names and terms the engines mispronounce
-// ("Hozier" → "Ho-zeer", "GHz" → "gigahertz"). Passed in as an argument —
-// never read from settings here — so this module stays pure.
+// Apply operator from/to corrections from settings.tts.corrections.
+// Pass them explicitly so the normalizer remains pure.
 export interface SpeechCorrection {
   from: string;
   to: string;
 }
 
-// Matching is case-insensitive and word-bounded — but a \b anchor only where
-// the rule's own edge is a word character, mirroring the SUB/WAVE rule's
-// anchors: a rule for "live" must not fire inside "delivery", while a rule
-// whose edge is a symbol ("Ke$ha") has no word boundary there to anchor on.
+// Use case-insensitive matches and add word boundaries only at word-character
+// edges: live cannot match delivery, while symbol-edged names need no boundary there.
 const REGEX_SPECIALS_RE = /[.*+?^${}()|[\]\\]/g;
 // Reuse each row's pattern across lines; weak keys release old settings when
 // they are replaced. Check `from` on every use so in-place edits work too.
@@ -188,7 +158,7 @@ function normalizeYears(text: string): string {
 // Fish/Chatterbox performance cues are deliberately loose in vocabulary — the
 // provider owns what it can express — but strict in position and purpose. A
 // cue must have spoken words before the next cue (or the end), and a segment
-// may carry at most two. Production directions are never useful TTS input:
+// may carry at most two. Arbitrary production directions are not TTS input:
 // they invite the engine to narrate a fade, a track change or a timing note.
 // This keeps a legitimate delivery change while dropping the common model
 // failure of appending `[softly]` after its final sentence. Closing tags have
@@ -199,6 +169,14 @@ const PERFORMANCE_CUE_RE = /\[[^\]\r\n]{1,80}\]/g;
 const SPOKEN_CHAR_RE = /[\p{L}\p{N}]/u;
 const PRODUCTION_CUE_RE = /\b(?:cue|square|stage|direction|fad(?:e|es|ed|ing)|music|track|vocals?|sounds?|intro(?:duction)?|outro|transition|paus(?:e|es|ed|ing)|riff(?:ing)?|build(?:ing|s)?|seconds?|\d+s)\b/i;
 const PRODUCTION_ACTION_RE = /\b(?:cue|stage|direction|fad(?:e|es|ed|ing)|intro(?:duction)?|outro|transition|paus(?:e|es|ed|ing)|riff(?:ing)?|build(?:ing|s)?|\d+s)\b/i;
+// These are engine instructions, not arbitrary production directions. Display
+// cleanup keeps them until the dispatcher knows the engine; only Gemini may
+// send them to synthesis. They still share the two-cue/following-words limits.
+const SUPPORTED_PAUSE_CUE_RE = /^(?:short|medium|long) pause[.!]*$/i;
+interface SpeechCuePolicy {
+  engine?: string;
+  forDisplay?: boolean;
+}
 const TITLE_QUALIFIER_RE = /^(?:live\b.*|deluxe\b.*|remaster(?:ed)?\b.*|radio edit\b.*|single edit\b.*|album version\b.*|original version\b.*|mono\b.*|stereo\b.*|acoustic\b.*|demo\b.*|bonus track\b.*|anniversary\b.*|expanded edition\b.*)$/i;
 const BRACKETED_TITLE_RE = /^(?:untitled(?:\s+(?:track\s*)?(?:no\.?\s*)?#?\d+)?|track\s*(?:no\.?\s*)?#?\d+)$/i;
 const TITLE_CONTEXT_RE = /\b(?:from|with|called|titled|track|song|album|record|version|mix|cut)\s*$/i;
@@ -207,12 +185,14 @@ function isTitleQualifier(body: string): boolean {
   return TITLE_QUALIFIER_RE.test(body) && !PRODUCTION_ACTION_RE.test(body);
 }
 
-function isPerformanceCue(body: string): boolean {
+function isPerformanceCue(body: string, policy: SpeechCuePolicy): boolean {
+  const supportedPause = (policy.forDisplay === true || policy.engine === 'gemini')
+    && SUPPORTED_PAUSE_CUE_RE.test(body);
   return !isTitleQualifier(body)
     && !body.startsWith('/')
     && !body.startsWith('-')
     && !/\d/.test(body)
-    && !PRODUCTION_CUE_RE.test(body);
+    && (!PRODUCTION_CUE_RE.test(body) || supportedPause);
 }
 
 // Real catalogue titles include names such as "[Untitled]". Preserve that
@@ -240,7 +220,7 @@ function stripUnmatchedCueBrackets(text: string): string {
   return out + text.slice(cursor).replace(/[\[\]]/g, '');
 }
 
-export function sanitizePerformanceCues(text: string, maxCues = 2): string {
+export function sanitizePerformanceCues(text: string, maxCues = 2, policy: SpeechCuePolicy = {}): string {
   if (!text) return text;
   const safeText = stripUnmatchedCueBrackets(text);
   const cues = [...safeText.matchAll(PERFORMANCE_CUE_RE)];
@@ -259,7 +239,7 @@ export function sanitizePerformanceCues(text: string, maxCues = 2): string {
     out += safeText.slice(cursor, start);
     if (isLiteralBracket(body, safeText.slice(0, start))) {
       out += cue[0];
-    } else if (isPerformanceCue(body) && hasFollowingWords && kept < maxCues) {
+    } else if (isPerformanceCue(body, policy) && hasFollowingWords && kept < maxCues) {
       out += cue[0];
       kept += 1;
     } else if (!hasFollowingWords && nextStart === safeText.length) {
@@ -284,9 +264,9 @@ function literalizeBracketedSpeech(text: string): string {
 
 // Markup + entity cleanup — everything in the pipeline that is safe for a
 // READER as well as an engine. Shared by both public passes so display and
-// speech can never disagree about what the words are; only about how they're
-// spelled out loud.
-function stripMarkup(text: string): string {
+// speech agree about the words. Display retains supported pause cues until
+// synthesis can filter them for the chosen engine.
+function stripMarkup(text: string, policy: SpeechCuePolicy = {}): string {
   let t = text;
 
   // Invisible format controls and soft hyphens have no spoken value but can
@@ -325,7 +305,7 @@ function stripMarkup(text: string): string {
   t = t.replace(/&(?:#0*34|quot|#0*8220|ldquo|#0*8221|rdquo);/gi, '"');
   t = t.replace(/&nbsp;/gi, ' ');
 
-  return sanitizePerformanceCues(t);
+  return sanitizePerformanceCues(t, 2, policy);
 }
 
 // Markup removal can leave doubled spaces; neither speech nor a booth-log line
@@ -414,16 +394,17 @@ export function stripSpeakerLabel(text: string, castNames: Iterable<string>): st
 
 export function normalizeForDisplay(text: string): string {
   if (!text) return text;
-  return collapseSpace(stripMarkup(text));
+  return collapseSpace(stripMarkup(text, { forDisplay: true }));
 }
 
 export function normalizeForSpeech(
   text: string,
   corrections?: readonly SpeechCorrection[],
   language = '',
+  engine = '',
 ): string {
   if (!text) return text;
-  let t = stripMarkup(text);
+  let t = stripMarkup(text, { engine });
 
   // Keep literal bracket content in the reader-facing form, but remove the
   // cue-shaped delimiters before TTS so an expressive engine cannot interpret

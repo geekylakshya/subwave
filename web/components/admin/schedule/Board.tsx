@@ -1,11 +1,5 @@
 'use client';
 
-// 7-column × 24-hour week board. Cards are shows, hatched slots are silent
-// runs; every write is local until Save the week.
-//
-// Geometry (#1204): columns divide the board's width from `sm` up (`sm:w-full`
-// + `sm:min-w-0`), no px floor. The hour unit is the `--hour-px` CSS variable
-// so the gutter's static height and each card's `calc()` cannot drift apart.
 
 import type {
   ComponentPropsWithoutRef, DragEvent, KeyboardEvent, PointerEvent,
@@ -81,6 +75,8 @@ export interface BoardProps {
   folded: Record<number, boolean>;
   onToggleFold: (day: number) => void;
   todayKey: number;
+  /** The station's clock as minutes since midnight (1265 = 21:05), for the now line. */
+  nowMinute: number;
   colorOf: (id: string | null | undefined) => string;
   hoursOf: (id: string) => number;
   onPick: (b: Block) => void;
@@ -102,7 +98,7 @@ export interface BoardProps {
 }
 
 export default function Board({
-  schedule, shows, folded, onToggleFold, todayKey,
+  schedule, shows, folded, onToggleFold, todayKey, nowMinute,
   colorOf, hoursOf, onPick, onRemove, onResize, onDropShow, onDragRun,
   armedShowId, onArmShow, onFillDay, onFillHour,
   density, hourPx, onDensity,
@@ -261,7 +257,6 @@ export default function Board({
     >
       <section>
       <div className="mb-3 flex flex-wrap items-center gap-x-3.5 gap-y-2 px-5 sm:px-[30px]">
-        {/* Two lengths: resize handles stay mouse-only; run dragging has a touch grip. */}
         <Mu className="min-w-0 flex-1 tracking-[0.08em] sm:hidden">
           {armedName
             ? `${armedName} is armed — tap an hour to book it, or a day header for the whole day`
@@ -304,8 +299,6 @@ export default function Board({
         </span>
       </div>
 
-      {/* The shelf wraps rather than scrolling: a chip must be on screen to be
-          dragged or armed. A chip is also a brush — arm it, then fill from the board. */}
       <div className="mx-5 mb-3.5 border border-ink bg-[var(--page-bg)] sm:mx-[30px]">
         <div className="flex flex-wrap items-center gap-2 px-3 py-2.5">
           <span className="eyebrow mr-1 flex-none text-ink">The shelf</span>
@@ -351,7 +344,6 @@ export default function Board({
         </div>
       </div>
 
-      {/* Radix reveals its scrollbar only on hover, so name the swipe outright. */}
       <Mu className="mb-1.5 flex items-center gap-1.5 px-5 tracking-[0.08em] sm:hidden">
         <span aria-hidden="true">◂</span>
         Swipe the board — Mon through Sun
@@ -360,8 +352,6 @@ export default function Board({
 
       <ScrollArea>
         <div ref={gridRef} className="flex w-max min-w-full items-start gap-2.5 pb-1.5 sm:w-full">
-          {/* Hour gutter — pt clears the 38px column headers (+border+padding).
-              Pinned at every width so the hour stays readable when the board scrolls. */}
           <div className="sticky left-0 z-10 w-[42px] flex-none bg-[var(--card-bg)] pt-[43px]">
             {HOURS.map(h => (
               // aria-disabled, not disabled: Firefox drops the tooltip and focus
@@ -401,6 +391,7 @@ export default function Board({
                 label={d.label}
                 name={d.name}
                 today={d.key === todayKey}
+                nowMinute={nowMinute}
                 blocks={dayBlocks(preview && d.key === dragDay ? preview.week : schedule, d.key)}
                 colorOf={colorOf}
                 shows={shows}
@@ -439,7 +430,7 @@ export default function Board({
 }
 
 function DayColumn({
-  label, name, today, blocks, colorOf, shows, density, hourPx, armedShowId, armedName,
+  label, name, today, nowMinute, blocks, colorOf, shows, density, hourPx, armedShowId, armedName,
   onToggleFold, onFillDay, onPick, onRemove, onResize, onDropShow,
   dragRun, dragStart, domOrder,
   runPlacements,
@@ -448,6 +439,7 @@ function DayColumn({
   label: string;
   name: string;
   today: boolean;
+  nowMinute: number;
   blocks: Block[];
   colorOf: (id: string | null | undefined) => string;
   shows: ScheduleShow[];
@@ -483,10 +475,11 @@ function DayColumn({
   return (
     // Phone: fixed-width strip so the next day peeks past the edge. From sm up
     // `min-w-0` lets the seven columns divide the board's width.
-    <div className="flex min-w-[164px] flex-1 flex-col border border-ink bg-[var(--page-bg)] sm:min-w-0">
-      {/* The header body folds the column, or fills the whole day while a brush
-          is armed. The chevron folds in either mode, so an armed brush always
-          leaves a collapse control; the footer keeps one too (24 hours tall). */}
+    // Today's clock gets its own gutter so it cannot cover a card's title.
+    <div className={cn(
+      'flex min-w-[164px] flex-1 flex-col border border-ink bg-[var(--page-bg)] sm:min-w-0',
+      today && 'mr-[var(--now-gutter)] [--now-gutter:4rem]',
+    )}>
       <div className="flex h-[38px] items-stretch border-b border-solid border-b-ink">
         <button
           type="button"
@@ -515,13 +508,13 @@ function DayColumn({
           <FoldHorizontal size={13} strokeWidth={1.75} aria-hidden />
         </button>
       </div>
-      {/* The padding sits outside the ladder so the inner box starts exactly at
-          hour 0 — `landing` and the ghost both measure off it. */}
+      {/* Measure landing positions and the ghost from the inner box at hour zero. */}
       <div className="p-[5px]">
         <div
           ref={hoursRef}
           className="relative"
         >
+          <NowLine minute={nowMinute} today={today} />
           {ordered.map(({ block: b, key }) =>
             b.showId ? (
               <BoardCard
@@ -560,7 +553,6 @@ function DayColumn({
       </div>
       <div className="flex items-center gap-2 border-t border-separator-strong px-2.5 py-2">
         <Mu className="text-[8px]">{booked} h booked</Mu>
-        {/* min-h-9 on a phone: an 8px text label alone is no tap target. */}
         <button
           type="button"
           onClick={onToggleFold}
@@ -752,10 +744,6 @@ function BoardCard({
           </span>
         )}
       </button>
-      {/* Match the playlist builder's input split: only this 28px grip owns
-          touch movement, so a swipe beginning on the card body still scrolls.
-          Its hit area is 32px high even on a one-hour compact card; the outer
-          card deliberately does not clip it. The resize edges sit above it. */}
       <button
         type="button"
         ref={setActivatorNodeRef}
@@ -768,7 +756,6 @@ function BoardCard({
       >
         <GripVertical size={12} strokeWidth={2} aria-hidden />
       </button>
-      {/* While drafting, print the range even on short cards. */}
       {draft && !showRange && (
         <span className="pointer-events-none absolute inset-x-0 bottom-0 bg-[rgba(0,0,0,0.45)] px-1 text-center font-mono text-[8.5px] tracking-[0.06em] whitespace-nowrap">
           {range}
@@ -902,5 +889,32 @@ function DropSlot({
         </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
+  );
+}
+
+// The station's current time across the board: solid with a time tag in today's
+// column, dashed in the others. Show colours span every hue, so the line is white
+// with a dark halo to read on any card.
+function NowLine({ minute, today }: { minute: number; today: boolean }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useDynamicStyle(ref, { top: `calc(var(--hour-px) * ${minute} / 60)` });
+  return (
+    <div
+      ref={ref}
+      aria-hidden="true"
+      className={cn(
+        // above the cards, below the sticky hour rail (z-10) and the page header
+        'pointer-events-none absolute -left-[5px] z-[5] [filter:drop-shadow(0_0_1px_rgb(0_0_0/0.9))_drop-shadow(0_1px_3px_rgb(0_0_0/0.5))]',
+        today
+          ? 'right-[calc(-5px_-_var(--now-gutter))] h-[3px] bg-white'
+          : '-right-[5px] border-t-2 border-dashed border-white/60',
+      )}
+    >
+      {today && (
+        <span className="absolute top-1/2 right-0 -translate-y-1/2 bg-vermilion px-2 py-1 font-mono text-[13px] leading-none font-bold tracking-[0.04em] text-white">
+          {hh(Math.floor(minute / 60))}:{hh(minute % 60)}
+        </span>
+      )}
+    </div>
   );
 }

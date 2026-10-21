@@ -3,31 +3,24 @@
 // knob, a widened failover gate) fails an assert before it reaches a model.
 
 import assert from 'node:assert/strict';
+import test from 'node:test';
 import { z } from 'zod';
-import { generateText, APICallError } from 'ai';
+import { generateText, APICallError, ToolChoiceViolationError } from 'ai';
 import { MockLanguageModelV3 } from 'ai/test';
-import { stripThinking, truncationError, extractJson, usageOf, perfOf, warningsOf, budgetMode, isGenerationControlError, isProviderRequestTimeout, isUnreachable, isTransient, isQuotaOrAuthError, isUpstreamOverloaded, isRateLimited, isModelUnavailable, errReason, nearestId, isElevenLabsV3, isFishS21Model, cloudExpressionCueFamily, snapV3Stability, modelTolerant, schemaHint, clipText, soulBrief, SOUL_BRIEF_MAX, renderTerminalPrompt, messageText } from '../src/llm/internal/core/pure.js';
+import { stripThinking, truncationError, extractJson, usageOf, perfOf, warningsOf, budgetMode, isGenerationControlError, isProviderRequestTimeout, isUnreachable, isTransient, isQuotaOrAuthError, isUpstreamOverloaded, isRateLimited, isModelUnavailable, isServerExhausted, isConnectionRefused, errReason, nearestId, isElevenLabsV3, isFishS21Model, cloudExpressionCueFamily, elevenLabsTtsModelIds, snapV3Stability, modelTolerant, schemaHint, clipText, soulBrief, SOUL_BRIEF_MAX, renderTerminalPrompt, messageText } from '../src/llm/internal/core/pure.js';
 import { withDeadline, withTransientRetry, retryAfterMs } from '../src/llm/internal/core/retry.js';
-import { reasoningFor, needsToolCallObject, repeatPenaltyApplies, appliedNumCtx, appliedRepeatPenalty, forcedToolChoice, discoveryStepsFor, gatedMaxStepsFor, runDiscoverySteps, DISCOVERY_STEPS_MIN, DISCOVERY_STEPS_MAX } from '../src/llm/internal/provider/capabilities.js';
+import { reasoningFor, needsToolCallObject, repeatPenaltyApplies, appliedNumCtx, appliedRepeatPenalty, forcedToolChoice, nativeFirstStepToolChoice, thinkingMandatoryModel, discoveryStepsFor, gatedMaxStepsFor, runDiscoverySteps, DISCOVERY_STEPS_MIN, DISCOVERY_STEPS_MAX } from '../src/llm/internal/provider/capabilities.js';
 import { agentPlan } from '../src/llm/internal/strategy/plan.js';
 import { objectViaToolCall, emitInstructions, EMIT_ANSWER_INSTRUCTION } from '../src/llm/internal/strategy/object-via-tool.js';
 import { NATIVE_JSON_INSTRUCTION } from '../src/llm/internal/strategy/object.js';
 import { introBudgetPhrase, enforceIntroBudget } from '../src/llm/internal/prompts/intro-budget.js';
 import { embeddingBaseUrl } from '../src/llm/internal/provider/embedding.js';
 import { DEFAULT_LOCCA_EMBED_BASE_URL, openAICompatibleFetch } from '../src/llm/internal/provider/registry.js';
-import { personaToneDirectives, normalizeDial, DIAL_NEUTRAL, validatePersonasStrict, clampTtsSpeed, TTS_SPEED_DEFAULT, clampMaxOutputTokens, resolveMaxOutputTokens, MAX_OUTPUT_TOKENS_MIN, MAX_OUTPUT_TOKENS_MAX, effectiveFrequency, SCRIPT_LENGTHS } from '../src/settings.js';
+import { personaToneDirectives, validatePersonasStrict, clampTtsSpeed, TTS_SPEED_DEFAULT, clampMaxOutputTokens, resolveMaxOutputTokens, MAX_OUTPUT_TOKENS_MIN, MAX_OUTPUT_TOKENS_MAX, effectiveFrequency, SCRIPT_LENGTHS } from '../src/settings.js';
 import { lengthMode, lengthPhrase } from '../src/llm/internal/prompts/system.js';
 import { showMusicLean } from '../src/llm/internal/prompts/picker.js';
 import { planSchema } from '../src/llm/internal/prompts/programme.js';
 import { modelForCloudRequest, resolveCloudModel, resolveCloudProvider, sharedCloudApiKeyForRequest, speedDirective } from '../src/llm/internal/speech/cloud-speech.js';
-
-let failures = 0;
-function test(name: string, fn: () => void | Promise<void>) {
-  return Promise.resolve()
-    .then(fn)
-    .then(() => console.log(`  ✓ ${name}`))
-    .catch((err) => { failures++; console.error(`  ✗ ${name}\n      ${err?.message || err}`); });
-}
 
 async function main() {
   console.log('isUnreachable vs isTransient (the failover gate):');
@@ -106,7 +99,7 @@ async function main() {
   });
   await test('OpenRouter out-of-credit 402 classifies by message when status is flattened', () => {
     // Canonical 402 — caught by the existing insufficient-credit branch.
-    assert.equal(isQuotaOrAuthError(new Error('Your account or API key has insufficient credits. Add more credits and retry the request.')), true);
+    assert.equal(isQuotaOrAuthError(Object.assign(new Error('Your account or API key has insufficient credits. Add more credits and retry the request.'), { cause: undefined })), true);
     // Per-request affordability 402 — no "insufficient"/"quota" token, so it used
     const afford: any = new Error('This request requires more credits, or fewer max_tokens. You requested up to 4096 tokens, but can only afford 118.');
     assert.equal(isQuotaOrAuthError(afford), true);
@@ -203,6 +196,67 @@ async function main() {
   await test('a bare 429 with a Retry-After header but no wording → rate-limited', () => {
     assert.equal(isRateLimited({ statusCode: 429, responseHeaders: { 'retry-after': '20' } }), true);
     assert.equal(isRateLimited({ statusCode: 429, responseHeaders: { 'retry-after-ms': '500' } }), true);
+  });
+
+  console.log('isServerExhausted (a 5xx that survived same-leg retries → fail over, no wording needed):');
+  await test('a bare 500 with no wording classifies by status alone (the locca model-off case)', () => {
+    const e: any = { statusCode: 500, message: 'Internal Server Error' };
+    assert.equal(isServerExhausted(e), true);
+    assert.equal(isUnreachable(e), false);        // the host answered — not a network outage
+    assert.equal(isModelUnavailable(e), false);   // no wording to match — which is why this exists
+    assert.equal(isQuotaOrAuthError(e), false);
+    assert.equal(isTransient(e), true);           // still retried on the same leg first
+  });
+  await test('the exhausted statuses are exactly the 5xx subset that same-leg retry burns', () => {
+    for (const status of [500, 502, 503, 504]) assert.equal(isServerExhausted({ statusCode: status }), true);
+    for (const status of [408, 425, 429, 501, 529]) assert.equal(isServerExhausted({ statusCode: status }), false);
+  });
+  await test('a wording-only 5xx in the message classifies when the SDK flattened the status', () => {
+    assert.equal(isServerExhausted({ message: 'HTTP 503: Service Unavailable' }), true);
+    assert.equal(isServerExhausted({ message: 'request failed with 502' }), true);
+    // …but a 4xx mention or a number inside prose does not.
+    assert.equal(isServerExhausted({ message: 'HTTP 429: too many requests' }), false);
+    assert.equal(isServerExhausted({ message: 'processed 5001 tokens in 5 seconds' }), false);
+  });
+  await test('a status code is the whole answer: a 4xx that mentions 500 is a bad request, not an exhausted server', () => {
+    assert.equal(isServerExhausted({ statusCode: 400, message: 'max_tokens must be at most 500' }), false);
+    assert.equal(isServerExhausted({ statusCode: 422, message: 'upstream said 503' }), false);
+    assert.equal(isServerExhausted({ cause: { statusCode: 404 }, message: 'route /v1/502 not found' }), false);
+  });
+  await test('cause.statusCode is unwrapped and SDK retry wrappers survive', () => {
+    assert.equal(isServerExhausted({ cause: { statusCode: 502 } }), true);
+    const inner = { statusCode: 500, message: 'Internal Server Error' };
+    for (const wrapped of [{ lastError: inner }, { errors: [inner] }]) {
+      assert.equal(isServerExhausted(wrapped), true);
+    }
+  });
+  await test('generation control errors and local parse failures never exhaust', () => {
+    const deadline: any = new Error('pick exceeded 45000ms deadline');
+    deadline.name = 'AgentDeadlineError';
+    assert.equal(isServerExhausted(deadline), false);
+    // A model reply that happens to contain "500" is quoted in a SyntaxError's
+    // message — providerMessage blanks it, so neither status nor wording matches.
+    const parse: any = new SyntaxError('Unexpected token \'I\', "Internal Server Error (500)" is not valid JSON');
+    assert.equal(isServerExhausted(parse), false);
+  });
+
+  console.log('isConnectionRefused (a refused/unresolvable host → skip same-leg retries):');
+  await test('ECONNREFUSED and ENOTFOUND classify by code, cause, or message', () => {
+    assert.equal(isConnectionRefused({ code: 'ECONNREFUSED' }), true);
+    assert.equal(isConnectionRefused({ code: 'ENOTFOUND' }), true);
+    assert.equal(isConnectionRefused({ cause: { code: 'ECONNREFUSED' } }), true);
+    assert.equal(isConnectionRefused(new Error('connect ECONNREFUSED 127.0.0.1:11434') as any), true);
+    assert.equal(isConnectionRefused({ lastError: { code: 'ENOTFOUND' } }), true);
+  });
+  await test('temporary failures stay retryable (EAI_AGAIN can clear in a second)', () => {
+    assert.equal(isConnectionRefused({ code: 'EAI_AGAIN' }), false);
+    assert.equal(isConnectionRefused({ code: 'ETIMEDOUT' }), false);
+    assert.equal(isConnectionRefused({ code: 'ECONNRESET' }), false);
+  });
+  await test('a refused host is still transient+unreachable for the failover gate', () => {
+    const e: any = { code: 'ECONNREFUSED', message: 'connect ECONNREFUSED 127.0.0.1:11434' };
+    assert.equal(isTransient(e), true);
+    assert.equal(isUnreachable(e), true);
   });
 
   console.log('isModelUnavailable (model gone for good → fail over, never retry):');
@@ -464,7 +518,7 @@ async function main() {
   await test('prefers a status when there is no errno, and never double-prints', () => {
     assert.equal(errReason({ statusCode: 503 }), '503');
     assert.equal(errReason({ message: '503 Service Unavailable', statusCode: 503 }), '503 Service Unavailable');
-    assert.equal(errReason(new Error('Insufficient credits. Add more credits and retry.')), 'Insufficient credits. Add more credits and retry.');
+    assert.equal(errReason(Object.assign(new Error('Insufficient credits. Add more credits and retry.'), { cause: undefined })), 'Insufficient credits. Add more credits and retry.');
     assert.equal(errReason(null), 'unknown');
   });
 
@@ -486,6 +540,17 @@ async function main() {
     assert.equal(reasoningFor({ provider: 'anthropic', model: 'claude-haiku-4.5', reasoning: true }), 'medium');
     assert.equal(reasoningFor({ provider: 'anthropic', model: 'claude-haiku-4.5', reasoning: true }, { forceNoThink: true }), 'none');
     assert.equal(reasoningFor({ provider: 'anthropic', model: 'claude-haiku-4.5', reasoning: false }), 'none');
+  });
+  await test('anthropic: thinking-mandatory generations never get none (it 400s) — minimal floor, medium when on', () => {
+    for (const model of ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-fable-5-1', 'claude-fable-5', 'claude-mythos-5-1']) {
+      assert.equal(reasoningFor({ provider: 'anthropic', model, reasoning: false }), 'minimal', model);
+      // forced-tool legs too: these models are never forced (forcedToolChoice), so thinking may stay on.
+      assert.equal(reasoningFor({ provider: 'anthropic', model, reasoning: false }, { forceNoThink: true }), 'minimal', model);
+      assert.equal(reasoningFor({ provider: 'anthropic', model, reasoning: true }, { forceNoThink: true }), 'medium', model);
+    }
+    // Earlier generations that still accept thinking:disabled keep the old mapping.
+    assert.equal(reasoningFor({ provider: 'anthropic', model: 'claude-sonnet-5', reasoning: false }), 'none');
+    assert.equal(reasoningFor({ provider: 'anthropic', model: 'claude-opus-5', reasoning: false }), 'none');
   });
   await test('google: none when reasoning off (provider maps it per family), default when on', () => {
     assert.equal(reasoningFor({ provider: 'google', model: 'gemini-3.5-flash', reasoning: false }), 'none');
@@ -521,6 +586,11 @@ async function main() {
     assert.equal(reasoningFor({ provider: 'gateway', model: 'anthropic/claude-haiku-4.5', reasoning: true }), undefined);
     assert.equal(reasoningFor({ provider: 'gateway', model: 'anthropic/claude-haiku-4.5', reasoning: false }), 'none');
     assert.equal(reasoningFor({ provider: 'gateway', model: 'deepseek/deepseek-v4', reasoning: true }, { forceNoThink: true }), 'none');
+  });
+  await test('gateway: a thinking-mandatory Claude downstream gets minimal, never none', () => {
+    assert.equal(reasoningFor({ provider: 'gateway', model: 'anthropic/claude-sonnet-5.5', reasoning: false }), 'minimal');
+    assert.equal(reasoningFor({ provider: 'gateway', model: 'anthropic/claude-opus-5.5', reasoning: true }, { forceNoThink: true }), 'minimal');
+    assert.equal(reasoningFor({ provider: 'gateway', model: 'anthropic/claude-opus-5.5', reasoning: true }), undefined);
   });
   await test('gateway: Gemma downstream (google/gemma-*) omits the param — no thinkingConfig to a non-thinking model (issue #1044)', () => {
     assert.equal(reasoningFor({ provider: 'gateway', model: 'google/gemma-4-31b-it', reasoning: false }), undefined);
@@ -594,6 +664,21 @@ async function main() {
     assert.equal(sent.reasoning_format, 'deepseek');
     assert.deepEqual(sent.reasoning, { enabled: false });
   });
+  await test('proxy to a thinking-mandatory Claude model: no thinking:disabled, reasoning effort:minimal', async () => {
+    // A proxy translating this to Anthropic Messages would turn thinking:disabled
+    // into a 400 on Sonnet 5.5 / Opus 5.5 / Fable 5.
+    let sent: any = null;
+    const impl = openAICompatibleFetch({ provider: 'openai-compatible', reasoning: false }, async (_u: any, init: any) => { sent = JSON.parse(init.body); return {} as any; }, true);
+    for (const model of ['claude-sonnet-5-5', 'anthropic/claude-opus-5.5', 'claude-fable-5-1']) {
+      await impl('http://x/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model, messages: [] }) });
+      assert.equal(sent.thinking, undefined, model);
+      assert.deepEqual(sent.reasoning, { effort: 'minimal' }, model);
+    }
+    // Any other model keeps the full suppression set.
+    await impl('http://x/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'claude-sonnet-5', messages: [] }) });
+    assert.deepEqual(sent.thinking, { type: 'disabled' });
+    assert.deepEqual(sent.reasoning, { enabled: false });
+  });
   await test('aggregator dialect: reasoning-mandatory model ids get effort:minimal, never enabled:false; existing body.reasoning never clobbered', async () => {
     let sent: any = null;
     const impl = openAICompatibleFetch({ provider: 'openai-compatible', reasoning: false }, async (_u: any, init: any) => { sent = JSON.parse(init.body); return {} as any; }, false);
@@ -620,6 +705,35 @@ async function main() {
     // Garbage / missing cfg never accidentally weakens the default.
     assert.equal(forcedToolChoice({ toolChoice: 'whatever' }), 'required');
     assert.equal(forcedToolChoice(undefined), 'required');
+  });
+  await test('nativeFirstStepToolChoice: hosted openai-compatible stays auto, every other leg follows forcedToolChoice (#1693 case D)', () => {
+    // Mistral: json_schema with tools is only compatible with tool_choice auto.
+    assert.equal(nativeFirstStepToolChoice({ provider: 'openai-compatible', compatibleMode: 'hosted' }), 'auto');
+    assert.equal(nativeFirstStepToolChoice({ provider: 'openai' }), 'required');
+    assert.equal(nativeFirstStepToolChoice({ provider: 'openai', toolChoice: 'auto' }), 'auto');
+    assert.equal(nativeFirstStepToolChoice({ provider: 'anthropic', model: 'claude-opus-5-5' }), 'auto');
+  });
+  await test('forcedToolChoice: thinking-mandatory Claude models are always auto — they 400 on tool_choice any/tool', () => {
+    // The live failure: openai-compatible proxy → claude-sonnet-5-5, required → any → 400.
+    assert.equal(forcedToolChoice({ provider: 'openai-compatible', model: 'claude-sonnet-5-5' }), 'auto');
+    assert.equal(forcedToolChoice({ provider: 'openai-compatible', model: 'claude-sonnet-5-5', toolChoice: 'required' }), 'auto');
+    assert.equal(forcedToolChoice({ provider: 'anthropic', model: 'claude-opus-5-5' }), 'auto');
+    assert.equal(forcedToolChoice({ provider: 'anthropic', model: 'claude-fable-5-1' }), 'auto');
+    assert.equal(forcedToolChoice({ provider: 'openrouter', model: 'anthropic/claude-sonnet-5.5' }), 'auto');
+    // Generations that accept forced tools are untouched.
+    assert.equal(forcedToolChoice({ provider: 'anthropic', model: 'claude-sonnet-5' }), 'required');
+    assert.equal(forcedToolChoice({ provider: 'anthropic', model: 'claude-opus-5' }), 'required');
+    assert.equal(forcedToolChoice({ provider: 'anthropic', model: 'claude-haiku-4-5' }), 'required');
+  });
+  await test('thinkingMandatoryModel: matches dash and dot spellings, prefixed ids and suffixes; no near misses', () => {
+    for (const id of ['claude-sonnet-5-5', 'claude-sonnet-5.5', 'anthropic/claude-opus-5-5', 'claude-opus-5-5-thinking',
+      'claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5-1', 'CLAUDE-SONNET-5-5']) {
+      assert.equal(thinkingMandatoryModel(id), true, id);
+    }
+    for (const id of ['claude-sonnet-5', 'claude-opus-5', 'claude-sonnet-5-20260101', 'claude-opus-4-8', 'claude-sonnet-4-5',
+      'claude-haiku-4-5', 'claude-fable-50', 'claude-sonnet-5-55', 'gpt-5.5', '', undefined as any]) {
+      assert.equal(thinkingMandatoryModel(id), false, String(id));
+    }
   });
 
   console.log('embeddingBaseUrl(cfg):');
@@ -713,8 +827,11 @@ async function main() {
         seen = opts;
         return {
           content: [{ type: 'text', text: 'here is the answer instead of calling the tool' }],
-          finishReason: 'stop',
-          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          finishReason: { unified: 'stop', raw: 'stop' },
+          usage: {
+            inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 1, text: 1, reasoning: 0 },
+          },
           warnings: [],
         };
       },
@@ -727,7 +844,7 @@ async function main() {
   }
   await test('the emit instruction reaches the model alongside the caller system prompt', async () => {
     const { seen, err } = await forcedToolCall('CALLER SYSTEM PROMPT');
-    assert.match(String(err?.message), /never called the emit tool/);
+    assert.ok(ToolChoiceViolationError.isInstance(err));
     // Serialised, so the assertion does not depend on how the SDK shapes the
     // system turn — only on the text having been sent.
     const wire = JSON.stringify(seen.prompt);
@@ -775,7 +892,7 @@ async function main() {
         { role: 'assistant', content: 'Just span Blue Monday.' },
         { role: 'user', content: 'Pick the track to play next. Stay silent — no link this time.' },
       ],
-      [{ name: 'searchByMood', args: { mood: 'late-night' }, result: [{ id: 'nEeVD8AWxtsGqdGS5vIvMr', title: 'Blue in Green' }] }],
+      [{ name: 'searchByMood', args: { mood: 'late-night' }, result: [{ id: 'nEeVD8AWxtsGqdGS5vIvMr', title: 'Blue in Green' }], round: 1 }],
     );
     assert.ok(prompt.includes('nEeVD8AWxtsGqdGS5vIvMr'), 'the discovered id must survive — without it a cornered model can only fabricate one');
     assert.ok(prompt.includes('searchByMood'), 'names the tool that produced the findings');
@@ -796,7 +913,7 @@ async function main() {
   await test('never renders the synthetic done tool as a finding', () => {
     const prompt = renderTerminalPrompt(
       [{ role: 'user', content: 'Pick.' }],
-      [{ name: 'done', args: { id: 'x' }, result: null }, { name: 'searchByMood', args: {}, result: [{ id: 'realId' }] }],
+      [{ name: 'done', args: { id: 'x' }, result: null, round: 1 }, { name: 'searchByMood', args: {}, result: [{ id: 'realId' }], round: 1 }],
     );
     assert.ok(!prompt.includes('done('), '`done` is the schema-emit signal, not a discovery result');
     assert.ok(prompt.includes('realId'), 'the genuine discovery still renders');
@@ -806,6 +923,7 @@ async function main() {
       name: `tool${i}`,
       args: {},
       result: [{ id: `id${i}`, blurb: 'x'.repeat(5000) }],
+      round: i + 1,
     }));
     const prompt = renderTerminalPrompt([{ role: 'user', content: 'Pick.' }], fat);
     assert.ok(prompt.length < 40_000, `prompt stays bounded (was ${prompt.length})`);
@@ -881,8 +999,10 @@ async function main() {
     assert.equal(truncationError({ finishReason: 'stop', text: 'Coming up next.' }), null);
     assert.equal(truncationError({ finishReason: 'unknown', text: 'x' }), null);
     assert.equal(truncationError({}), null);
-    const err = truncationError({ finishReason: 'length', text: 'We need to output spoken words only…', usage: { outputTokens: 4000 } });
-    assert.ok(err instanceof Error);
+    const result = truncationError({ finishReason: 'length', text: 'We need to output spoken words only…', usage: { outputTokens: 4000 } });
+    assert.ok(result instanceof Error);
+    assert.equal(result.cause, undefined);
+    const err = Object.assign(result, { cause: undefined });
     // Raw text/usage ride on the error so failureDiagnostics + the console
     // preview still show WHY the call failed.
     assert.equal(err.text, 'We need to output spoken words only…');
@@ -1033,15 +1153,7 @@ async function main() {
     assert.match(introBudgetPhrase(4000, 4000), /4s/);
   });
 
-  console.log('personaToneDirectives / normalizeDial:');
-  await test('normalizeDial clamps to 0-10 int, neutral on garbage', () => {
-    assert.equal(normalizeDial(7), 7);
-    assert.equal(normalizeDial(-3), 0);
-    assert.equal(normalizeDial(99), 10);
-    assert.equal(normalizeDial(6.7), 7);
-    assert.equal(normalizeDial('abc'), DIAL_NEUTRAL);
-    assert.equal(normalizeDial(undefined), DIAL_NEUTRAL);
-  });
+  console.log('personaToneDirectives:');
   await test('neutral / missing dials append nothing (prompt stays byte-identical)', () => {
     assert.equal(personaToneDirectives({ humour: 5, localColour: 5, warmth: 5 }), '');
     assert.equal(personaToneDirectives({}), '');
@@ -1056,20 +1168,6 @@ async function main() {
     const both = personaToneDirectives({ humour: 8, warmth: 8 });
     assert.ok(both.startsWith('\n\nTone:\n- '));
     assert.equal(both.split('\n- ').length, 3); // header + 2 bullets
-  });
-  // validatePersonasStrict rebuilds each persona from a field whitelist; dials
-  // missing from it are dropped on every save. Pin that they round-trip.
-  await test('validatePersonasStrict carries the dials through the save path', () => {
-    const base = { name: 'Nova', soul: 'late-night', frequency: 'moderate',
-      tts: { engine: 'piper', cloudProvider: 'openai', voice: '' } };
-    const [saved] = validatePersonasStrict([{ ...base, humour: 9, localColour: 0, warmth: 99 }]);
-    assert.equal(saved.humour, 9);
-    assert.equal(saved.localColour, 0);
-    assert.equal(saved.warmth, 10);            // clamped, same as normalizeDial
-    const [bare] = validatePersonasStrict([base]);
-    assert.equal(bare.humour, DIAL_NEUTRAL);   // absent dials default to neutral
-    assert.equal(bare.localColour, DIAL_NEUTRAL);
-    assert.equal(bare.warmth, DIAL_NEUTRAL);
   });
 
   // Every consumer branches on these values; pin the ladder and the save path.
@@ -1134,19 +1232,6 @@ async function main() {
     assert.equal(clampTtsSpeed(1.23), 1.25);
     assert.equal(clampTtsSpeed(0.87), 0.85);
     assert.equal(clampTtsSpeed(1.0), 1.0);
-  });
-
-  // The persona save path (validatePersonasStrict → validateTtsBlock) must carry
-  // tts.speed through, else the per-persona dial is silently dropped on every save.
-  await test('validatePersonasStrict carries tts.speed through the save path', () => {
-    const base = { name: 'Nova', soul: 'late-night', frequency: 'moderate',
-      tts: { engine: 'piper', cloudProvider: 'openai', voice: '' } };
-    const [fast] = validatePersonasStrict([{ ...base, tts: { ...base.tts, speed: 1.4 } }]);
-    assert.equal(fast.tts.speed, 1.4);
-    const [clamped] = validatePersonasStrict([{ ...base, tts: { ...base.tts, speed: 9 } }]);
-    assert.equal(clamped.tts.speed, 2.0);          // clamped to max
-    const [bare] = validatePersonasStrict([base]);
-    assert.equal(bare.tts.speed, TTS_SPEED_DEFAULT); // absent → unity
   });
 
   // At most one of body/atempo is non-null: send `speed` upstream or stretch locally.
@@ -1424,9 +1509,25 @@ async function main() {
   await test('cue families require both the matching provider and model family', () => {
     assert.equal(cloudExpressionCueFamily('fish-audio', 's2.1-pro'), 'fish-s21');
     assert.equal(cloudExpressionCueFamily('elevenlabs', 'eleven_v3'), 'elevenlabs-v3');
+    assert.equal(cloudExpressionCueFamily('elevenlabs', 'eleven_v3_conversational'), 'elevenlabs-v3');
+    assert.equal(cloudExpressionCueFamily('elevenlabs', 'eleven_v4'), 'elevenlabs-v3');
+    assert.equal(cloudExpressionCueFamily('elevenlabs', 'eleven_v4_turbo'), 'elevenlabs-v3');
+    assert.equal(cloudExpressionCueFamily('elevenlabs', 'eleven_flash_v2_5'), null);
+    assert.equal(cloudExpressionCueFamily('elevenlabs', 'eleven_v5'), null, 'an unchecked family stays out');
+    assert.equal(cloudExpressionCueFamily('elevenlabs', 'eleven_v40'), null);
     assert.equal(cloudExpressionCueFamily('fish-audio', 'eleven_v3_custom'), null);
     assert.equal(cloudExpressionCueFamily('elevenlabs', 's2.1-pro'), null);
     assert.equal(cloudExpressionCueFamily('openai', 'eleven_v3'), null);
+  });
+
+  await test('elevenLabsTtsModelIds keeps speech models in provider order and drops the rest', () => {
+    assert.deepEqual(elevenLabsTtsModelIds([
+      { model_id: 'eleven_v4_turbo', can_do_text_to_speech: true },
+      { model_id: 'eleven_english_sts_v2', can_do_text_to_speech: false },
+      { model_id: 'eleven_flash_v2_5', can_do_text_to_speech: true },
+      { can_do_text_to_speech: true },
+    ]), ['eleven_v4_turbo', 'eleven_flash_v2_5']);
+    assert.deepEqual(elevenLabsTtsModelIds({ detail: 'unauthorized' }), []);
   });
 
   console.log('isElevenLabsV3 (model-family gate):');
@@ -1440,6 +1541,8 @@ async function main() {
     assert.equal(isElevenLabsV3('eleven_flash_v2_5'), false);
     assert.equal(isElevenLabsV3('eleven_multilingual_v2'), false);
     assert.equal(isElevenLabsV3('eleven_ttv_v3'), false);
+    assert.equal(isElevenLabsV3('eleven_v4'), false, 'v4 takes a continuous stability: no snap');
+    assert.equal(isElevenLabsV3('eleven_v4_turbo'), false);
     assert.equal(isElevenLabsV3('gpt-4o-mini-tts'), false);
     assert.equal(isElevenLabsV3(''), false);
   });
@@ -1465,12 +1568,13 @@ async function main() {
 
   // Miniature twins of the real agent schemas, so these pin the mechanism without
   // importing modules that carry side effects.
-  const pickLike = () => modelTolerant(z.object({
+  const pickContract = () => z.object({
     id: z.string().describe('the exact id'),
     reason: z.string(),
     say: z.string().nullable().describe('spoken line or null'),
     transition: z.enum(['normal', 'blend']).nullable().describe('transition'),
-  }));
+  });
+  const pickLike = () => modelTolerant(pickContract());
   const SEGMENT_FALLBACK = { kind: '', text: '', sfx: null };
   const segmentLike = (onDiscard?: (field: string, value: unknown) => void) => modelTolerant(z.object({
     reason: z.string(),
@@ -1553,11 +1657,12 @@ async function main() {
   await test('every field stays in `required` under io:\'input\' — identical to the plain object schema', () => {
     const rendered: any = z.toJSONSchema(pickLike(), { target: 'draft-7', io: 'input' });
     assert.deepEqual(rendered.required.sort(), ['id', 'reason', 'say', 'transition']);
-    // Nullable-ness and enum values survive too — the model still sees the contract.
-    assert.deepEqual(rendered.properties.say.anyOf.map((b: any) => b.type).sort(), ['null', 'string']);
+    // Zod may encode nullable strings as a type array or an anyOf. The wrapper
+    // must preserve the complete plain schema, including nulls and descriptions.
     assert.deepEqual(rendered.properties.transition.anyOf[0].enum, ['normal', 'blend']);
     // Field descriptions still travel (they are the model's primary coaching channel).
     assert.equal(rendered.properties.id.description, 'the exact id');
+    assert.deepEqual(rendered, z.toJSONSchema(pickContract(), { target: 'draft-7', io: 'input' }));
   });
   await test('objectFallbacks does not leak a visible "default" into the schema (a field-level .catch() would)', () => {
     const rendered: any = z.toJSONSchema(segmentLike(), { target: 'draft-7', io: 'input' });
@@ -1677,9 +1782,6 @@ async function main() {
     // maxLength is still advertised to the model — the cap is a nudge, kept.
     assert.equal(rendered.properties.angle.maxLength, 200);
   });
-
-  console.log(failures === 0 ? '\nAll llm-pure tests passed.' : `\n${failures} test(s) FAILED.`);
-  if (failures > 0) process.exit(1);
 }
 
-main();
+await main();

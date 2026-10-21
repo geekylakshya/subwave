@@ -1,9 +1,5 @@
 'use client';
 
-// Show definitions. A scheduled show puts its persona on air and overrides the
-// autonomous mood (empty moods = Any/auto). /admin/shows/schedule owns the board
-// and PUT /schedule; this page loads the schedule read-only for the
-// hours-a-week counts. Putting a show on air right now is a takeover (dash).
 import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { z } from 'zod';
@@ -64,6 +60,7 @@ import {
 import { useSettingsQuery } from './settings/queries';
 import {
   patchShowSettings,
+  showKeys,
   useCommunityShowsQuery,
   useShowGenresQuery,
   useShowPlaylistsQuery,
@@ -250,8 +247,11 @@ export default function ShowsPanel() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ show: showPayload(show) }),
     }),
-    onDone: (result, _vars, client) => {
+    onDone: async (result, { show }, client) => {
       if (result.shows) patchShowSettings(client, { shows: result.shows });
+      // A save can turn Play in order on or off, or change the anchor that
+      // decides where the walk stands — so the position line must re-ask.
+      await client.invalidateQueries({ queryKey: showKeys.playlistPosition(show.id), exact: true });
     },
     toastOnError: false,
   });
@@ -279,8 +279,8 @@ export default function ShowsPanel() {
       themeId: '', genres: [], eras: [], energies: [], vocals: '',
       filtersStrict: false, maxTrackSeconds: null, minTrackLengthSeconds: null,
       fadeAtShowEnd: null,
-      playlistIds: [], playlistStrict: false, playlistExhaust: false, excludedPlaylistIds: [],
-      programme: false, segmentSkill: '', tags: [],
+      playlistIds: [], playlistStrict: false, playlistExhaust: false, playlistInOrder: false, excludedPlaylistIds: [],
+      programme: false, segmentSkill: '', preparationSkill: '', tags: [],
     });
     // errors populate only once a field is touched, so without this the new
     // row's "incomplete" badge stays silent about why.
@@ -373,7 +373,7 @@ export default function ShowsPanel() {
     return (
       <div className="grid gap-4">
         <Card title="Shows" sub="definitions">
-          <ErrorState error={err} onRetry={load} />
+          <ErrorState error={err} onRetry={load} retrying={settingsQuery.isFetching} />
         </Card>
       </div>
     );
@@ -465,8 +465,6 @@ export default function ShowsPanel() {
           </Btn>
         </div>
       </div>
-      {/* Hidden below a handful of shows: a filter bar over four rows is
-          furniture. */}
       {shows.length > 5 && (
         <RosterToolbar<ShowSort>
           query={query}
@@ -498,8 +496,6 @@ export default function ShowsPanel() {
           )}
         />
       )}
-      {/* The toolbar carries the view toggle once it is on screen; below the
-          threshold the header row keeps it. */}
       {shows.length > 0 && shows.length <= 5 && (
         <div className="flex justify-end">
           <RosterViewToggle view={view} onChange={setView} />
@@ -508,6 +504,7 @@ export default function ShowsPanel() {
 
       {shows.length === 0 && (
         <EmptyState
+          art="calendar"
           title="No shows scheduled"
           description="Add one to start programming the week."
         />

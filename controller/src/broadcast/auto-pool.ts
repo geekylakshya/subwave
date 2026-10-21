@@ -1,19 +1,14 @@
-// Pure pool builder for the auto.m3u fallback (broadcast/scheduler.ts). No I/O:
-// the caller fetches the source lists and feeds them in via take().
-//
-// Three guards on every candidate:
-//   1. Recency — drop anything recently played, by id AND by lowercased
-//      `title|artist` key, so N duplicate copies can't slip one back on (#874).
-//   2. Dedup — never add the same track twice, by id AND key.
-//   3. Artist cap — cap one artist's share; per-source overridable for a source
-//      that IS an exact operator-pinned set.
+// Build the fallback pool from injected sources. Apply recency and dedup by both ID and
+// title/artist key, then per-source artist caps. #874.
 
+import { aboveTrackCeiling } from '../music/track-ceiling.js';
 import { artistKey, trackKey } from '../music/recency.js';
 
 export interface PoolBuilderOpts {
   recentIds: Set<string>;
   recentKeys: Set<string>;   // lowercased `title|artist` of recent plays
   targetPool: number;        // stop accepting once the pool reaches this size
+  selectionMaxSec?: number | null;
   maxPerArtist: number;      // cap any one artist's share of the pool
 }
 
@@ -23,6 +18,10 @@ export interface TakeOpts {
   // set, so a narrow pinned playlist inside the recency window would coast
   // entirely off-playlist. Dedup and the artist cap still apply on the retry.
   neverStarve?: boolean;
+  // Skip the recency window for THIS source: one that carries its own (a full
+  // playlist rotation's longest-waiting order, #1919). Re-filtered by the
+  // station's trackHours, a 109-track rotation came out as a 2-track loop.
+  ignoreRecency?: boolean;
   // Lift the artist cap for THIS source only — a strict-playlist show pinned an
   // exact set, so a single-artist playlist is the point. Scoped per take()
   // because the other sources still run on such a show, and an uncapped
@@ -50,7 +49,7 @@ export function createPoolBuilder(opts: PoolBuilderOpts): PoolBuilder {
     let n = 0;
     for (const t of items) {
       if (n >= cap || pool.length >= targetPool) break;
-      if (!t?.id) continue;
+      if (!t?.id || aboveTrackCeiling(t, opts.selectionMaxSec)) continue;
       // Key only when the song has a title (mirrors queue.recentlyPlayed) so a
       // title-less row can't collapse an artist's whole catalogue.
       const tk = t.title ? trackKey(t) : '';
@@ -70,8 +69,8 @@ export function createPoolBuilder(opts: PoolBuilderOpts): PoolBuilder {
 
   const take = (label: string, items: any[], cap: number, takeOpts: TakeOpts = {}) => {
     const artistCap = takeOpts.maxPerArtist ?? maxPerArtist;
-    const n = pull(label, items, cap, false, artistCap);
-    if (n === 0 && takeOpts.neverStarve) pull(label, items, cap, true, artistCap);
+    const n = pull(label, items, cap, !!takeOpts.ignoreRecency, artistCap);
+    if (n === 0 && takeOpts.neverStarve && !takeOpts.ignoreRecency) pull(label, items, cap, true, artistCap);
   };
 
   return { pool, fromSource, take };

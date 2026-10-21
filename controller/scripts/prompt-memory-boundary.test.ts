@@ -9,9 +9,10 @@
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { removeTempDir } from './test-utils/temp-dir.js';
 
 const root = mkdtempSync(join(tmpdir(), 'subwave-prompt-memory-'));
 process.env.STATE_DIR = root;
@@ -22,8 +23,8 @@ const { queue } = await import('../src/broadcast/queue.js');
 const scripts = await import('../src/llm/internal/prompts/scripts.js');
 const { exchangeSegment } = await import('../src/broadcast/queue/pure.js');
 
-after(() => {
-  rmSync(root, { recursive: true, force: true });
+after(async () => {
+  await removeTempDir(root);
 });
 
 function context(show: { id: string; name: string } | null, period = 'morning') {
@@ -255,7 +256,15 @@ test('the recap window measures from the newest turn, not the oldest', () => {
   ], 'openers carry no time cutoff of their own — only the recap does');
 });
 
-test('prompt memory survives a controller restart', async () => {
+test('prompt memory survives a controller restart', async (t) => {
+  const prior = structuredClone({ shows: settings.get().shows, schedule: settings.get().schedule });
+  t.after(() => settings.update(prior));
+  const week: Record<number, string[]> = {};
+  for (let day = 0; day < 7; day++) week[day] = Array(24).fill('s_resumed');
+  await settings.update({
+    shows: [{ id: 's_resumed', name: 'Resumed Session', topic: '', personaId: settings.get().personas[0].id }],
+    schedule: week,
+  });
   queue.djLog = [];
   const ctx = context({ id: 's_resumed', name: 'Resumed Session' });
   // What recover() actually reads: a session.json written by the previous

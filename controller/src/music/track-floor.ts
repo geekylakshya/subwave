@@ -1,19 +1,6 @@
-// Minimum-track-length policy (#1573): the one answer to "is this track too
-// short to pick?". The floor itself is resolved by
-// settings.effectiveMinTrackSec (show override → station default); this module
-// only applies it.
-//
-// Not part of show-filter.ts's strict locks: it applies whether or not a show
-// is strict, like the track-length CAP. It is the mirror image of that cap —
-// an over-long track is cut on air (liq_cue_out) and stays eligible, whereas a
-// 40-second skit cannot be lengthened and has to leave the pool.
-//
-// Pure and import-free, so it unit-tests without a library, settings cache or
-// mixer (scripts/track-floor.test.ts).
-
-// Subsonic children carry `duration`, library rows `durationSec`; neither means
-// unknown length. Structurally satisfied by both, so callers pass their own
-// element type through unchanged.
+// Apply the effective minimum track length independently of strict show filters. Accept
+// Subsonic duration or library durationSec; missing values mean unknown. #1573,
+// scripts/track-floor.test.ts.
 export interface LengthTrack {
   duration?: number | null;
   durationSec?: number | null;
@@ -55,4 +42,22 @@ export function applyTrackFloor<T extends LengthTrack>(
   const kept = tracks.filter((t) => !belowTrackFloor(t, min));
   if (!starve && kept.length === 0) return tracks.slice();
   return kept;
+}
+
+// The cue-out the #447 length CAP should stamp for a track of `lengthSec`, or
+// null to stamp none. Only a track that actually runs past the cap is cut.
+//
+// A cap stamp on a SHORTER track is not a no-op, although it reads like one:
+// Liquidsoap's cue-out wrapper (request.ml, 2.4) reports remaining time as
+// `cue_out - position` whenever the decoder cannot say how long the file is,
+// and a Navidrome stream reached through subhttp is exactly that ("Estimating
+// duration from bitrate"). A 300s song stamped at 600 then claims minutes of
+// runway to its last second, `cross` never opens its buffer, and every capped
+// seam plays back-to-back with no crossfade. An UNKNOWN length still stamps:
+// the cap is the only thing that would stop a two-hour mix nobody measured.
+export function capCueOutSec(lengthSec: number | null | undefined, maxSec: number | null | undefined): number | null {
+  if (!Number.isFinite(maxSec) || (maxSec as number) <= 0) return null;
+  const len = Number.isFinite(lengthSec) && (lengthSec as number) > 0 ? (lengthSec as number) : null;
+  if (len != null && len <= (maxSec as number)) return null;
+  return maxSec as number;
 }

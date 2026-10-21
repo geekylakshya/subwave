@@ -8,10 +8,10 @@ section first — one wrong toggle and playback crashes on launch.
 
 ## Architecture-critical facts (read before changing native config)
 
-### Both platforms run the New Architecture — it's mandatory in RN 0.85
+### Both platforms run the New Architecture — it's mandatory in RN 0.86
 
 RN 0.82+ **removed the ability to opt out** of the New Architecture. Both
-platforms run it ON, and this is required (Reanimated 4.3.1 only works under new
+platforms run it ON, and this is required (Reanimated 4.5.1 only works under new
 arch):
 
 - **iOS** — `Info.plist RCTNewArchEnabled = true`, Pods built `-DRCT_NEW_ARCH_ENABLED=1`.
@@ -29,7 +29,8 @@ a no-op). Don't rely on such flags anywhere; they do nothing on this RN version.
 RNTP 4.1.2 is not natively New-Architecture-compatible — out of the box, Android
 playback crashes with `You should not use ReactNativeHost directly in the New
 Architecture` from `MusicService`. **The fix is `patches/react-native-track-player+4.1.2.patch`**,
-which makes two source edits:
+whose New Architecture half is two source edits (the rest of the patch is the
+progress and iOS metadata fixes described below):
 
 - `MusicModule.kt` — routes async `@ReactMethod`s through a Unit-returning
   `launch` helper (TurboModule interop requires void-returning async methods).
@@ -42,12 +43,35 @@ which makes two source edits:
 > patch is harmless there. Validated: Android `BUILD SUCCESSFUL` and iOS live
 > playback both with the patch applied.
 
+The patch also fixes live song progress (#857). RNTP 4.1.2's Android bridge
+ignores `elapsedTime`; KotlinAudio normally reports ExoPlayer's continuous
+stream position. `NowPlayingProgress` wraps only the session-facing player,
+retaining the existing remote-control interception. KotlinAudio 2.1.0's private
+`NotificationManager.player` and `mediaSessionConnector` fields are pinned by
+consumer ProGuard rules. Recheck this adapter when upgrading either dependency.
+The iOS metadata patch clears omitted song-clock fields and preserves artwork
+on progress-only refreshes, while retaining `isLiveStream` and the LIVE controls.
+These changes require a new binary, not an OTA update.
+
+For a device smoke test, play a track with a known duration and inspect
+`adb shell dumpsys media_session`: its duration should be the song's duration
+in milliseconds, and position should match the app's elapsed time, including
+the advertised listener buffer. Check that artwork remains visible during
+progress refreshes and changes with the track/persona. During DJ speech and
+on a track with no duration, the previous song's progress must disappear.
+Repeat after a track change, screen lock, reconnect, and tune-out/tune-in.
+Verify a release build too, so the reflection keep rules are exercised.
+On iOS, confirm the LIVE controls, artwork, and Live Activity still work;
+Cast should still tear down the local session. Bluetooth display of artwork
+and progress must also be checked in the car.
+
 ### Other load-bearing facts
 
 - **Expo Go does not work** — native modules (RNTP, Skia, Reanimated worklets)
   ship compiled code. You must build a **dev client**.
-- **Stream is MP3 only** (`{base}/stream.mp3`), same universal-floor choice as
-  the web player. No Opus/Ogg.
+- **MP3 is the default** (`{base}/stream.mp3`). The SIGNAL picker offers AAC on
+  both platforms and Opus/FLAC on Android when the station advertises the mount.
+  iOS cannot demux Ogg. Cast always uses MP3.
 - **No backend needed for testing** — the app defaults to the public
   `getsubwave.com` station, which is live. Onboarding pre-fills it.
 - **Base URL is fully runtime** — there are no hardcoded station URLs in source.
@@ -170,6 +194,16 @@ Background audio (lock screen / CarPlay / headphones) and metadata can only be
 properly judged on a **physical device** — the remote-control wiring lives in
 `service.ts` (Play/Pause/Stop; Next/Seek intentionally omitted for a live
 stream).
+
+On Android, `PlaybackService` must **never resolve**. It runs as RNTP's
+headless JS task, and React Native fires JS timers behind a paused activity only
+while a headless task is active. Every background poll is a timer, including the
+`/now-playing` poll that feeds lock-screen and Bluetooth metadata. RN 0.85 never
+registered `HeadlessJsTaskSupport` under bridgeless, so the task never finished.
+RN 0.86 (Expo SDK 57) registers it, and app 1.6.0 shipped with metadata frozen
+behind the lock screen until the phone was unlocked. Device check: tune in, lock
+the phone, and wait through a track change. The notification (or a Bluetooth
+head unit) should show the new title without unlocking.
 
 ### CarPlay — Now-Playing in the car (iOS only)
 
@@ -301,10 +335,10 @@ eas submit --profile production --platform ios     # uploads to App Store Connec
 
 ## Known issues / gotchas
 
-- **`patches/react-native-track-player+4.1.2.patch`** is the RNTP new-arch fix
-  (2 source files — see "Architecture-critical facts"). It was previously bloated
-  to 229 files with accidental Gradle build artifacts; **slimmed to just the 2
-  `.kt` source files** (2026-06) and re-verified with a clean `BUILD SUCCESSFUL`.
+- **`patches/react-native-track-player+4.1.2.patch`** contains the RNTP new-arch
+  and media-session progress fixes (see "Architecture-critical facts"). It was previously bloated
+  to 229 files with accidental Gradle build artifacts; slimmed in 2026-06 and
+  re-verified with a clean `BUILD SUCCESSFUL` before the progress fix was added.
   Keep it lean — never run `patch-package` after a Gradle build has populated
   `node_modules/react-native-track-player/android/build/`, or it recaptures the
   junk.
@@ -325,7 +359,7 @@ eas submit --profile production --platform ios     # uploads to App Store Connec
 |---|---|---|
 | `tsc --noEmit` | ✅ | ✅ |
 | Native build | ✅ simulator (new arch ON) | ✅ emulator + APK (new arch ON, JDK 17) |
-| RNTP slim patch (2 files) | ✅ live playback | ✅ `BUILD SUCCESSFUL` after slim |
+| RNTP New Architecture patch | ✅ live playback | ✅ `BUILD SUCCESSFUL` after slim |
 | Install + launch | ✅ | ✅ (emulator install) |
 | JS bundle | ✅ 4075 modules | ✅ build path |
 | Onboarding → health check | ✅ all 4 probes OK | (same JS; via skill on device) |

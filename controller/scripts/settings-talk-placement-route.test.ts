@@ -157,7 +157,8 @@ test('DJ behaviour segmented controls expose their visible labels and help text'
   for (const aria of ['talkPlacementAria', 'linkStyleAria']) {
     assert.match(source, new RegExp(`<Label \\{\\.\\.\\.${aria}\\.labelledByProps\\}`));
     assert.match(source, new RegExp(`<Seg\\s+\\{\\.\\.\\.${aria}\\.groupProps\\}`));
-    assert.match(source, new RegExp(`<p \\{\\.\\.\\.${aria}\\.descriptionProps\\}`));
+    // The help text's element is layout; the description wiring is the point.
+    assert.match(source, new RegExp(`<(?:p|div) \\{\\.\\.\\.${aria}\\.descriptionProps\\}`));
   }
 });
 
@@ -168,7 +169,7 @@ test('DJ recap controls hydrate, save and display nested validation errors', () 
     'utf8',
   );
   const panel = readFileSync(
-    path.resolve(here, '../../web/components/admin/SettingsPanel.tsx'),
+    path.resolve(here, '../../web/components/admin/settings/form-state.ts'),
     'utf8',
   );
   for (const [field, fallback] of [

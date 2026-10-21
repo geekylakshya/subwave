@@ -5,10 +5,14 @@
 // token-budget gated.
 
 import { z } from 'zod';
+import { isInstrumental } from './lyric-vocal.js';
+import type { PlaylistGenerationResult } from '../schemas/playlist.js';
 import * as subsonic from './subsonic.js';
 import * as library from './library.js';
 import * as embeddings from './embeddings.js';
 import * as analyzer from './analyzer.js';
+import * as likes from '../broadcast/likes.js';
+import * as settings from '../settings.js';
 import { djObject } from '../llm/sdk.js';
 import {
   mergePools,
@@ -65,15 +69,7 @@ export interface GenerateInput {
   recentPlayIds?: string[];
 }
 
-export interface GenerateResult {
-  tracks: DraftTrack[];
-  name?: string;
-  description?: string;
-  degraded: boolean;
-  reasons: string[];
-  poolSize: number;
-  usedFallback: boolean;
-}
+export type GenerateResult = PlaylistGenerationResult;
 
 const POOL_CAP = 120;              // candidates kept after merge/filter
 const LLM_CANDIDATE_CAP = 90;      // candidates shown to the model (token budget)
@@ -91,9 +87,7 @@ function clampCount(n: number): number {
 function norm(r: any, source: string, baseScore: number): PoolTrack {
   const instrumental =
     typeof r.instrumental === 'boolean' ? r.instrumental
-      : Array.isArray(r.vocalRanges) ? r.vocalRanges.length === 0
-        : r.vocalRanges === null ? null
-          : null;
+      : isInstrumental(r.vocalRanges, r.vocalRangesInvalid);
   const yearNum = typeof r.year === 'number' ? r.year : parseInt(String(r.year ?? ''), 10);
   return {
     id: String(r.id),
@@ -236,7 +230,11 @@ export async function buildCandidatePool(
   // Fillers when the pool is thin, so a small library stays usable.
   let pool = mergePools(pools);
   if (pool.length < 30) {
-    pools.push(normMany(await subsonic.getStarred().catch(() => []), 'starred', 0.4));
+    // Operator curation only (likes.operatorStarred, gated on likes.influenceDj):
+    // a star a listener like left behind is not the operator's pick. The random
+    // filler beside it is what keeps a small library usable either way.
+    await likes.load();
+    pools.push(normMany(likes.operatorStarred(await subsonic.getStarred().catch((): any[] => []), settings.get()?.likes), 'starred', 0.4));
     const era = eraSpan(knobs.eras);
     pools.push(normMany(
       await subsonic.getRandomSongs({

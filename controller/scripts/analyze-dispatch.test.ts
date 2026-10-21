@@ -1,16 +1,8 @@
 import assert from 'node:assert/strict';
+import { deferred } from './test-utils/async.js';
 import { test } from 'node:test';
 import { dispatchAnalysis, type DispatchOutcome } from '../src/music/analyze-dispatch.js';
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
 
 test('bounded analysis dispatch admits in order and waits for capacity', async () => {
   const jobs = [deferred<string>(), deferred<string>(), deferred<string>()];
@@ -86,7 +78,7 @@ test('outcomes are reported in input order even when jobs settle out of order', 
   jobs[2].resolve('third');
   jobs[1].reject(new Error('second failed'));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(reported, [], 'later outcomes wait for the first source item');
+  assert.equal(reported.length, 0, 'later outcomes wait for the first source item');
 
   jobs[0].resolve('first');
   await dispatch;

@@ -12,6 +12,7 @@ import {
   type RequestEntry,
 } from './types';
 import { scheduleKeys, type ScheduleLiveData } from '../schedule/queries';
+import { toConnectionsState } from './connections';
 
 export const dashKeys = {
   all: ['dash'] as const,
@@ -49,17 +50,32 @@ export async function fetchDashStatus(fetcher: AdminFetch, signal: AbortSignal):
   return { ...nowPlaying, queue: state ?? {}, sessionMessages: session?.messages ?? [] };
 }
 
+/**
+ * Drop a queued row from the cached status ahead of its DELETE; the poll
+ * confirms. An in-flight status read is cancelled first so it cannot land over
+ * the patch with the row still in it. The write is stamped like a fresh read
+ * but carries everything else the cache held, now-playing included, so never
+ * judge what is on air from this cache after a refetch: never-play's skip
+ * reads the fetch's own answer instead (`refetchOnAirId`, #2018).
+ */
+export async function removeQueuedRow(client: QueryClient, id: string): Promise<void> {
+  await client.cancelQueries({ queryKey: dashKeys.status(), exact: true }, { silent: true });
+  client.setQueryData<DashStatus>(dashKeys.status(), current => current
+    ? {
+        ...current,
+        queue: {
+          ...(current.queue || {}),
+          upcoming: (current.queue?.upcoming || []).filter(item => item.subsonic_id !== id),
+        },
+      }
+    : current);
+}
+
 export async function fetchConnections(fetcher: AdminFetch, signal: AbortSignal): Promise<ConnectionsState> {
   const body = await adminJson<Partial<ConnectionsState>>(
     fetcher, '/listeners/connections', undefined, signal,
   );
-  return {
-    count: body?.count ?? 0,
-    connections: body?.connections ?? [],
-    // An older controller omits the key entirely; `known: false` is the same
-    // "say nothing" verdict the controller's own unknown case produces.
-    trustedProxies: body?.trustedProxies ?? UNKNOWN_TRUSTED_PROXIES,
-  };
+  return toConnectionsState(body, UNKNOWN_TRUSTED_PROXIES);
 }
 
 export function fetchHealthStats(fetcher: AdminFetch, signal: AbortSignal): Promise<HealthStats> {
@@ -91,7 +107,9 @@ export async function runDashAction(
     body: JSON.stringify(body || {}),
   });
   const result = await response.json().catch(() => ({})) as ActResponse;
-  if (!response.ok) throw new Error(result.error || `failed (${response.status})`);
+  // Same message as ever; the status rides along so a caller can tell an
+  // answer (the targeted skip's 409) from a failure.
+  if (!response.ok) throw new AdminResponseError(result.error || `failed (${response.status})`, response.status, result);
   return result;
 }
 

@@ -141,6 +141,7 @@ router.get('/settings', requireAdmin, async (req, res) => {
         scrobble: s.scrobble,
         // privacy.password arrives redacted ('set'/'').
         privacy: s.privacy,
+        alexa: s.alexa,
         requests: s.requests,
       },
       defaults: {

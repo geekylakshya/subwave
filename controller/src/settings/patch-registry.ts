@@ -30,6 +30,7 @@
 import { ZodError, type ZodType } from 'zod';
 import {
   archivePatchSchema,
+  alexaPatchSchema,
   audioPatchSchema,
   backupsPatchSchema,
   bedsPatchSchema,
@@ -153,6 +154,7 @@ export const SETTINGS_PATCH_KEYS = [
   'beds',
   'silenceTrim',
   'ui',
+  'alexa',
   'privacy',
   'requests',
   'webhooks',
@@ -238,6 +240,7 @@ export const SETTINGS_PATCH_SCHEMAS: Readonly<Partial<Record<SettingsPatchKey, S
   weatherMoods: weatherMoodsSchema,
   festivals: festivalsSchema,
   timezone: timezoneSchema,
+  alexa: alexaPatchSchema,
   privacy: privacyPatchSchema,
   requests: requestsPatchSchema,
   // Both are validated by the SAME schema update() reaches through

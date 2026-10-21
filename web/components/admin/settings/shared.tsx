@@ -319,6 +319,11 @@ export interface PrivacyForm {
   publishPersonaSouls: boolean;
 }
 
+export interface AlexaForm {
+  enabled: boolean;
+  skillId: string;
+}
+
 /** Every field applies live and the controller clamps on save, so the UI doesn't
  *  need to. Numbers are held as strings and parsed on save (the weather lat/lng
  *  idiom). */
@@ -398,6 +403,7 @@ export interface FormState {
   embedding: EmbeddingForm;
   scrobble: ScrobbleForm;
   privacy: PrivacyForm;
+  alexa: AlexaForm;
   likes: LikesForm;
   requests: RequestsForm;
 }
@@ -526,6 +532,10 @@ export interface SettingsData {
       listenerAuth?: boolean;
       password?: string;
       publishPersonaSouls?: boolean;
+    };
+    alexa?: {
+      enabled?: boolean;
+      skillId?: string;
     };
     requests?: {
       enabled?: boolean;

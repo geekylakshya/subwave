@@ -41,6 +41,7 @@ import {
   requestBreakerFailure,
   requestBreakerOpen,
   requestBreakerSuccess,
+  RequestIdentificationMiss,
 } from './dj-agent/breaker.js';
 import { dropEchoedLink, enqueuePick, generatePickLink, trackFields, trimLinkToIntro } from './dj-agent/enqueue.js';
 import { advanceRun, notePickShow, runActive } from './dj-agent/runs.js';
@@ -1737,8 +1738,12 @@ export async function runTrackEvent(queue, ctx, { wantLink, showAt = null, pickA
 // so its failures are the same symptom.
 // The caller (routes/request.js) owns the request `event` turn — it posts one
 // for every request path, so the agent only appends its own `dj` reply here.
+export function requestMatchingEnabled(): boolean {
+  return settings.get().llm?.requestMatching === 'agentic';
+}
+
 export async function runRequest(queue: any, { requester, text }: { requester: string; text: string }) {
-  if (settings.get().llm?.requestMatching !== 'agentic' || requestBreakerOpen()) return null;
+  if (!requestMatchingEnabled() || requestBreakerOpen()) return null;
   // Over the hard token cap the request agent only runs when requests are
   // exempt (llm.exemptRequests, on by default); otherwise return null and let
   // the caller's stateless matcher cascade handle it without a model call.
@@ -1749,7 +1754,7 @@ export async function runRequest(queue: any, { requester, text }: { requester: s
     requestBreakerSuccess();
     return out;
   } catch (err) {
-    requestBreakerFailure(queue);
+    requestBreakerFailure(queue, err);
     throw err;
   }
 }
@@ -1907,6 +1912,9 @@ async function runRequestViaAgent(queue: any, { requester, text }: { requester: 
         agent: 'request', id: object?.id ?? null, candidates: extras.seen.size, toolCalls,
         idInSessionWindow: !!(object?.id && windowText.includes(object.id)),
       });
+      if (extras.seen.size === 0) {
+        throw new RequestIdentificationMiss(`request agent found no matching track for id ${object?.id ?? 'none'}`);
+      }
       throw new Error(`request agent returned unknown id ${object?.id}`);
     }
 

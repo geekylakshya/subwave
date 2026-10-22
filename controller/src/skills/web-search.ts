@@ -38,7 +38,12 @@ async function memo(
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < ttl) return hit.val;
   const val = await fn();
-  cache.set(key, { val, at: Date.now() });
+  // Empty responses are usually transient provider failures or upstream
+  // timeouts represented as a successful empty JSON response. Caching them
+  // for the full TTL turns one bad search into a 30-minute outage for the
+  // request resolver. Keep useful evidence cached, but let the next request
+  // retry an empty result immediately.
+  if (val.answer.trim() || val.results.length > 0) cache.set(key, { val, at: Date.now() });
   return val;
 }
 

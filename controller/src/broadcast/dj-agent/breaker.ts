@@ -47,7 +47,21 @@ export function requestBreakerSuccess() {
   requestBreakerFails = 0;
 }
 
-export function requestBreakerFailure(queue: any) {
+// An empty candidate set after a request-identification run is an expected
+// no-match, not evidence that the model or tool harness is broken. Keep this
+// marker local to the request agent so malformed tool responses and genuine
+// provider failures still count toward the breaker.
+export class RequestIdentificationMiss extends Error {
+  readonly expected = true;
+
+  constructor(message = 'request agent found no matching track') {
+    super(message);
+    this.name = 'RequestIdentificationMiss';
+  }
+}
+
+export function requestBreakerFailure(queue: any, error?: unknown) {
+  if (error instanceof RequestIdentificationMiss || (error as any)?.expected === true) return;
   requestBreakerFails++;
   if (requestBreakerFails < BREAKER_FAILURES) return;
   requestBreakerFails = 0;
@@ -63,4 +77,3 @@ export function requestBreakerFailure(queue: any) {
 export function agentDeadline(): number {
   return settings.get().llm?.agentTimeoutMs ?? 45000;
 }
-

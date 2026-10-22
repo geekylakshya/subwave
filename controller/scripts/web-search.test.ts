@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { createTempDir } from './test-utils/temp-dir.js';
 
 process.env.STATE_DIR = createTempDir(join(tmpdir(), 'subwave-web-search-'));
-const { parseBraveResponse, buildSearxngUrl, parseSearxngResponse, searchWeb } =
+const { parseBraveResponse, buildSearxngUrl, parseSearxngResponse, searchWeb, searchCacheSize } =
   await import('../src/skills/web-search.js');
 const settings = await import('../src/settings.js');
 const here = dirname(fileURLToPath(import.meta.url));
@@ -209,4 +209,19 @@ test('dispatcher cache separates recency windows and reuses each answer', async 
   assert.deepEqual(await searchWeb('RECENCY-CACHE-REGRESSION'), all);
   assert.deepEqual(await searchWeb('RECENCY-CACHE-REGRESSION', { recency: 'week' }), week);
   assert.equal(windows.length, 2, 'repeats of both windows use their cached answers');
+});
+
+test('empty provider responses are retried instead of cached for the full TTL', async t => {
+  await settings.load();
+  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://empty-search.test' } });
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    return new Response(JSON.stringify({ results: [] }));
+  });
+  const query = `empty-cache-regression-${Date.now()}`;
+  assert.deepEqual(await searchWeb(query), { answer: '', results: [] });
+  assert.deepEqual(await searchWeb(query), { answer: '', results: [] });
+  assert.equal(calls, 2, 'an empty result must not be reused from the long-lived cache');
+  assert.ok(searchCacheSize() >= 0);
 });

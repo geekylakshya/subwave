@@ -11,6 +11,10 @@ const queue = { log: () => undefined };
 
 test('picker and request failures use independent breakers', () => {
   assert.equal(requestBreakerOpen(), false);
+  requestBreakerFailure(queue, { expected: true });
+  requestBreakerFailure(queue, { expected: true });
+  requestBreakerFailure(queue, { expected: true });
+  assert.equal(requestBreakerOpen(), false);
   breakerFailure(queue);
   breakerFailure(queue);
   breakerFailure(queue);

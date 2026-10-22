@@ -479,3 +479,116 @@ test('an empty first lyric search gets bounded fallback queries before failing',
     await settings.update({ llm: originalLlm, search: originalSearch } as never);
   }
 });
+
+test('a long lyric starts with a bounded web fragment and resolves the local track', async () => {
+  const originalLlm = structuredClone(settings.get().llm);
+  const originalSearch = structuredClone(settings.get().search);
+  const realFetch = globalThis.fetch;
+  const searchQueries: string[] = [];
+  const musicQueries: string[] = [];
+  const json = (value: unknown) => Response.json(value);
+  const reference = 'phull koyi vilyat wala lai geya phull koyi vilyat wala lai geya ghod da main reh geya keyariyan';
+
+  try {
+    await settings.update({
+      llm: { model: '', provider: 'openai-compatible', fallback: { enabled: false } },
+      search: { provider: 'searxng', baseUrl: 'http://search.long-lyric.fixture' },
+    } as never);
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.origin === 'http://search.long-lyric.fixture') {
+        const query = url.searchParams.get('q') || '';
+        searchQueries.push(query);
+        // The fixture represents a provider that only finds the song when the
+        // request contains a bounded content-word fragment. A complete pasted
+        // verse is intentionally treated as a miss.
+        const bounded = query.includes('lyrics song artist') && query.length < reference.length;
+        return json({
+          results: bounded ? [{
+            title: 'Phull Koyi Vilyat Wala Lyrics',
+            content: 'Song: Phull Koyi Vilyat Wala Artist: Fictional Punjabi Singer Album: Demo.',
+            url: 'https://lyrics.example.test/phull-koyi-vilyat-wala',
+          }] : [],
+        });
+      }
+      if (url.origin === 'http://navidrome.fixture') {
+        const query = url.searchParams.get('query') || '';
+        const songCount = Number(url.searchParams.get('songCount') || 0);
+        musicQueries.push(`${query}|${songCount}`);
+        const localMatch = query.includes('Fictional Punjabi Singer')
+          && query.includes('Phull Koyi Vilyat Wala')
+          && songCount > 0;
+        return json({
+          'subsonic-response': {
+            status: 'ok',
+            version: '1.16.1',
+            searchResult3: {
+              artist: [],
+              song: localMatch ? [{
+                id: 'phull-koyi-vilyat-wala',
+                title: 'Phull Koyi Vilyat Wala',
+                artist: 'Fictional Punjabi Singer',
+                album: 'Demo',
+                duration: 210,
+              }] : [],
+            },
+          },
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const built: any = identifyTool.build({ collect: (songs: any[]) => songs } as any);
+    const result = await built.execute({ reference }, {} as any);
+
+    assert.deepEqual(result, {
+      candidates: [{
+        id: 'phull-koyi-vilyat-wala',
+        title: 'Phull Koyi Vilyat Wala',
+        artist: 'Fictional Punjabi Singer',
+        album: 'Demo',
+        duration: 210,
+      }],
+    });
+    assert.ok(
+      searchQueries.some(query => query.includes('lyrics song artist') && query.length < reference.length),
+      `expected an initial bounded lyric query, got ${JSON.stringify(searchQueries)}`,
+    );
+    assert.ok(musicQueries.includes('Fictional Punjabi Singer Phull Koyi Vilyat Wala|25'));
+  } finally {
+    globalThis.fetch = realFetch;
+    await settings.update({ llm: originalLlm, search: originalSearch } as never);
+  }
+});
+
+test('an empty lyric search returns a normal no-match result without inventing a candidate', async () => {
+  const originalLlm = structuredClone(settings.get().llm);
+  const originalSearch = structuredClone(settings.get().search);
+  const realFetch = globalThis.fetch;
+  const json = (value: unknown) => Response.json(value);
+
+  try {
+    await settings.update({
+      llm: { model: '', provider: 'openai-compatible', fallback: { enabled: false } },
+      search: { provider: 'searxng', baseUrl: 'http://search.no-evidence.fixture' },
+    } as never);
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.origin === 'http://search.no-evidence.fixture') return json({ results: [] });
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const built: any = identifyTool.build({ collect: (songs: any[]) => songs } as any);
+    const result = await built.execute({
+      reference: 'a lyric description that does not exist in the web index',
+    }, {} as any);
+
+    assert.deepEqual(result, { error: 'no web result for that reference' });
+    assert.equal('candidates' in result, false);
+  } finally {
+    globalThis.fetch = realFetch;
+    await settings.update({ llm: originalLlm, search: originalSearch } as never);
+  }
+});

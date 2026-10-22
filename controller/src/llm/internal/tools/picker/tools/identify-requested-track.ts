@@ -153,7 +153,7 @@ export function extractLyricTrackHints(web: { results?: WebTrackResult[] }): Lyr
     .map(({ title, artist }) => ({ title, artist }));
 }
 
-function lyricSearchQuery(reference: string, artist: string | null = null): string {
+function lyricSearchQuery(reference: string, artist: string | null = null, edge: 'head' | 'tail' = 'tail'): string {
   const stop = new Set(['a', 'an', 'and', 'are', 'at', 'be', 'but', 'for', 'i', 'in', 'is', 'it', 'my', 'of', 'on', 'or', 'the', 'there', 'this', 'to', 'was', 'we', 'with', 'you']);
   const words = String(reference || '').replace(/[“”"']/g, '').toLocaleLowerCase('en').split(/\s+/)
     .map(word => word.replace(/[^\p{L}\p{N}]/gu, '')).filter(word => word.length >= 4 && !stop.has(word));
@@ -161,7 +161,7 @@ function lyricSearchQuery(reference: string, artist: string | null = null): stri
   // lyric. Prefer later words because opening lines are often quoted by many
   // pages, while a distinctive phrase plus the performer finds the canonical
   // song page more reliably.
-  const fragment = words.slice(-8).join(' ');
+  const fragment = (edge === 'head' ? words.slice(0, 8) : words.slice(-8)).join(' ');
   return `${artist ? `${artist} ` : ''}${fragment || String(reference).slice(0, 120)} lyrics song artist`;
 }
 
@@ -179,9 +179,14 @@ type WebSearchResponse = { answer?: string; results?: WebTrackResult[] };
 
 async function lyricWebEvidence(reference: string): Promise<WebSearchResponse> {
   const wordCount = requestName(reference).split(' ').filter(Boolean).length;
-  const queries = wordCount >= 3 && wordCount < 8
-    ? [shortLyricSearchQuery(reference), reference]
-    : [reference];
+  const raw = String(reference || '').replace(/["“”]/gu, '').replace(/\s+/g, ' ').trim();
+  const boundedRaw = raw.length > 240 ? `${raw.slice(0, 120)} ${raw.slice(-120)}` : raw;
+  const initialQueries = wordCount >= 8
+    ? [lyricSearchQuery(reference, null, 'head'), lyricSearchQuery(reference), boundedRaw]
+    : wordCount >= 3
+      ? [shortLyricSearchQuery(reference), boundedRaw]
+      : [boundedRaw];
+  const queries = [...new Set(initialQueries.filter(Boolean))];
   const merged: WebTrackResult[] = [];
   const seen = new Set<string>();
   let answer = '';
@@ -205,11 +210,14 @@ async function lyricWebEvidence(reference: string): Promise<WebSearchResponse> {
   // final identification failure: issue a bounded pair of differently keyed
   // music queries once, only when the first pass returned no evidence.
   if (!merged.length) {
-    const fallbackQueries = [
-      `${reference} song lyrics`,
-      `"${String(reference || '').replace(/["“”]/gu, '').trim()}" song`,
-    ];
-    collect(await Promise.allSettled(fallbackQueries.map(query => searchWeb(query))));
+    const fallbackQueries = wordCount >= 8
+      ? [lyricSearchQuery(reference, null, 'tail'), lyricSearchQuery(reference, null, 'head'), `${boundedRaw} song lyrics`]
+      : [
+        `${boundedRaw} song lyrics`,
+        `"${boundedRaw}" song`,
+      ];
+    const uniqueFallbacks = [...new Set(fallbackQueries.filter(query => !queries.includes(query)))];
+    collect(await Promise.allSettled(uniqueFallbacks.map(query => searchWeb(query))));
   }
 
   return { answer, results: merged.slice(0, 20) };
@@ -333,23 +341,35 @@ export default definePickerTool({
           if (extra) blob = (blob + '\n' + extra).slice(0, 8000);
         }
 
-        let songs = await resolveGuess(guess, blob);
+        // A plausible model guess is not enough by itself. Require the title
+        // and, when supplied, the artist to appear in the accumulated search
+        // evidence before resolving anything in the local catalogue.
+        if (!evidenceSupportsGuess(guess, blob)) {
+          return { error: 'could not verify a specific song from the available search evidence' };
+        }
+
+        const songs = await resolveGuess(guess, blob);
+        let verifiedSongs = verifyCandidate(guess, songs);
 
         // Some providers rank a lyric mirror above the canonical song page and
         // the first identification can therefore be wrong even though the
         // requested track is in Navidrome. Retry once with an exact opening
         // lyric fragment, but only after the first locally verified lookup
         // failed. The second guess still has to resolve to a real library id.
-        if (!songs.length && requestName(reference).split(' ').length >= 8) {
+        if (!verifiedSongs.length && requestName(reference).split(' ').length >= 8) {
           const focused = await searchWeb(lyricSearchQuery(reference, guess.artist));
           const focusedBlob = webBlob(focused, 5000);
           if (focusedBlob) {
             const focusedGuess = await identifyTrackFromText(reference, focusedBlob);
-            if (focusedGuess) songs = await resolveGuess(focusedGuess, focusedBlob + '\n' + blob);
+            const focusedEvidence = focusedBlob + '\n' + blob;
+            if (focusedGuess && evidenceSupportsGuess(focusedGuess, focusedEvidence)) {
+              const focusedSongs = await resolveGuess(focusedGuess, focusedEvidence);
+              verifiedSongs = verifyCandidate(focusedGuess, focusedSongs);
+            }
           }
         }
 
-        const candidates = collect(songs);
+        const candidates = collect(verifiedSongs);
         if (!candidates.length) return { candidates, note: 'could not find the described song in this library' };
         return { candidates };
       } catch (err) { return { error: (err as Error).message }; }

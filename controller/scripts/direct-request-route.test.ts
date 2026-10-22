@@ -154,6 +154,18 @@ test('short transliterated lyric prose also goes through the evidence agent', as
   assert.equal(agentCalls, 1);
 });
 
+test('an evidence-agent miss does not enter the unsupported direct-request path', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  agentResult = { object: {}, steps: 1, toolCalls: [], extras: { seen: new Map() } };
+  const result = await submit('phull koyi vilyat wala lai geya ghod da main reh geya keyariyan');
+  assert.equal(result.status, 'failed');
+  assert.equal(result.outcome, 'no-match');
+  assert.match(result.message, /identify that song/i);
+  assert.equal(queue.upcoming.length, 0);
+  assert.equal(bodies.length, 0, 'an evidence miss must not make a second direct matcher call');
+  assert.equal(requestLog.snapshot(1)[0].pickSource, 'agent:evidence-miss');
+});
+
 test('Direct searches the named recording before genre candidates, with one interpretation call', async () => {
   const result = await submit();
   assert.equal(result.outcome, 'matched');

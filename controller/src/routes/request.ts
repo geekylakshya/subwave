@@ -31,6 +31,7 @@ import { directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, mode
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
 import { ARTIST_VARIETY_WINDOW, drawRequestCandidate } from '../broadcast/dj-agent/artist-guard.js';
+import { RequestIdentificationMiss } from '../broadcast/dj-agent/breaker.js';
 
 export const router = express.Router();
 
@@ -202,6 +203,7 @@ function withWaitNotice(ack: string | null | undefined, trackId: string | null |
 const ON_AIR_REFERENCE = /\bsimilar\b|\b(?:something|anything|more|songs?|tracks?|music|stuff|one)\s+like\b|\blike\s+(?:this|that|these|those)\b|\bmatch\s+this\b/i;
 
 const UNSUPPORTED_REFUSAL = `I couldn't reliably check all the conditions in that request. Try naming a song, artist, album, genre or simple mood.`;
+const EVIDENCE_MISS_REFUSAL = `I couldn't identify that song from the description. Try naming the title or artist.`;
 
 // A bounded literal parser for hard-budget or failed interpretation calls.
 // The resolver still verifies its title/artist against the actual catalogue.
@@ -383,7 +385,7 @@ async function resolveRequest(entry) {
   // descriptions still use the existing web-aware agent path.
   const needsEvidenceIdentification = lyricLike
     || /\b(?:song|track|music)\s+(?:from|in)\s+(?:the\s+)?(?:film|movie|show|advert|commercial)\b/iu.test(text);
-  if (!explicitNamedRequest && needsEvidenceIdentification) {
+  if (!explicitNamedRequest && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
     try {
       const agentRes = await djAgent.runRequest(queue, { requester, text });
       if (agentRes) {
@@ -422,7 +424,16 @@ async function resolveRequest(entry) {
         });
       }
     } catch (err) {
-      queue.log('error', `DJ agent request failed: ${err.message} — falling back`);
+      if (err instanceof RequestIdentificationMiss) {
+        entry.path = 'agent';
+        entry.pickSource = 'agent:evidence-miss';
+        entry.outcome = 'no-match';
+        return failed(EVIDENCE_MISS_REFUSAL);
+      }
+      // Provider, tool, timeout, and malformed-response failures retain the
+      // stateless cascade. They are infrastructure failures, not evidence
+      // misses, and should not be hidden behind a no-match response.
+      queue.log('error', `DJ agent request failed — using stateless fallback: ${err.message}`);
     }
   }
 
@@ -708,75 +719,84 @@ router.post('/request', validatePublicBody(listenerRequestSchema), async (req, r
   const requester = cleanRequesterName(rawName, reservedNames);
 
   const ip = clientIp(req);
-  // Janitor runs BEFORE the gates: the one-pending hold returns 429 without
-  // reaching the rest of the handler, so pruning later held an IP past the TTL.
-  pruneRequests();
-  const gate = checkRateLimit(ip);
-  if (!gate.ok) {
-    res.setHeader('Retry-After', String(gate.retryAfter));
-    return res.status(429).json({
-      success: false,
-      message: `Easy there — try again in ${gate.retryAfter}s.`,
-      retryAfter: gate.retryAfter,
-    });
-  }
-  const globalGate = checkGlobalRateLimit();
-  if (!globalGate.ok) {
-    res.setHeader('Retry-After', String(globalGate.retryAfter));
-    return res.status(429).json({
-      success: false,
-      message: 'The request line is busy — try again in a few minutes.',
-      retryAfter: globalGate.retryAfter,
-    });
-  }
-  // Both queue-state refusals carry the COOLDOWN as Retry-After: checkRateLimit
-  // already stamped it, so the caller genuinely cannot succeed before it expires.
-  const retryAfter = Number(cfg.cooldownSec) > 0 ? Number(cfg.cooldownSec) : 60;
-  if (cfg.onePendingPerIp !== false && stillInFlight(lastByIp.get(ip), queue.queuedIds())) {
-    res.setHeader('Retry-After', String(retryAfter));
-    return res.status(429).json({
-      success: false,
-      message: 'Your last request is still queued — it airs first.',
-      retryAfter,
-    });
-  }
-  // LISTENER requests only — an operator's own studio push carries
-  // `requestedBy: 'studio'` for the air-path exemptions and must not consume a
-  // slot in the listener queue. See queue.pendingListenerRequests(). Requests
-  // still resolving count too: they hold no queue slot yet, so a burst
-  // accepted inside one resolution window would otherwise all pass. The brief
-  // overlap between a push and its entry settling errs toward refusing.
-  const pendingCount = queue.pendingListenerRequests() + resolvingRequestCount();
-  if (pendingCount >= (Number(cfg.maxPending) || 6)) {
-    res.setHeader('Retry-After', String(retryAfter));
-    return res.status(429).json({
-      success: false,
-      message: "The request queue's full — try again in a few minutes.",
-      retryAfter,
-    });
+  let entry: any;
+  const releaseAdmission = await acquireAdmissionLock();
+  try {
+    // Janitor runs BEFORE the gates: the one-pending hold returns 429 without
+    // reaching the rest of the handler, so pruning later held an IP past the TTL.
+    pruneRequests();
+    const gate = checkRateLimit(ip);
+    if (!gate.ok) {
+      res.setHeader('Retry-After', String(gate.retryAfter));
+      return res.status(429).json({
+        success: false,
+        message: `Easy there — try again in ${gate.retryAfter}s.`,
+        retryAfter: gate.retryAfter,
+      });
+    }
+    const globalGate = checkGlobalRateLimit();
+    if (!globalGate.ok) {
+      res.setHeader('Retry-After', String(globalGate.retryAfter));
+      return res.status(429).json({
+        success: false,
+        message: 'The request line is busy — try again in a few minutes.',
+        retryAfter: globalGate.retryAfter,
+      });
+    }
+    // Both queue-state refusals carry the COOLDOWN as Retry-After: checkRateLimit
+    // already stamped it, so the caller genuinely cannot succeed before it expires.
+    const retryAfter = Number(cfg.cooldownSec) > 0 ? Number(cfg.cooldownSec) : 60;
+    if (cfg.onePendingPerIp !== false && stillInFlight(lastByIp.get(ip), queue.queuedIds())) {
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({
+        success: false,
+        message: 'Your last request is still queued — it airs first.',
+        retryAfter,
+      });
+    }
+    // LISTENER requests only — an operator's own studio push carries
+    // `requestedBy: 'studio'` for the air-path exemptions and must not consume a
+    // slot in the listener queue. See queue.pendingListenerRequests(). Requests
+    // still resolving count too: they hold no queue slot yet, so a burst
+    // accepted inside one resolution window would otherwise all pass. The brief
+    // overlap between a push and its entry settling errs toward refusing.
+    const pendingCount = queue.pendingListenerRequests() + resolvingRequestCount();
+    if (pendingCount >= (Number(cfg.maxPending) || 6)) {
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({
+        success: false,
+        message: "The request queue's full — try again in a few minutes.",
+        retryAfter,
+      });
+    }
+
+    // Spend the hourly budgets only after the queue-state gates: those reject
+    // without queueing, and charging them burned the station-wide cap to zero on
+    // rejections alone. The per-IP cooldown was already spent by checkRateLimit.
+    commitRateLimit(ip);
+    commitGlobalRateLimit();
+
+    const id = randomUUID();
+    entry = {
+      id, status: 'pending', requester, text,
+      rawText: sanitizeRequestText(rawText),
+      injection: stripped.injection,
+      ack: null, track: null, queuePosition: null, message: null,
+      createdAt: Date.now(),
+    };
+    requests.set(id, entry);
+    lastByIp.set(ip, entry);
+  } finally {
+    // Resolution can spend tens of seconds in the model and web search. It must
+    // never hold the admission mutex while doing that slow work.
+    releaseAdmission();
   }
 
-  // Spend the hourly budgets only after the queue-state gates: those reject
-  // without queueing, and charging them burned the station-wide cap to zero on
-  // rejections alone. The per-IP cooldown was already spent by checkRateLimit.
-  commitRateLimit(ip);
-  commitGlobalRateLimit();
-
-  const id = randomUUID();
-  const entry: any = {
-    id, status: 'pending', requester, text,
-    rawText: sanitizeRequestText(rawText),
-    injection: stripped.injection,
-    ack: null, track: null, queuePosition: null, message: null,
-    createdAt: Date.now(),
-  };
-  requests.set(id, entry);
-  lastByIp.set(ip, entry);
-  queue.log('request', `${requester}: "${text}" (id ${id.slice(0, 8)})${stripped.injection ? ` [${stripped.injection} stripped]` : ''}`);
+  queue.log('request', `${requester}: "${text}" (id ${entry.id.slice(0, 8)})${stripped.injection ? ` [${stripped.injection} stripped]` : ''}`);
   webhooks.notify('request.received', { requestedBy: requester, text });
 
   // Hand back a receipt and let go of the connection.
-  res.status(202).json({ success: true, requestId: id, status: 'pending' });
+  res.status(202).json({ success: true, requestId: entry.id, status: 'pending' });
 
   resolveRequest(entry).catch(err => {
     queue.log('error', `Request resolution crashed: ${err.message}`);

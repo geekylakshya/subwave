@@ -200,6 +200,17 @@ test('a missing short title fails without selecting an unrelated fallback', asyn
   assert.equal(bodies.length, 0, 'a named-title miss must not invoke the interpreter or fallback pool');
 });
 
+test('a one-word artist remains artist-capable after a title miss', async () => {
+  catalogueSongs = [filler];
+  artistSongs = [exact];
+  const result = await submit('Queen');
+  assert.equal(result.outcome, 'matched');
+  assert.equal(result.track.title, exact.title);
+  assert.equal(result.track.artist, exact.artist);
+  assert.equal(queue.upcoming[0].track.id, exact.id);
+  assert.equal(bodies.length, 0, 'a local ambiguity should not require an interpretation call');
+});
+
 test('a stalled interpreter settles the accepted request instead of leaving it pending', async () => {
   await settings.update({ llm: { requestTimeoutMs: 5000 } } as never);
   modelStalls = true;

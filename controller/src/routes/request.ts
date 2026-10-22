@@ -483,7 +483,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   // artist-only handling can consider it an artist. Once the local title-first
   // classifier has identified it as a short title candidate, keep the title
   // identity intact for the catalogue resolver instead.
-  let matched = likelyShortTitle ? { ...literal, literal: false } : literal;
+  let matched = likelyShortTitle ? { ...literal, literal: false, titleOnly: true } : literal;
   if (!likelyShortTitle && budget.requestsAllowed()) {
     try {
       const interpreted = await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack }, signal);

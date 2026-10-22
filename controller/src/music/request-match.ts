@@ -36,6 +36,10 @@ export interface RequestMatch {
   unsupported?: string[];
   // Controller-owned markers; never part of the model's interpretation schema.
   literal?: boolean;
+  // A short title-only request may be ambiguous with an artist-only request.
+  // The route tries the title first, then permits an exact artist lookup, but
+  // never falls through to an unrelated recommendation.
+  titleOnly?: boolean;
   // A literal "A - B" or "A, B" whose words do not say which side is the artist.
   reversible?: boolean;
   // Names need catalogue proof before they may hide condition words.
@@ -624,6 +628,7 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   };
   let title = requestedTitle(match, deps.text);
   let artistName = match.artist;
+  let titleOnlyArtistFallback = false;
   const requiredGenre = !!match.genre && (deps.text === undefined || explicitRequestAttribute(deps.text, match, match.genre));
   const requiredLanguage = !!match.language && (deps.text === undefined || explicitRequestAttribute(deps.text, match, match.language));
   const required = [requiredGenre && 'genre', requiredLanguage && 'language'].filter((value): value is string => !!value);
@@ -791,7 +796,21 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     standingIn = true;
   }
 
-  if (match.literal && !artistName && title) {
+  // Decide the exact-only policy before entering the artist branch. A short
+  // title-only query has already missed its title lookup, so it may now try the
+  // same words as an artist identity; an explicit title must stop here.
+  if (deps.exactOnly && title) {
+    if (match.titleOnly && !artistName) {
+      artistName = title;
+      resolvedArtistName = title;
+      title = null;
+      titleOnlyArtistFallback = true;
+    } else {
+      return { track: null, source: errors.length ? 'lookup-error' : 'no-match', outcome: 'no-match', errors, required, alternatives };
+    }
+  }
+
+  if (match.literal && !match.titleOnly && !artistName && title) {
     artistName = title;
     resolvedArtistName = title;
     title = null;
@@ -878,10 +897,6 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   // Explicit named titles are never silently replaced by a random search or
   // fallback track. This also covers title-only requests, where an ambiguous
   // fuzzy result must be shown as alternatives instead of being queued.
-  if (deps.exactOnly && title) {
-    return { track: null, source: errors.length ? 'lookup-error' : 'no-match', outcome: 'no-match', errors, required, alternatives };
-  }
-
   if (!title && !match.album) {
     if (genre) {
       const result = select(await safe('genre tracks', () => catalog.getSongsByGenreSampled(genre!, { count: 100 }), []), `genre:${genre}`);
@@ -902,6 +917,7 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     const constrainedRefusal = refusal();
     if (constrainedRefusal) return constrainedRefusal;
   }
+  if (titleOnlyArtistFallback) return { track: null, source: errors.length ? 'lookup-error' : 'no-match', outcome: 'no-match', errors, required, alternatives };
   if (deps.similarSongs) {
     const result = select(await safe('similar tracks', deps.similarSongs, []), 'similar-to-current', !title && !artistName && !match.album);
     if (result) return result;

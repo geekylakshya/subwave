@@ -31,10 +31,12 @@ const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 const realFetch = globalThis.fetch;
 after(() => server.close());
 const exact = { id: 'queen-song', title: 'Bohemian Rhapsody', artist: 'Queen', album: 'A Night at the Opera', duration: 300, genre: 'Rock', language: 'English', moods: ['energetic'] };
+const titleOnlyExact = { id: 'daaku-song', title: 'Daaku', artist: 'Unknown Artist', album: 'Daaku', duration: 180 };
 const filler = { id: 'filler-song', title: 'Fatigue', artist: 'The Gathering', genre: 'Rock', duration: 200 };
 let ip = 0;
 let modelOutput: Record<string, unknown>;
 let modelError = false;
+let modelStalls = false;
 let introError = false;
 let searchEmpty = false;
 let catalogueSongs: RequestSong[];
@@ -52,7 +54,7 @@ beforeEach(async context => {
   await settings.update({
     tts: { enabled: false },
     llm: { requestMatching: 'direct', provider: 'openai-compatible', compatibleMode: 'local',
-      baseUrl: 'http://direct-model.invalid/v1', model: 'no-tools', fallback: { enabled: false }, dailyTokenCap: 0 },
+      baseUrl: 'http://direct-model.invalid/v1', model: 'no-tools', fallback: { enabled: false }, dailyTokenCap: 0, requestTimeoutMs: 300000 },
     requests: { enabled: true, onePendingPerIp: false, maxPending: 50, globalHourlyCap: 1000, repeatCooldownMin: 120 },
   } as never);
   queue.upcoming = [];
@@ -64,6 +66,7 @@ beforeEach(async context => {
   invalidateWeatherCache();
   bodies = [];
   modelError = false;
+  modelStalls = false;
   introError = false;
   searchEmpty = false;
   catalogueSongs = [filler, exact];
@@ -80,6 +83,7 @@ beforeEach(async context => {
   const leg = primaryLeg();
   for (const model of new Set([leg.model, leg.noThinkModel])) t.mock.method(model as any, 'doGenerate', async (options: any) => {
     bodies.push(options);
+    if (modelStalls) return new Promise(() => {});
     if (modelError) throw Error('synthetic interpreter failure');
     const intro = JSON.stringify(options.prompt).includes('Write an intro for this track');
     if (intro && introError) throw Error('synthetic intro failure');
@@ -106,12 +110,12 @@ beforeEach(async context => {
   });
 });
 
-async function submit(text = 'Queen, Bohemian Rhapsody') {
+async function submit(text = 'Queen, Bohemian Rhapsody', maxPolls = 250) {
   const response = await realFetch(`${base}/request`, { method: 'POST',
     headers: { 'content-type': 'application/json', 'x-forwarded-for': `198.51.100.${++ip}` }, body: JSON.stringify({ text, name: 'Listener' }) });
   const accepted: any = await response.json();
   assert.equal(response.status, 202, JSON.stringify(accepted));
-  for (let n = 0; n < 250; n++) {
+  for (let n = 0; n < maxPolls; n++) {
     const result: any = await (await realFetch(`${base}/request/${accepted.requestId}`)).json();
     if (result.status !== 'pending') {
       if (!agentResult) assert.equal(agentCalls, 0, 'Direct bypasses the agent, including when its failure could be caught');
@@ -173,6 +177,37 @@ test('Direct searches the named recording before genre candidates, with one inte
   assert.equal(queue.upcoming[0].track.id, exact.id);
   assert.equal(bodies.length, 1);
   assert.ok(recentCalls.some(c => c.kind === 'matchRequest' && ['ai-sdk', 'ai-sdk:tool'].includes(c.via || '')));
+});
+
+test('a short title is resolved locally before the interpreter', async () => {
+  catalogueSongs = [filler, titleOnlyExact];
+  const result = await submit('daaku');
+  assert.equal(result.outcome, 'matched');
+  assert.equal(result.track.title, titleOnlyExact.title);
+  assert.equal(result.track.artist, titleOnlyExact.artist);
+  assert.equal(queue.upcoming[0].track.id, titleOnlyExact.id);
+  assert.equal(bodies.length, 0, 'a short named request should not spend an interpretation call');
+});
+
+test('a missing short title fails without selecting an unrelated fallback', async () => {
+  catalogueSongs = [filler];
+  searchEmpty = true;
+  const result = await submit('daaku');
+  assert.equal(result.status, 'failed');
+  assert.equal(result.outcome, 'no-match');
+  assert.match(result.message, /couldn't find|could not find|no match|nothing .* matched/i);
+  assert.equal(queue.upcoming.length, 0);
+  assert.equal(bodies.length, 0, 'a named-title miss must not invoke the interpreter or fallback pool');
+});
+
+test('a stalled interpreter settles the accepted request instead of leaving it pending', async () => {
+  await settings.update({ llm: { requestTimeoutMs: 5000 } } as never);
+  modelStalls = true;
+  const result = await submit('play something from the nineties', 650);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.outcome, 'timeout');
+  assert.match(result.message, /too long/i);
+  assert.equal(queue.upcoming.length, 0);
 });
 
 test('agentic matching cannot replace an explicit voice request with another artist track', async () => {

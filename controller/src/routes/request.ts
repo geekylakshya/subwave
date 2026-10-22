@@ -17,6 +17,7 @@ import * as likes from '../broadcast/likes.js';
 import { generateQueuedRequestIntro } from '../broadcast/request-intro.js';
 import * as webhooks from '../broadcast/webhooks.js';
 import * as settings from '../settings.js';
+import { withDeadline } from '../llm/internal/core/retry.js';
 import {
   sanitizeRequestText, stripScriptedOpener, cleanRequesterName, cleanMissedArtist, stillInFlight, screenAck,
   isNamedRequester, sorryNoMatch,
@@ -38,6 +39,25 @@ export const router = express.Router();
 // In-memory request index for fast polling and admission checks. The durable
 const requests = new Map();
 const REQUEST_TTL_MS = 10 * 60 * 1000;
+// A listener request is accepted asynchronously, but it must still reach a
+// terminal state promptly. Provider generation has a much larger safety
+// timeout for other call sites; letting that budget govern this route leaves a
+// listener receipt pending for minutes when a model accepts a request and then
+// stops answering. Keep this route's wall-clock bound independent and shorter.
+const REQUEST_RESOLUTION_MAX_MS = 60_000;
+
+function requestResolutionTimeoutMs(): number {
+  const providerTimeout = Number((settings.get() as any)?.llm?.requestTimeoutMs);
+  return Number.isFinite(providerTimeout) && providerTimeout > 0
+    ? Math.min(REQUEST_RESOLUTION_MAX_MS, providerTimeout)
+    : REQUEST_RESOLUTION_MAX_MS;
+}
+
+function throwIfRequestResolutionAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason instanceof Error ? signal.reason : new Error('request resolution aborted');
+  throw reason;
+}
 
 // settings.requests.onePendingPerIp: an IP's previous request must resolve AND
 // leave the upcoming queue before the next is accepted. A request currently on
@@ -220,7 +240,7 @@ function resolvingRequestCount(): number {
   return n;
 }
 
-async function resolveRequest(entry) {
+async function resolveRequestCore(entry, signal?: AbortSignal) {
   const { requester, text } = entry;
   entry.startedAt = Date.now();
 
@@ -250,11 +270,13 @@ async function resolveRequest(entry) {
     queue.log('error', `getFullContext for request failed: ${err.message}`);
     ctx = {};
   }
+  throwIfRequestResolutionAborted(signal);
 
   // Roll, then post ONE event turn before any resolution path, so the agent, the
   // more-like-this shortcut and the cascade share it and no orphan event is left.
   try {
     await session.maybeRoll(ctx);
+    throwIfRequestResolutionAborted(signal);
     const cur = queue.current?.track || null;
     session.appendTurn({
       role: 'event', kind: 'request',
@@ -290,8 +312,10 @@ async function resolveRequest(entry) {
     // Same artist first, then real track similarity so a one-off collab credit
     // playing now doesn't dead-end the request.
     let pick = await pickMoreByArtist(refArtist, recentIds, reference?.track?.id);
+    throwIfRequestResolutionAborted(signal);
     if (!pick) {
       pick = await pickSimilarToTrack(reference, recentIds);
+      throwIfRequestResolutionAborted(signal);
       if (pick) entry.pickSource = 'more-like-this:similar';
     }
     if (!pick) {
@@ -310,6 +334,7 @@ async function resolveRequest(entry) {
       recentTracks: queue.getRecentTracks(),
       recentOpeners: queue.getRecentOpeners(),
     }, text);
+    throwIfRequestResolutionAborted(signal);
     if (generatedIntro.failure) {
       entry.introFailure = generatedIntro.failure;
       queue.log('error', 'more-like-this optional intro failed — queueing without speech');
@@ -376,6 +401,18 @@ async function resolveRequest(entry) {
   // pasted verse from bypassing lyric search and selecting a random track by a
   // parser-invented artist.
   const explicitNamedRequest = !lyricLike && Boolean(literal.title?.trim() && literal.artist?.trim());
+  // A short, attribute-free request is more likely to be a title than a
+  // conversational instruction. Resolve it against the local catalogue first
+  // so a provider stall cannot delay a straightforward named request. It is an
+  // identity claim: a miss must remain a miss rather than becoming an
+  // unrelated fallback track.
+  const likelyShortTitle = !lyricLike
+    && literal.kind === 'track'
+    && Boolean(literal.title?.trim())
+    && !literal.artist && !literal.album
+    && !literal.genre && !literal.language && !literal.mood && !literal.energy
+    && !/^(?:hello|hi|hey)(?:\s+(?:dj|radio|there|subwave|chill\s+zone))?[.!?]*$/iu.test(literal.title!.trim())
+    && literal.title!.trim().split(/\s+/u).length <= 4;
 
   // Conversational DJ agent. On any failure fall through to the stateless
   // cascade below, so a request is never dropped.
@@ -385,9 +422,10 @@ async function resolveRequest(entry) {
   // descriptions still use the existing web-aware agent path.
   const needsEvidenceIdentification = lyricLike
     || /\b(?:song|track|music)\s+(?:from|in)\s+(?:the\s+)?(?:film|movie|show|advert|commercial)\b/iu.test(text);
-  if (!explicitNamedRequest && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
+  if (!explicitNamedRequest && !likelyShortTitle && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
     try {
       const agentRes = await djAgent.runRequest(queue, { requester, text });
+      throwIfRequestResolutionAborted(signal);
       if (agentRes) {
         // Thread the agent's own echo-guard verdict into the durable log; the
         // other paths set it inline.
@@ -441,10 +479,15 @@ async function resolveRequest(entry) {
   // what is on air. Gated before generation: past the hard token cap with
   // requests not exempt, the model is not called at all.
   const currentTrack = queue.current?.track || null;
-  let matched = literal;
-  if (budget.requestsAllowed()) {
+  // `modelFreeRequest` marks a one-word literal as `literal` so legacy
+  // artist-only handling can consider it an artist. Once the local title-first
+  // classifier has identified it as a short title candidate, keep the title
+  // identity intact for the catalogue resolver instead.
+  let matched = likelyShortTitle ? { ...literal, literal: false } : literal;
+  if (!likelyShortTitle && budget.requestsAllowed()) {
     try {
-      const interpreted = await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack });
+      const interpreted = await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack }, signal);
+      throwIfRequestResolutionAborted(signal);
       if (explicitNamedRequest) {
         // Keep useful explicit attributes from the interpreter, but let the
         // request-match module pin title and artist identity to the listener's
@@ -458,6 +501,7 @@ async function resolveRequest(entry) {
       queue.log('error', `request interpretation failed: ${err.message} — trying library search`);
     }
   }
+  throwIfRequestResolutionAborted(signal);
   matched = normalizeRequestMatch(matched, { moods: settings.moodVocab() });
   const unsupported = directRequestUnsupported(text, matched);
   if (unsupported.length) {
@@ -536,7 +580,7 @@ async function resolveRequest(entry) {
     recentIds: cdMin > 0 ? queue.recentlyPlayedIds(cdMin / 60) : new Set<string>(),
     queuedIds: queue.queuedIds(),
     currentId: queue.current?.track?.id,
-    exactOnly: explicitNamedRequest,
+    exactOnly: explicitNamedRequest || likelyShortTitle,
     moodSongs: async mood => { await library.load(); return library.songsByMood(mood); },
     energySongs: async energy => { await library.load(); return library.songsByEnergy(energy); },
     fallbackSongs: async () => {
@@ -557,6 +601,7 @@ async function resolveRequest(entry) {
     ...(currentTrack?.id && ON_AIR_REFERENCE.test(text)
       ? { similarSongs: () => subsonic.getSimilarSongs(currentTrack.id, { count: 20 }) } : {}),
   });
+  throwIfRequestResolutionAborted(signal);
   const pick = selection.track;
   const pickSource = selection.source;
   entry.outcome = selection.outcome;
@@ -619,6 +664,7 @@ async function resolveRequest(entry) {
     recentTracks: queue.getRecentTracks(),
     recentOpeners: queue.getRecentOpeners(),
   }, text);
+  throwIfRequestResolutionAborted(signal);
   if (generatedIntro.failure) {
     entry.introFailure = generatedIntro.failure;
     queue.log('error', 'request optional intro failed — queueing without speech');
@@ -631,6 +677,7 @@ async function resolveRequest(entry) {
 
   // 4. Enqueue. push() dedups a track a concurrent request already queued (#619).
   if (entry.status === 'cancelled') return;
+  throwIfRequestResolutionAborted(signal);
   const pos = await queue.push({
     track: pick,
     requestedBy: requester,
@@ -672,6 +719,28 @@ async function resolveRequest(entry) {
     track: { title: pick.title, artist: pick.artist },
     queuePosition: queue.upcoming.length,
   });
+}
+
+// The HTTP handler returns the receipt before resolution starts, so this
+// wrapper owns the lifecycle guarantee: every accepted request either reaches
+// a normal terminal closure in resolveRequestCore or is failed here when the
+// bounded wall-clock budget expires. A stalled provider must never leave the
+// durable receipt pending forever.
+async function resolveRequest(entry) {
+  try {
+    await withDeadline(requestResolutionTimeoutMs(), 'request resolution', signal => resolveRequestCore(entry, signal));
+  } catch (err) {
+    if (entry.status === 'cancelled' || entry.status === 'resolved' || entry.status === 'failed') return;
+    const timedOut = err?.name === 'AgentDeadlineError'
+      || /request resolution.*deadline|request resolution.*aborted/i.test(String(err?.message || ''));
+    entry.outcome = timedOut ? 'timeout' : 'error';
+    entry.status = 'failed';
+    entry.message = timedOut
+      ? 'The request took too long to resolve — try naming the title and artist.'
+      : 'Something went wrong in the booth — try again.';
+    queue.log('error', `Request resolution ${timedOut ? 'timed out' : 'failed'}: ${err?.message || err}`);
+    recordOutcome(entry);
+  }
 }
 
 // Validates + rate-limits synchronously, then resolves in the background.

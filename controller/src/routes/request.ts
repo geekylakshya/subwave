@@ -27,21 +27,36 @@ import {
 } from '../middleware/ratelimit.js';
 import { validatePublicBody } from '../middleware/validate.js';
 import { listenerRequestSchema } from '../schemas/request.js';
-import { directRequestUnsupported, isRefusedOutcome, modelFreeRequest, nameSearchTerms, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
+import { directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
 import { ARTIST_VARIETY_WINDOW, drawRequestCandidate } from '../broadcast/dj-agent/artist-guard.js';
 
 export const router = express.Router();
 
-// In-memory request ledger, ephemeral by design: a restart drops in-flight
-// requests, and the track is either already queued or it isn't.
+// In-memory request index for fast polling and admission checks. The durable
 const requests = new Map();
 const REQUEST_TTL_MS = 10 * 60 * 1000;
 
 // settings.requests.onePendingPerIp: an IP's previous request must resolve AND
-// leave the upcoming queue before the next is accepted. pruneRequests() janitors.
+// leave the upcoming queue before the next is accepted. A request currently on
+// air has already left the waiting line and does not block the next request.
+// pruneRequests() janitors.
 const lastByIp = new Map<string, any>();
+
+// Admission checks and their durable receipt/budget commit must be serialized.
+// The ledger write is asynchronous, so without this short mutex concurrent
+// callers could all observe the same global and pending-request counts before
+// any of them committed its reservation.
+let admissionTail = Promise.resolve();
+
+async function acquireAdmissionLock(): Promise<() => void> {
+  const previous = admissionTail;
+  let release!: () => void;
+  admissionTail = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+  return release;
+}
 
 function pruneRequests() {
   const cutoff = Date.now() - REQUEST_TTL_MS;
@@ -208,6 +223,7 @@ async function resolveRequest(entry) {
   entry.startedAt = Date.now();
 
   const resolved = ({ ack, track, queuePosition }) => {
+    if (entry.status === 'cancelled') return;
     entry.outcome ||= entry.refused ? 'already-queued' : track ? 'matched' : 'chat';
     entry.status = 'resolved';
     entry.ack = ack || null;
@@ -216,11 +232,14 @@ async function resolveRequest(entry) {
     recordOutcome(entry);
   };
   const failed = (message) => {
+    if (entry.status === 'cancelled') return;
     entry.outcome ||= 'no-match';
     entry.status = 'failed';
     entry.message = message;
     recordOutcome(entry);
   };
+
+  if (entry.status === 'cancelled') return;
 
   let ctx;
   try {
@@ -298,6 +317,7 @@ async function resolveRequest(entry) {
       queue.log('request-guard', `more-like-this intro echoed request text — ${generatedIntro.guard}`);
     }
     const introScript = generatedIntro.introScript;
+    if (entry.status === 'cancelled') return;
     const pos = await queue.push({
       track: pick, requestedBy: requester, intent: 'more_like_this', introScript,
       introKind: 'dj-speak',
@@ -306,6 +326,10 @@ async function resolveRequest(entry) {
       introPersona: generatedIntro.introPersona,
       introHostSpeech: generatedIntro.introHostSpeech,
     });
+    if (entry.status === 'cancelled') {
+      await queue.removeUpcoming(pick.id).catch(() => undefined);
+      return;
+    }
     entry.pick = pick;
     if (pos === -2) {
       // Blocklist refused the pick; decline with the standard not-found copy so
@@ -336,61 +360,94 @@ async function resolveRequest(entry) {
     });
   }
 
+  // The literal parser is the authority for an explicit title+artist pair.
+  // Such a request is an identity claim, so it bypasses the conversational
+  // agent and uses the bounded catalogue resolver below. This is both faster
+  // for voice clients and prevents an agent from turning "title by artist"
+  // into a popular song by that artist. Vague, mood, similarity and lyric
+  // requests still use the agent, including its existing web-search tool.
+  const literal = modelFreeMatch(text);
+  const lyricLike = looksLikeLyricRequest(text);
+  // Long lyric/prose input can contain commas or "by" and look like an
+  // artist-title pair to the literal parser. It is not an identity claim: the
+  // web-aware request agent must get first chance to identify it. This keeps a
+  // pasted verse from bypassing lyric search and selecting a random track by a
+  // parser-invented artist.
+  const explicitNamedRequest = !lyricLike && Boolean(literal.title?.trim() && literal.artist?.trim());
+
   // Conversational DJ agent. On any failure fall through to the stateless
   // cascade below, so a request is never dropped.
-  try {
-    const agentRes = await djAgent.runRequest(queue, { requester, text });
-    if (agentRes) {
-      // Thread the agent's own echo-guard verdict into the durable log; the
-      // other paths set it inline.
-      if (agentRes.guard) flagGuard(entry, agentRes.guard);
-      if (!agentRes.track) {
-        // Chat escape: the agent answered in persona, nothing to queue. Only an
-        // EXPLICIT kind:"chat" lands here; an omitted id falls to the cascade.
-        queue.log('request', `agent chat-answered (no track)`);
-        entry.path = 'chat';
-        entry.pickSource = 'agent-chat';
-        return resolved({ ack: agentRes.ack, track: null, queuePosition: null });
-      }
-      if (agentRes.refused) {
-        // The agent declined to queue and returned the track only so the ack and
-        // log can name it: no queue position, no one-pending hold.
-        queue.log('request', `agent refused (${agentRes.refused}): ${agentRes.track.title} — ${agentRes.track.artist}`);
+  // The agent is reserved for evidence-heavy identification. Named, mood,
+  // energy, genre, and language requests must use the shared deterministic
+  // resolver so every listener request follows the same deterministic path. Lyric and film
+  // descriptions still use the existing web-aware agent path.
+  const needsEvidenceIdentification = lyricLike
+    || /\b(?:song|track|music)\s+(?:from|in)\s+(?:the\s+)?(?:film|movie|show|advert|commercial)\b/iu.test(text);
+  if (!explicitNamedRequest && needsEvidenceIdentification) {
+    try {
+      const agentRes = await djAgent.runRequest(queue, { requester, text });
+      if (agentRes) {
+        // Thread the agent's own echo-guard verdict into the durable log; the
+        // other paths set it inline.
+        if (agentRes.guard) flagGuard(entry, agentRes.guard);
+        if (!agentRes.track) {
+          // Chat escape: the agent answered in persona, nothing to queue. Only an
+          // EXPLICIT kind:"chat" lands here; an omitted id falls to the cascade.
+          queue.log('request', `agent chat-answered (no track)`);
+          entry.path = 'chat';
+          entry.pickSource = 'agent-chat';
+          return resolved({ ack: agentRes.ack, track: null, queuePosition: null });
+        }
+        if (agentRes.refused) {
+          // The agent declined to queue and returned the track only so the ack and
+          // log can name it: no queue position, no one-pending hold.
+          queue.log('request', `agent refused (${agentRes.refused}): ${agentRes.track.title} — ${agentRes.track.artist}`);
+          entry.path = 'agent';
+          entry.pickSource = `agent:${agentRes.refused}`;
+          entry.pick = agentRes.track;
+          entry.refused = true;
+          entry.outcome = agentRes.refused;
+          return resolved({ ack: agentRes.ack, track: agentRes.track, queuePosition: null });
+        }
+        queue.log('request', `agent resolved: ${agentRes.track.title} — ${agentRes.track.artist}`);
         entry.path = 'agent';
-        entry.pickSource = `agent:${agentRes.refused}`;
+        entry.pickSource = 'agent';
         entry.pick = agentRes.track;
-        entry.refused = true;
-        entry.outcome = agentRes.refused;
-        return resolved({ ack: agentRes.ack, track: agentRes.track, queuePosition: null });
+        entry.introScript = agentRes.introScript || null;
+        if (entry.status === 'cancelled') return;
+        return resolved({
+          ack: withWaitNotice(agentRes.ack, agentRes.track.id),
+          track: agentRes.track,
+          queuePosition: queue.upcoming.length,
+        });
       }
-      queue.log('request', `agent resolved: ${agentRes.track.title} — ${agentRes.track.artist}`);
-      entry.path = 'agent';
-      entry.pickSource = 'agent';
-      entry.pick = agentRes.track;
-      entry.introScript = agentRes.introScript || null;
-      return resolved({
-        ack: withWaitNotice(agentRes.ack, agentRes.track.id),
-        track: agentRes.track,
-        queuePosition: queue.upcoming.length,
-      });
+    } catch (err) {
+      queue.log('error', `DJ agent request failed: ${err.message} — falling back`);
     }
-  } catch (err) {
-    queue.log('error', `DJ agent request failed: ${err.message} — falling back`);
   }
 
   // 1. LLM matches intent; the current track lets vibe queries be read against
   // what is on air. Gated before generation: past the hard token cap with
   // requests not exempt, the model is not called at all.
   const currentTrack = queue.current?.track || null;
-  let matched = modelFreeMatch(text);
+  let matched = literal;
   if (budget.requestsAllowed()) {
     try {
-      matched = repairRequestMatch(await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack }), text) as typeof matched;
+      const interpreted = await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack });
+      if (explicitNamedRequest) {
+        // Keep useful explicit attributes from the interpreter, but let the
+        // request-match module pin title and artist identity to the listener's
+        // literal pair.
+        matched = (pinExplicitRequestMatch(interpreted, text) || literal) as typeof matched;
+      } else {
+        matched = repairRequestMatch(interpreted, text) as typeof matched;
+      }
     } catch (err) {
       entry.interpretationFallback = true;
       queue.log('error', `request interpretation failed: ${err.message} — trying library search`);
     }
   }
+  matched = normalizeRequestMatch(matched, { moods: settings.moodVocab() });
   const unsupported = directRequestUnsupported(text, matched);
   if (unsupported.length) {
     entry.path = 'cascade';
@@ -468,7 +525,9 @@ async function resolveRequest(entry) {
     recentIds: cdMin > 0 ? queue.recentlyPlayedIds(cdMin / 60) : new Set<string>(),
     queuedIds: queue.queuedIds(),
     currentId: queue.current?.track?.id,
+    exactOnly: explicitNamedRequest,
     moodSongs: async mood => { await library.load(); return library.songsByMood(mood); },
+    energySongs: async energy => { await library.load(); return library.songsByEnergy(energy); },
     fallbackSongs: async () => {
       let moodSongs: any[] = [];
       if (ctx.dominantMood) {
@@ -499,9 +558,16 @@ async function resolveRequest(entry) {
       entry.unsupported = selection.unsupported || [];
       return failed(UNSUPPORTED_REFUSAL);
     }
-    return failed(selection.required?.length
-      ? 'Could not verify a track meeting the requested language or genre requirements. Try simplifying the request.'
-      : sorryNoMatch(requester));
+    if (selection.required?.length) {
+      return failed('Could not verify a track meeting the requested language or genre requirements. Try simplifying the request.');
+    }
+    if (selection.alternatives?.length) {
+      const choices = selection.alternatives
+        .map(candidate => `"${candidate.title}" by ${candidate.artist}`)
+        .join('; ');
+      return failed(`I found a few close matches: ${choices}. Please request the title and artist again.`);
+    }
+    return failed(sorryNoMatch(requester));
   }
   // A search in the listener's own spelling answers in the library's ("Tupac"
   // finds 2Pac). That may be the same act, so the intro is not told it is not.
@@ -553,6 +619,7 @@ async function resolveRequest(entry) {
   const introScript = generatedIntro.introScript;
 
   // 4. Enqueue. push() dedups a track a concurrent request already queued (#619).
+  if (entry.status === 'cancelled') return;
   const pos = await queue.push({
     track: pick,
     requestedBy: requester,
@@ -562,6 +629,10 @@ async function resolveRequest(entry) {
     introPersona: generatedIntro.introPersona,
     introHostSpeech: generatedIntro.introHostSpeech,
   });
+  if (entry.status === 'cancelled') {
+    await queue.removeUpcoming(pick.id).catch(() => undefined);
+    return;
+  }
   entry.pick = pick;
   if (pos === -2) {
     // Blocklist refused the pick; standard not-found copy so it doesn't leak.

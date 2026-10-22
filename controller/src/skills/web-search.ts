@@ -11,7 +11,7 @@ const TAVILY_ENDPOINT = 'https://api.tavily.com/search';
 const DDG_ENDPOINT = 'https://api.duckduckgo.com/';
 const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
 
-type SearchResult = { title: string; content: string };
+type SearchResult = { title: string; content: string; url?: string };
 type SearchResponse = { answer: string; results: SearchResult[] };
 
 // 30-min TTL cache keyed by `${provider}:${query}`. BOUNDED: the request path's
@@ -67,6 +67,7 @@ export async function tavilySearch(query: string): Promise<SearchResponse> {
       ? data.results.map((r: any) => ({
           title: String(r.title || ''),
           content: String(r.content || ''),
+          ...(r.url ? { url: String(r.url) } : {}),
         }))
       : [],
   };
@@ -115,6 +116,7 @@ export async function duckduckgoSearch(query: string): Promise<SearchResponse> {
           results.push({
             title: String(sub.Name || data.Heading || ''),
             content: sub.Text.trim(),
+            ...(sub.FirstURL ? { url: String(sub.FirstURL) } : {}),
           });
         }
         if (results.length >= 5) break;
@@ -123,6 +125,7 @@ export async function duckduckgoSearch(query: string): Promise<SearchResponse> {
       results.push({
         title: String(t.Name || data.Heading || ''),
         content: t.Text.trim(),
+        ...(t.FirstURL ? { url: String(t.FirstURL) } : {}),
       });
     }
     if (results.length >= 5) break;
@@ -207,7 +210,8 @@ export function parseSearxngResponse(data: unknown): SearchResponse {
     const title = typeof rec.title === 'string' ? rec.title.trim() : '';
     const content = typeof rec.content === 'string' ? rec.content.trim().slice(0, 300) : '';
     if (!title || !content) continue;
-    results.push({ title, content });
+    const url = typeof rec.url === 'string' ? rec.url.trim() : '';
+    results.push({ title, content, ...(url ? { url } : {}) });
     if (results.length >= 10) break;
   }
 
@@ -293,7 +297,8 @@ export function parseBraveResponse(data: unknown): SearchResponse {
     const title = braveText(rec.title);
     const content = braveText(rec.description).slice(0, 300);
     if (!title || !content) return;
-    results.push({ title, content });
+    const url = typeof rec.url === 'string' ? rec.url.trim() : '';
+    results.push({ title, content, ...(url ? { url } : {}) });
   };
   const newsResults = sub(d.news, 'results');
   const webResults = sub(d.web, 'results');

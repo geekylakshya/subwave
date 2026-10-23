@@ -700,6 +700,13 @@ test('model-free requests retain combined genre, energy, and language constraint
   assert.equal(rockPunjabi.language, 'Punjabi');
 });
 
+test('model-free requests recognise album framing', () => {
+  const match = modelFreeRequest('play the album Fearless');
+  assert.equal(match.album, 'Fearless');
+  assert.equal(match.scope, 'album');
+  assert.deepEqual(match.search_terms, ['Fearless']);
+});
+
 test('short transliterated lyric prose is routed to evidence resolution', () => {
   assert.equal(looksLikeLyricRequest('chite suit te daag pai gaye gali teri vich gara'), true);
   assert.equal(looksLikeLyricRequest('gali teri vich gara'), true);

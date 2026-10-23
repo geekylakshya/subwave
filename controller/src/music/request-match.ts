@@ -617,6 +617,15 @@ export function rankAliasCandidates(
 export function modelFreeRequest(text: string): RequestMatch {
   const cleaned = text.replace(REQUEST_LEAD, '').replace(/\s+please[.!?]*$/i, '').trim();
   const unquote = (s: string) => s.replace(/^["'“‘]|["'”’][.!?]*$/g, '').trim();
+  const albumPhrase = cleaned.match(/^(?:the\s+)?album\s+(.+?)[.!?]*$/iu);
+  if (albumPhrase) {
+    const album = unquote(albumPhrase[1]);
+    return {
+      kind: 'track', title: null, album, artist: null, genre: null, language: null,
+      mood: null, energy: null, sort: null, scope: 'album', search_terms: album ? [album] : [],
+      intent: album ? `Wants a track from the album ${album}.` : 'Wants a track from an album.', ack: '',
+    };
+  }
   const attributeBody = cleaned
     .replace(/^(?:some|something|music|songs?|tracks?|a\s+song|a\s+track)\s+/iu, '')
     .replace(/\s+(?:music|songs?|tracks?|genre|language|style)\s*$/iu, '')

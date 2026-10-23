@@ -542,6 +542,17 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     && !literal.artist && !literal.album
     && !literal.genre && !literal.language && !literal.mood && !literal.energy
     && !/^(?:hello|hi|hey|surprise|anything|something|music)(?:\s+(?:me|dj|radio|there|subwave|chill\s+zone))?[.!?]*$/iu.test(literal.title!.trim());
+  // These forms already carry all the identity/attribute information the
+  // deterministic resolver needs. Calling the interpreter first only adds a
+  // failure point (and used to leave album/mood requests waiting on a slow
+  // model even though the local parser had a complete plan).
+  const deterministicLiteralRequest = !lyricLike
+    && !explicitNamedRequest
+    && (Boolean(literal.album?.trim())
+      || Boolean(literal.genre?.trim())
+      || Boolean(literal.language?.trim())
+      || Boolean(literal.mood?.trim())
+      || Boolean(literal.energy?.trim()));
   const explicitNoMatchCue = /\b(?:no\s+such|doesn['’]?t\s+exist|does\s+not\s+exist|not\s+in\s+(?:the\s+)?(?:library|catalog(?:ue)?))\b/iu.test(literal.title || '');
   // A framed, unquoted multi-word name is still an identity claim when no
   // artist/attribute is present. Keep a miss honest instead of letting a model
@@ -640,9 +651,15 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // classifier has identified it as a short title candidate, keep the title
   // identity intact for the catalogue resolver instead.
   let matched = likelyShortTitle ? { ...literal, literal: false, titleOnly: true } : literal;
-  if (!likelyShortTitle && !forcedNamedTitle && budget.requestsAllowed()) {
+  if (!likelyShortTitle && !forcedNamedTitle && !deterministicLiteralRequest && budget.requestsAllowed()) {
     try {
-      const interpreted = await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack }, signal);
+      // A title-only phrase may still benefit from model repair (for example,
+      // an unseparated artist and title), but it must not spend the complete
+      // request deadline before the local fuzzy catalogue gets a chance.
+      const interpretationSignal = titleOnlyNamedRequest
+        ? signal ? AbortSignal.any([signal, AbortSignal.timeout(8_000)]) : AbortSignal.timeout(8_000)
+        : signal;
+      const interpreted = await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack }, interpretationSignal);
       throwIfRequestResolutionAborted(signal);
       if (explicitNamedRequest) {
         // Keep useful explicit attributes from the interpreter, but let the

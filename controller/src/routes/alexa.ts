@@ -14,6 +14,11 @@ import {
   DEFAULT_ALEXA_TOKEN_TTL_HOURS,
 } from '../alexa/token.js';
 import { alexaPatchSchema } from '../schemas/settings.js';
+import {
+  submitListenerRequest,
+  type ListenerRequestResolution,
+  type ListenerRequestSubmission,
+} from './request.js';
 
 const router = express.Router();
 const ALEXA_SKILL_ID_RE = /^amzn1\.ask\.skill\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -30,6 +35,12 @@ export interface AlexaRuntime {
     tokenTtlSeconds?: number;
   };
   isStreamOnline: () => boolean;
+  submitListenerRequest?: (input: {
+    text: string;
+    name?: string;
+    ip: string;
+    source: 'alexa';
+  }) => Promise<ListenerRequestSubmission>;
 }
 
 export interface AlexaConnectionCheck {
@@ -74,6 +85,7 @@ function defaultRuntime(): AlexaRuntime {
       };
     },
     isStreamOnline: () => getStreamStatus().online,
+    submitListenerRequest,
   };
 }
 
@@ -318,6 +330,55 @@ function stopResponse(input: any, message: string) {
     .getResponse();
 }
 
+function alexaRequestText(input: any): string {
+  const slots = input.requestEnvelope.request.intent?.slots || {};
+  const values = Object.entries(slots)
+    .map(([name, slot]: [string, any]) => ({
+      name,
+      value: String(slot?.value || '').trim(),
+      rank: /(?:song|track|title|request|artist|music)/iu.test(name) ? 0 : 1,
+    }))
+    .filter(slot => slot.value)
+    .sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name))
+    .map(slot => slot.value);
+  return values.join(' ').trim();
+}
+
+function alexaListenerId(input: any): string {
+  const userId = input.requestEnvelope.context?.System?.user?.userId
+    || input.requestEnvelope.session?.user?.userId
+    || input.requestEnvelope.request?.requestId
+    || 'anonymous';
+  return `alexa:${String(userId).slice(0, 160)}`;
+}
+
+function requestResponse(input: any, resolution: ListenerRequestResolution) {
+  const spoken = resolution.ack || resolution.message || (
+    resolution.outcome === 'matched' ? 'Your request is queued.'
+      : resolution.outcome === 'already-queued' ? 'That request is already queued.'
+        : resolution.outcome === 'cooldown' ? 'That track was played recently.'
+          : resolution.outcome === 'unsupported' ? 'I need a title, artist, or music description for that request.'
+            : resolution.outcome === 'provider-error' ? 'The search service is unavailable right now.'
+              : 'I could not find that in the library.'
+  );
+  return input.responseBuilder.speak(spoken).withShouldEndSession(true).getResponse();
+}
+
+async function listenerRequestResponse(input: any, runtime: AlexaRuntime) {
+  const text = alexaRequestText(input);
+  if (!text) return input.responseBuilder
+    .speak('Tell me a song title, artist, or music description to request.')
+    .withShouldEndSession(true)
+    .getResponse();
+  const submit = runtime.submitListenerRequest || submitListenerRequest;
+  const result = await submit({ text, name: 'Alexa listener', ip: alexaListenerId(input), source: 'alexa' });
+  if (!result.accepted) {
+    return input.responseBuilder.speak(result.message || result.error || 'Requests are unavailable right now.')
+      .withShouldEndSession(true).getResponse();
+  }
+  return requestResponse(input, await result.completion);
+}
+
 function intentHandler(names: readonly string[], handle: (input: any) => any) {
   return {
     canHandle: (input: any) =>
@@ -359,6 +420,8 @@ export function createAlexaSkill(runtime: AlexaRuntime = defaultRuntime()) {
           .speak('You can say start, pause, resume, or stop the radio.')
           .withShouldEndSession(false)
           .getResponse()),
+      intentHandler(['RequestSongIntent', 'SongRequestIntent', 'PlaySongIntent'], input =>
+        listenerRequestResponse(input, runtime)),
       {
         canHandle: (input: any) => input.requestEnvelope.request.type === 'SessionEndedRequest',
         handle: () => ({}),

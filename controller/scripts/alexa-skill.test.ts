@@ -60,6 +60,20 @@ function intent(name: string) {
   });
 }
 
+function songRequest(text: string) {
+  return envelope({
+    type: 'IntentRequest',
+    requestId: 'EdwRequestId.song-request',
+    timestamp: '2026-10-21T12:00:00Z',
+    locale: 'en-IN',
+    intent: {
+      name: 'RequestSongIntent',
+      confirmationStatus: 'NONE',
+      slots: { request: { name: 'request', value: text, confirmationStatus: 'NONE' } },
+    },
+  });
+}
+
 const runtime = {
   getSettings: () => ({
     enabled: true,
@@ -158,6 +172,38 @@ test('pause and stop stop live playback, while resume starts at the live edge', 
   assert.deepEqual(stop.directives, [{ type: 'AudioPlayer.Stop' }]);
   assert.equal(resume.outputSpeech.ssml, '<speak>Resuming EXAMPLE STATION.</speak>');
   assert.equal(resume.directives[0].audioItem.stream.offsetInMilliseconds, 0);
+});
+
+test('Alexa song requests use the shared listener resolver and preserve typed outcomes', async () => {
+  let received: { text: string; name?: string; ip: string; source: 'alexa' } | null = null;
+  const alexaRuntime = {
+    ...runtime,
+    submitListenerRequest: async (input: typeof received extends infer T ? T & {} : never) => {
+      received = input as typeof received;
+      return {
+        accepted: true as const,
+        requestId: 'request-alexa-test',
+        status: 'pending' as const,
+        completion: Promise.resolve({
+          outcome: 'matched' as const,
+          legacyOutcome: 'matched',
+          ack: 'Queued Bohemian Rhapsody by Queen.',
+          message: null,
+          track: { id: 'bohemian-rhapsody', title: 'Bohemian Rhapsody', artist: 'Queen' },
+          queuePosition: 1,
+        }),
+      };
+    },
+  };
+  const response = (await createAlexaSkill(alexaRuntime).invoke(songRequest('Queen Bohemian Rhapsody'))).response as any;
+  assert.deepEqual(received, {
+    text: 'Queen Bohemian Rhapsody',
+    name: 'Alexa listener',
+    ip: 'alexa:amzn1.ask.account.test',
+    source: 'alexa',
+  });
+  assert.equal(response.outputSpeech.ssml, '<speak>Queued Bohemian Rhapsody by Queen.</speak>');
+  assert.equal(response.shouldEndSession, true);
 });
 
 test('Alexa rejects a skill request with the wrong configured skill id', async () => {

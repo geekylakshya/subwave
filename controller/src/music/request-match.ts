@@ -964,7 +964,11 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   const selectFuzzy = (songs: RequestSong[], source: string): RequestSelection | null => {
     if (!title) return null;
     const scored = unique(songs)
-      .filter(song => constraints(song, source) && eligible(song))
+      // Keep temporarily ineligible candidates in the ranked set. Exact
+      // matching already preserves a queued/cooldown identity for a refusal;
+      // fuzzy matching must do the same instead of turning a verified repeat
+      // into a misleading no-match.
+      .filter(song => constraints(song, source))
       .map(song => ({ song, confidence: identityScore(song), titleScore: requestTitleSimilarity(title, song.title), artistScore: resolvedArtistName ? requestCandidateArtistSimilarity(resolvedArtistName, song) : 1 }))
       // Keep a wider, still meaningful candidate set for clarification. Only
       // the stricter confidence and margin checks below may auto-select.
@@ -976,14 +980,30 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
       artist: String(row.song.artist || ''),
       confidence: Number(row.confidence.toFixed(4)),
     }));
-    const top = scored[0];
-    const margin = top && scored[1] ? top.confidence - scored[1].confidence : 1;
+    // Prefer an eligible candidate when one exists. If every plausible
+    // candidate is queued, playing, or on cooldown, retain the best verified
+    // identity so the caller can return its typed refusal instead of widening
+    // into an unrelated fallback.
+    const ranked = scored.filter(row => eligible(row.song));
+    const top = (ranked.length ? ranked : scored)[0];
+    const comparison = ranked.length ? ranked : scored;
+    const margin = top && comparison[1] ? top.confidence - comparison[1].confidence : 1;
     // A title-only request has no artist signal to contribute, so one speech
     // recognition typo can land just below the explicit title+artist floor.
     // Keep a meaningful title threshold and the same ambiguity margin; a
     // collision therefore remains a no-match rather than becoming a guess.
     const minimumConfidence = resolvedArtistName ? 0.92 : 0.88;
     if (!top || top.confidence < minimumConfidence || margin < 0.08) return null;
+    if (!eligible(top.song)) {
+      return {
+        track: top.song,
+        source,
+        outcome: queuedIds.has(top.song.id) || top.song.id === currentId ? 'already-queued' : 'cooldown',
+        errors,
+        confidence: top.confidence,
+        alternatives,
+      };
+    }
     return {
       track: top.song,
       source: `${source}:fuzzy`,

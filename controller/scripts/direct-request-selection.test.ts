@@ -761,6 +761,22 @@ for (const typo of ['choor bazari', 'chhor bazari']) {
   });
 }
 
+test('a fuzzy title preserves an already-queued verified candidate', async () => {
+  const wanted = { id: 'chor-bazaari', title: 'Chor Bazaari', artist: 'Sunidhi Chauhan & Neeraj Shridhar' };
+  const f = fixture({
+    searchPage: async () => ({ songs: [], rawCount: 0 }),
+    fuzzySearch: async () => [wanted],
+  });
+  f.deps.queuedIds.add(wanted.id);
+  const result = await resolveDirectRequest(
+    { title: 'choor bazari', artist: null, search_terms: ['choor bazari'], scope: 'song' },
+    { ...f.deps, exactOnly: true },
+  );
+  assert.equal(result.track?.id, wanted.id);
+  assert.equal(result.outcome, 'already-queued');
+  assert.equal(f.fallbackCalls(), 0);
+});
+
 test('same-title local fuzzy collisions remain no-match instead of guessing', async () => {
   const first = { id: 'chor-a', title: 'Chor Bazaari', artist: 'Sunidhi Chauhan & Neeraj Shridhar' };
   const second = { id: 'chor-b', title: 'Chor Bazaari', artist: 'Other Artist' };

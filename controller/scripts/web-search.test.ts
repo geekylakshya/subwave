@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { createTempDir } from './test-utils/temp-dir.js';
 
 process.env.STATE_DIR = createTempDir(join(tmpdir(), 'subwave-web-search-'));
-const { parseBraveResponse, buildSearxngUrl, parseSearxngResponse, searchWeb, searchCacheSize } =
+const { parseBraveResponse, buildSearxngUrl, parseSearxngResponse, searchWeb, searchCacheSize, isWebSearchProviderError } =
   await import('../src/skills/web-search.js');
 const settings = await import('../src/settings.js');
 const here = dirname(fileURLToPath(import.meta.url));
@@ -224,4 +224,89 @@ test('empty provider responses are retried instead of cached for the full TTL', 
   assert.deepEqual(await searchWeb(query), { answer: '', results: [] });
   assert.equal(calls, 2, 'an empty result must not be reused from the long-lived cache');
   assert.ok(searchCacheSize() >= 0);
+});
+
+test('dispatcher cache is isolated by SearXNG base URL and engine selection', async t => {
+  await settings.load();
+  const calls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    calls.push(url.toString());
+    return Response.json({ results: [{ title: url.host, content: url.searchParams.get('engines') || 'default' }] });
+  });
+  const query = `provider-config-cache-${Date.now()}`;
+
+  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://first.test', searxngEngines: 'google' } });
+  const first = await searchWeb(query);
+  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://second.test', searxngEngines: 'wikipedia' } });
+  const second = await searchWeb(query);
+
+  assert.equal(calls.length, 2, 'each provider configuration gets its own cache entry');
+  assert.notDeepEqual(first, second);
+  assert.match(calls[0], /first\.test/);
+  assert.match(calls[0], /engines=google/);
+  assert.match(calls[1], /second\.test/);
+  assert.match(calls[1], /engines=wikipedia/);
+});
+
+test('concurrent identical searches share one provider request', async t => {
+  await settings.load();
+  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://dedupe.test', searxngEngines: '' } });
+  let calls = 0;
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    await blocked;
+    return Response.json({ results: [{ title: 'Shared', content: 'one result' }] });
+  });
+  const query = `concurrent-search-${Date.now()}`;
+  const first = searchWeb(query);
+  const second = searchWeb(query);
+  await new Promise(resolve => setImmediate(resolve));
+  const callsWhilePending = calls;
+  release();
+  assert.deepEqual(await first, await second);
+  assert.equal(callsWhilePending, 1);
+  assert.equal(calls, 1);
+});
+
+test('rate limits become typed provider failures and are never cached', async t => {
+  await settings.load();
+  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://rate-limit.test', searxngEngines: '' } });
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    return new Response('slow down', { status: 429 });
+  });
+  const query = `rate-limit-${Date.now()}`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(searchWeb(query), error => {
+      assert.ok(isWebSearchProviderError(error));
+      assert.equal(error.provider, 'searxng');
+      assert.equal(error.reason, 'rate-limit');
+      return true;
+    });
+  }
+  assert.equal(calls, 2);
+});
+
+test('malformed provider data becomes a typed failure and is never cached', async t => {
+  await settings.load();
+  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://malformed.test', searxngEngines: '' } });
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    return new Response('{not-json', { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  const query = `malformed-${Date.now()}`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(searchWeb(query), error => {
+      assert.ok(isWebSearchProviderError(error));
+      assert.equal(error.provider, 'searxng');
+      assert.equal(error.reason, 'malformed');
+      return true;
+    });
+  }
+  assert.equal(calls, 2);
 });

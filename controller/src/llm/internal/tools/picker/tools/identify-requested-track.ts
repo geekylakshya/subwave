@@ -1,7 +1,7 @@
 import { tool } from 'ai';
 import { z } from 'zod';
 import * as subsonic from '../../../../../music/subsonic.js';
-import { searchWeb, searchReady } from '../../../../../skills/web-search.js';
+import { isWebSearchProviderError, searchWeb, searchReady } from '../../../../../skills/web-search.js';
 import * as settings from '../../../../../settings.js';
 import { identifyTrackFromText } from '../../../prompts/request.js';
 import { definePickerTool } from '../defs.js';
@@ -153,7 +153,12 @@ export function extractLyricTrackHints(web: { results?: WebTrackResult[] }): Lyr
     .map(({ title, artist }) => ({ title, artist }));
 }
 
-function lyricSearchQuery(reference: string, artist: string | null = null, edge: 'head' | 'tail' = 'tail'): string {
+function lyricSearchQuery(
+  reference: string,
+  artist: string | null = null,
+  edge: 'head' | 'tail' = 'tail',
+  suffix = 'lyrics song artist',
+): string {
   const stop = new Set(['a', 'an', 'and', 'are', 'at', 'be', 'but', 'for', 'i', 'in', 'is', 'it', 'my', 'of', 'on', 'or', 'the', 'there', 'this', 'to', 'was', 'we', 'with', 'you']);
   const words = String(reference || '').replace(/[“”"']/g, '').toLocaleLowerCase('en').split(/\s+/)
     .map(word => word.replace(/[^\p{L}\p{N}]/gu, '')).filter(word => word.length >= 4 && !stop.has(word));
@@ -162,7 +167,7 @@ function lyricSearchQuery(reference: string, artist: string | null = null, edge:
   // pages, while a distinctive phrase plus the performer finds the canonical
   // song page more reliably.
   const fragment = (edge === 'head' ? words.slice(0, 8) : words.slice(-8)).join(' ');
-  return `${artist ? `${artist} ` : ''}${fragment || String(reference).slice(0, 120)} lyrics song artist`;
+  return `${artist ? `${artist} ` : ''}"${fragment || String(reference).slice(0, 120)}" ${suffix}`;
 }
 
 // Short transliterated lyric fragments are especially vulnerable to SearXNG
@@ -177,50 +182,49 @@ function shortLyricSearchQuery(reference: string): string {
 
 type WebSearchResponse = { answer?: string; results?: WebTrackResult[] };
 
-async function lyricWebEvidence(reference: string): Promise<WebSearchResponse> {
-  const wordCount = requestName(reference).split(' ').filter(Boolean).length;
+type EvidenceSearchBudget = {
+  readonly used: number;
+  search(query: string): Promise<WebSearchResponse>;
+};
+
+function evidenceSearchBudget(limit = 3, signal?: AbortSignal): EvidenceSearchBudget {
+  let used = 0;
+  const seen = new Set<string>();
+  return {
+    get used() { return used; },
+    async search(query: string) {
+      const key = requestName(query);
+      if (!key || seen.has(key) || used >= limit) return { answer: '', results: [] };
+      seen.add(key);
+      used++;
+      return searchWeb(query, { signal });
+    },
+  };
+}
+
+function hasWebEvidence(web: WebSearchResponse): boolean {
+  return !!String(web.answer || '').trim() || !!web.results?.length;
+}
+
+async function lyricWebEvidence(reference: string, budget: EvidenceSearchBudget): Promise<WebSearchResponse> {
+  const normalizedWords = requestName(reference).split(' ').filter(Boolean);
+  const wordCount = normalizedWords.length;
+  const hasRepeatedPhraseCue = new Set(normalizedWords.filter(word => word.length >= 4)).size
+    < normalizedWords.filter(word => word.length >= 4).length;
   const raw = String(reference || '').replace(/["“”]/gu, '').replace(/\s+/g, ' ').trim();
   const boundedRaw = raw.length > 240 ? `${raw.slice(0, 120)} ${raw.slice(-120)}` : raw;
-  const initialQueries = wordCount >= 8
-    ? [lyricSearchQuery(reference, null, 'head'), lyricSearchQuery(reference), boundedRaw]
-    : wordCount >= 3
-      ? [shortLyricSearchQuery(reference), boundedRaw]
-      : [boundedRaw];
-  const queries = [...new Set(initialQueries.filter(Boolean))];
-  const merged: WebTrackResult[] = [];
-  const seen = new Set<string>();
-  let answer = '';
-  const collect = (responses: PromiseSettledResult<WebSearchResponse>[]) => {
-    for (const response of responses) {
-      if (response.status !== 'fulfilled') continue;
-      answer ||= String(response.value.answer || '').trim();
-      for (const result of response.value.results || []) {
-        const key = `${requestName(result.title)}|${requestName(result.content)}|${result.url || ''}`;
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
-        merged.push(result);
-      }
-    }
-  };
+  const firstQuery = wordCount >= 8
+    ? lyricSearchQuery(reference, null, 'tail', hasRepeatedPhraseCue ? 'lyrics song artist' : 'lyrics')
+    : wordCount >= 3 ? shortLyricSearchQuery(reference) : boundedRaw;
+  const first = await budget.search(firstQuery);
+  if (hasWebEvidence(first)) return first;
 
-  collect(await Promise.allSettled(queries.map(query => searchWeb(query))));
-
-  // A SearXNG engine can briefly answer with an empty result set while its
-  // upstream engines are timing out. Do not cache that transient miss as a
-  // final identification failure: issue a bounded pair of differently keyed
-  // music queries once, only when the first pass returned no evidence.
-  if (!merged.length) {
-    const fallbackQueries = wordCount >= 8
-      ? [lyricSearchQuery(reference, null, 'tail'), lyricSearchQuery(reference, null, 'head'), `${boundedRaw} song lyrics`]
-      : [
-        `${boundedRaw} song lyrics`,
-        `"${boundedRaw}" song`,
-      ];
-    const uniqueFallbacks = [...new Set(fallbackQueries.filter(query => !queries.includes(query)))];
-    collect(await Promise.allSettled(uniqueFallbacks.map(query => searchWeb(query))));
-  }
-
-  return { answer, results: merged.slice(0, 20) };
+  // Only an evidence-less first fragment earns a second, distinct fragment.
+  // Provider failures throw and stop here; they are not identification misses.
+  const secondQuery = wordCount >= 8
+    ? lyricSearchQuery(reference, null, 'head', 'song lyrics')
+    : `"${boundedRaw}" song lyrics`;
+  return budget.search(secondQuery);
 }
 
 // Request path only, and only when a web-search provider is ready. Resolves a
@@ -235,14 +239,19 @@ async function lyricWebEvidence(reference: string): Promise<WebSearchResponse> {
 export default definePickerTool({
   name: 'identifyRequestedTrack',
   available: ({ scope }) => scope.resolveReferences && searchReady(),
-  build: ({ collect }) => tool({
-    description: 'Use when a listener DESCRIBES a track instead of naming it, OR pastes SONG LYRICS — e.g. "the song from the new Dune movie", "the one all over TikTok", or a block of lyrics in any language. Looks the text up on the web, identifies the song, and returns matching tracks FROM THIS LIBRARY. Use this (not searchLibrary) when the request looks like lyrics — repeated phrases, verse structure, non-English text that is not an artist/title; when they name an artist or title outright, use searchLibrary. (searchByLyrics finds songs ABOUT a theme — this identifies the one specific song.) Returns { candidates } from this library; when nothing matched, a note says so and you choose a fitting stand-in from your other results.',
-    inputSchema: z.object({
-      reference: z.string().min(3).max(REQUEST_TEXT_MAX).describe("the listener's description of the track, verbatim"),
-    }),
-    execute: async ({ reference }) => {
+  build: (ctx) => {
+    const { collect } = ctx;
+    return tool({
+      description: 'Use when a listener DESCRIBES a track instead of naming it, OR pastes SONG LYRICS — e.g. "the song from the new Dune movie", "the one all over TikTok", or a block of lyrics in any language. Looks the text up on the web, identifies the song, and returns matching tracks FROM THIS LIBRARY. Use this (not searchLibrary) when the request looks like lyrics — repeated phrases, verse structure, non-English text that is not an artist/title; when they name an artist or title outright, use searchLibrary. (searchByLyrics finds songs ABOUT a theme — this identifies the one specific song.) Returns { candidates } from this library; when nothing matched, a note says so and you choose a fitting stand-in from your other results.',
+      inputSchema: z.object({
+        reference: z.string().min(3).max(REQUEST_TEXT_MAX).describe("the listener's description of the track, verbatim"),
+      }),
+      execute: async ({ reference }, options: { abortSignal?: AbortSignal } = {}) => {
       try {
-        const web = await lyricWebEvidence(reference); // cached 30 min per query
+        const signal = options.abortSignal;
+        signal?.throwIfAborted();
+        const searchBudget = evidenceSearchBudget(3, signal);
+        const web = await lyricWebEvidence(reference, searchBudget); // cached 30 min per provider configuration
         let blob = webBlob(web, 5000);
         if (!blob) return { error: 'no web result for that reference' };
 
@@ -310,7 +319,10 @@ export default definePickerTool({
         // is the complete fallback path.
         let guess: IdentifiedTrack | null = null;
         if (llmConfigured()) {
-          try { guess = await identifyTrackFromText(reference, blob); } catch { guess = null; }
+          try { guess = await identifyTrackFromText(reference, blob, signal); } catch (err) {
+            if (signal?.aborted) throw err;
+            guess = null;
+          }
           if (guess && evidenceSupportsGuess(guess, blob)) {
             const modelSongs = await resolveGuess(guess, blob);
             const modelCandidates = collect(verifyCandidate(guess, modelSongs));
@@ -328,7 +340,10 @@ export default definePickerTool({
 
         if (!llmConfigured()) return { error: 'could not identify a specific song from the available search results' };
         if (!guess) {
-          try { guess = await identifyTrackFromText(reference, blob); } catch { guess = null; }
+          try { guess = await identifyTrackFromText(reference, blob, signal); } catch (err) {
+            if (signal?.aborted) throw err;
+            guess = null;
+          }
         }
         if (!guess) return { error: 'could not identify a specific song from that description' };
 
@@ -336,7 +351,7 @@ export default definePickerTool({
         // credit. A bounded title-and-artist follow-up gives the same provider
         // a better query before we decide the local library has no match.
         if (!guess.artist && !webArtistHints(blob, guess.title, guess.keyword).length) {
-          const followUp = await searchWeb(String(guess.title) + ' song artist');
+          const followUp = await searchBudget.search(String(guess.title) + ' song artist');
           const extra = webBlob(followUp, 3000);
           if (extra) blob = (blob + '\n' + extra).slice(0, 8000);
         }
@@ -357,10 +372,10 @@ export default definePickerTool({
         // lyric fragment, but only after the first locally verified lookup
         // failed. The second guess still has to resolve to a real library id.
         if (!verifiedSongs.length && requestName(reference).split(' ').length >= 8) {
-          const focused = await searchWeb(lyricSearchQuery(reference, guess.artist));
+          const focused = await searchBudget.search(lyricSearchQuery(reference, guess.artist, 'head'));
           const focusedBlob = webBlob(focused, 5000);
           if (focusedBlob) {
-            const focusedGuess = await identifyTrackFromText(reference, focusedBlob);
+            const focusedGuess = await identifyTrackFromText(reference, focusedBlob, signal);
             const focusedEvidence = focusedBlob + '\n' + blob;
             if (focusedGuess && evidenceSupportsGuess(focusedGuess, focusedEvidence)) {
               const focusedSongs = await resolveGuess(focusedGuess, focusedEvidence);
@@ -372,7 +387,12 @@ export default definePickerTool({
         const candidates = collect(verifiedSongs);
         if (!candidates.length) return { candidates, note: 'could not find the described song in this library' };
         return { candidates };
-      } catch (err) { return { error: (err as Error).message }; }
-    },
-  }),
+      } catch (err) {
+        if (options.abortSignal?.aborted) throw err;
+        if (isWebSearchProviderError(err)) ctx.failures.push(err);
+          return { error: (err as Error).message };
+        }
+      },
+    });
+  },
 });

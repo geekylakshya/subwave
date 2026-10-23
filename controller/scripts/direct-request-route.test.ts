@@ -12,7 +12,7 @@ process.env.STATE_DIR = createTempDir(join(tmpdir(), 'subwave-direct-route-'));
 process.env.NAVIDROME_URL = 'http://direct-library.invalid';
 const express = (await import('express')).default;
 const settings = await import('../src/settings.js');
-const { router } = await import('../src/routes/request.js');
+const { router, submitListenerRequest } = await import('../src/routes/request.js');
 const { queue } = await import('../src/broadcast/queue.js');
 const { primaryLeg } = await import('../src/llm/internal/provider/legs.js');
 const requestLog = await import('../src/broadcast/request-log.js');
@@ -21,6 +21,7 @@ const { recentCalls } = await import('../src/llm/log.js');
 const { requestAgent } = await import('../src/broadcast/dj-agent/agents.js');
 const { invalidateWeatherCache } = await import('../src/context.js');
 const { REQUEST_SCHEMA_TOLERANT } = await import('../src/llm/internal/prompts/request.js');
+const { WebSearchProviderError } = await import('../src/skills/web-search.js');
 
 const app = express();
 app.use(express.json());
@@ -47,6 +48,7 @@ let genreSongs: RequestSong[];
 let bodies: any[] = [];
 let agentCalls = 0;
 let agentResult: any = null;
+let agentError: Error | null = null;
 
 beforeEach(async context => {
   const t = context as TestContext;
@@ -74,9 +76,11 @@ beforeEach(async context => {
   genreSongs = [];
   agentCalls = 0;
   agentResult = null;
+  agentError = null;
   modelOutput = { kind: 'track', title: exact.title, artist: 'Queen', search_terms: [exact.title, 'Queen'], genre: 'Rock', scope: 'song' };
   t.mock.method(requestAgent, 'run', async () => {
     agentCalls++;
+    if (agentError) throw agentError;
     if (agentResult) return agentResult;
     throw Error('Direct must never invoke the request agent');
   });
@@ -118,7 +122,7 @@ async function submit(text = 'Queen, Bohemian Rhapsody', maxPolls = 250) {
   for (let n = 0; n < maxPolls; n++) {
     const result: any = await (await realFetch(`${base}/request/${accepted.requestId}`)).json();
     if (result.status !== 'pending') {
-      if (!agentResult) assert.equal(agentCalls, 0, 'Direct bypasses the agent, including when its failure could be caught');
+      if (!agentResult && !agentError) assert.equal(agentCalls, 0, 'Direct bypasses the agent, including when its failure could be caught');
       return result;
     }
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -170,6 +174,18 @@ test('an evidence-agent miss does not enter the unsupported direct-request path'
   assert.equal(requestLog.snapshot(1)[0].pickSource, 'agent:evidence-miss');
 });
 
+test('an evidence-provider failure is reported accurately without a hidden fallback', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  agentError = new WebSearchProviderError('searxng', 'rate-limit', 'SearXNG HTTP 429');
+  const result = await submit('phull koyi vilyat wala lai geya ghod da main reh geya keyariyan');
+  assert.equal(result.status, 'failed');
+  assert.equal(result.outcome, 'provider-error');
+  assert.match(result.message, /search provider/i);
+  assert.equal(queue.upcoming.length, 0);
+  assert.equal(bodies.length, 0, 'a provider failure must not silently enter another resolver');
+  assert.equal(requestLog.snapshot(1)[0].pickSource, 'agent:provider-error');
+});
+
 test('Direct searches the named recording before genre candidates, with one interpretation call', async () => {
   const result = await submit();
   assert.equal(result.outcome, 'matched');
@@ -177,6 +193,26 @@ test('Direct searches the named recording before genre candidates, with one inte
   assert.equal(queue.upcoming[0].track.id, exact.id);
   assert.equal(bodies.length, 1);
   assert.ok(recentCalls.some(c => c.kind === 'matchRequest' && ['ai-sdk', 'ai-sdk:tool'].includes(c.via || '')));
+});
+
+test('browser and Alexa submissions share the same typed resolver outcome', async () => {
+  const browser = await submit();
+  assert.equal(browser.outcome, 'matched');
+  queue.upcoming = [];
+
+  const alexa = await submitListenerRequest({
+    text: 'Queen, Bohemian Rhapsody',
+    name: 'Alexa listener',
+    ip: `alexa:test-${++ip}`,
+    source: 'alexa',
+  });
+  assert.equal(alexa.accepted, true);
+  if (!alexa.accepted) return;
+  const resolved = await alexa.completion;
+  assert.equal(resolved.outcome, 'matched');
+  assert.equal(resolved.legacyOutcome, browser.outcome);
+  assert.equal(resolved.track?.title, browser.track.title);
+  assert.equal(requestLog.snapshot(1)[0].source, 'alexa');
 });
 
 test('a short title is resolved locally before the interpreter', async () => {

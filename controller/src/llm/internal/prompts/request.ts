@@ -215,6 +215,7 @@ const IDENTIFY_KEYWORD_MAX = 40;
 export async function identifyTrackFromText(
   reference: string,
   webText: string,
+  signal?: AbortSignal,
 ): Promise<{ title: string; artist: string | null; keyword: string | null } | null> {
   // Both inputs are untrusted (a listener's words, third-party web text), so
   // they are fenced as JSON data under a data-not-direction rule, and the guess
@@ -225,6 +226,7 @@ export async function identifyTrackFromText(
     schema: IDENTIFY_SCHEMA,
     temperature: 0.2,
     kind: 'identifyRequest',
+    signal,
   });
   const clip = (v: unknown, max: number) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   const title = clip(out?.title, IDENTIFY_TITLE_MAX);

@@ -46,6 +46,13 @@ export interface RequestMatch {
   unverifiedConditions?: string[];
 }
 
+export type ListenerRequestClass =
+  | 'named-song-or-artist'
+  | 'lyrics-or-description'
+  | 'attributes'
+  | 'ambiguous-music'
+  | 'non-music-chat';
+
 export interface RequestSong {
   id: string;
   title?: string;
@@ -403,6 +410,18 @@ export function modelFreeRequest(text: string): RequestMatch {
     .replace(/\s+(?:music|songs?|tracks?|genre|language|style)\s*$/iu, '')
     .trim();
   const lyricLike = looksLikeLyricRequest(cleaned);
+  // At the model token cap, deictic similarity requests still need their
+  // semantic lane. Treat only the unquoted "something/anything like this"
+  // frame as similarity; a quoted or otherwise named recording keeps its
+  // literal identity.
+  if (!lyricLike && /^(?:something|anything)\s+like\s+this\b/iu.test(cleaned)
+    && !/["'“‘]/u.test(cleaned)) {
+    return {
+      kind: 'track', title: null, album: null, artist: null, genre: null,
+      language: null, mood: null, energy: null, sort: null, scope: 'song',
+      search_terms: [], intent: 'Wants more like the current track.', ack: '',
+    };
+  }
   // Parse a trailing language condition before resolving the other attributes,
   // so "energetic in Punjabi" and "rock in Punjabi" retain both constraints.
   const languagePhrase = attributeBody.match(/\s+(?:in|en|de|में|में|ਵਿੱਚ)\s+([\p{L}][\p{L} -]*?)[.!?]*$/iu);
@@ -483,6 +502,33 @@ export function modelFreeRequest(text: string): RequestMatch {
   return { kind: 'track', title, album: null, unverifiedConditions, artist: artist ? unquote(artist) : null, reversible: !!separated,
     search_terms: [title], genre: null, language: language?.[1] || null, mood: null, sort: null,
     scope: 'song', intent: 'library search without model interpretation', ack: '' };
+}
+
+// A deliberately small, deterministic classifier. It does not decide which
+// track wins; it only chooses the resolver lane and provides durable
+// diagnostics. Catalogue lookup still gets first refusal for short inputs in
+// the route, because a title such as "Daaku" can otherwise resemble ordinary
+// prose in an unfamiliar language.
+export function classifyListenerRequest(text: string, literal = modelFreeRequest(text)): ListenerRequestClass {
+  const normalized = text.normalize('NFKC').replace(/\s+/gu, ' ').trim();
+  const musicFraming = /\b(?:play|queue|request|song|track|music|album|artist|band|dj|more like|surprise)\b/iu.test(normalized);
+  if (!musicFraming && /^(?:hello|hi|hey|how|what|who|where|when|why|are|is|do|does|can|could|would)\b/iu.test(normalized)) {
+    return 'non-music-chat';
+  }
+  if (looksLikeLyricRequest(normalized)
+    || /\b(?:song|track|music)\s+(?:from|in)\b.{0,60}\b(?:film|movie|show|advert|commercial)\b/iu.test(normalized)
+    || /\b(?:lyrics?|words|line)\s+(?:are|goes?|containing|that has)\b/iu.test(normalized)) {
+    return 'lyrics-or-description';
+  }
+  if (literal.album || literal.genre || literal.language || literal.mood || literal.energy || literal.scope === 'album') {
+    return 'attributes';
+  }
+  const generic = /^(?:please\s+)?(?:play|queue|put on|request)\s+(?:me\s+)?(?:anything|something|music|a song|a track)|^(?:anything|something|surprise me|more like this)$/iu;
+  if (!generic.test(normalized) && (literal.artist?.trim() || literal.title?.trim())) {
+    return 'named-song-or-artist';
+  }
+  if (musicFraming) return 'ambiguous-music';
+  return 'non-music-chat';
 }
 
 // A model reply repaired against the literal reading of the same words.
@@ -796,18 +842,13 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     standingIn = true;
   }
 
-  // Decide the exact-only policy before entering the artist branch. A short
-  // title-only query has already missed its title lookup, so it may now try the
-  // same words as an artist identity; an explicit title must stop here.
-  if (deps.exactOnly && title) {
-    if (match.titleOnly && !artistName) {
-      artistName = title;
-      resolvedArtistName = title;
-      title = null;
-      titleOnlyArtistFallback = true;
-    } else {
-      return { track: null, source: errors.length ? 'lookup-error' : 'no-match', outcome: 'no-match', errors, required, alternatives };
-    }
+  // A one-word title miss can also be an artist name. Try that exact artist
+  // catalogue before refusing, but retain the no-stand-in policy below.
+  if (deps.exactOnly && match.titleOnly && !artistName && title) {
+    artistName = title;
+    resolvedArtistName = title;
+    title = null;
+    titleOnlyArtistFallback = true;
   }
 
   if (match.literal && !match.titleOnly && !artistName && title) {
@@ -889,6 +930,13 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   const identityRefusal = refusal();
   if (identityRefusal) return identityRefusal;
   if (unverifiedConditions.length) return { track: null, source: 'unsupported', outcome: 'unsupported', errors, unsupported: unverifiedConditions };
+
+  // Exact identity requests may inspect the named artist's real catalogue for
+  // aliases and alternatives, but they never enter similarity, mood, genre,
+  // language, or starred fallback pools.
+  if (deps.exactOnly && title) {
+    return { track: null, source: errors.length ? 'lookup-error' : 'no-match', outcome: 'no-match', errors, required, alternatives };
+  }
 
   // An explicit title and artist are identity claims, not a request for a
   // nearby recommendation. The caller can still use the normal fallback

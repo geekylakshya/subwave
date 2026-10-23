@@ -127,6 +127,9 @@ export interface PickerContext {
   // id → slim song across all tool calls; the picker resolves the agent's final
   // id choice against this.
   seen: Map<string, any>;
+  // Typed dependency failures observed by tools. The request path uses this
+  // to distinguish an evidence miss from a configured provider outage.
+  failures: unknown[];
   collect(list: any, cap?: number, opts?: CollectOptions): any[];
   // Widen source fetches under strict show locks, before collect's hard filter.
   candidateLimit(limit: number): number;
@@ -154,6 +157,7 @@ export function buildPickerContext(scope: PickerScope): PickerContext {
   } = scope;
 
   const seen = new Map<string, any>();
+  const failures: unknown[] = [];
 
   // #1655: only ~7% of the reported library passed instrumental + low energy.
   // A bounded 5x fetch gives the hard filters more neighbours to work with,
@@ -306,5 +310,5 @@ export function buildPickerContext(scope: PickerScope): PickerContext {
     return { tracks: [] as any[], matched: 0, fellBack: false };
   };
 
-  return { scope, seen, collect, candidateLimit, emptyResult, seedSimilarity, knnExclude, stats, hasTextEmbeddings, hasAudioEmbeddings, hasEmbeddingProvider, textIndexDegraded };
+  return { scope, seen, failures, collect, candidateLimit, emptyResult, seedSimilarity, knnExclude, stats, hasTextEmbeddings, hasAudioEmbeddings, hasEmbeddingProvider, textIndexDegraded };
 }

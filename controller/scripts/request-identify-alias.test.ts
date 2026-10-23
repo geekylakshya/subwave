@@ -642,3 +642,65 @@ test('an empty lyric search returns a normal no-match result without inventing a
     await settings.update({ llm: originalLlm, search: originalSearch } as never);
   }
 });
+
+test('lyric identification verifies Preet Re edition metadata and composite artist credits', async () => {
+  const originalLlm = structuredClone(settings.get().llm);
+  const originalSearch = structuredClone(settings.get().search);
+  const realFetch = globalThis.fetch;
+  const json = (value: unknown) => Response.json(value);
+
+  try {
+    await settings.update({
+      llm: { model: '', provider: 'openai-compatible', fallback: { enabled: false } },
+      search: { provider: 'searxng', baseUrl: 'http://search.preet-re.fixture' },
+    } as never);
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.origin === 'http://search.preet-re.fixture') {
+        return json({ results: [{
+          title: 'Preet Re lyrics',
+          content: 'Song credits Song: Preet Re (From "Dhadak 2") Artist: Rochak Kohli. Mere dil ke tu rahiyo nazdeek re.',
+          url: 'https://lyrics.example/preet-re',
+        }] });
+      }
+      if (url.origin === 'http://navidrome.fixture') {
+        const query = url.searchParams.get('query') || '';
+        const songCount = Number(url.searchParams.get('songCount') || 0);
+        const matched = songCount > 0 && query.includes('Rochak Kohli') && query.includes('Preet Re');
+        return json({
+          'subsonic-response': {
+            status: 'ok',
+            version: '1.16.1',
+            searchResult3: {
+              artist: [],
+              song: matched ? [
+                { id: 'preet-wrong', title: 'Preet Re', artist: 'Other Artist', album: 'Collision', duration: 180 },
+                { id: 'preet-good', title: 'Preet Re (From "Dhadak 2")', artist: 'Darshan Raval / Rochak Kohli / Jonita Gandhi / Gurpreet Saini', album: 'Dhadak 2', duration: 210 },
+              ] : [],
+            },
+          },
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const built: any = identifyTool.build({ collect: (songs: any[]) => songs } as any);
+    const result = await built.execute({
+      reference: 'Mere dil ke tu rahiyo nazdeek re tu jo saath ho toh sab lage theek re',
+    }, {} as any);
+
+    assert.deepEqual(result, {
+      candidates: [{
+        id: 'preet-good',
+        title: 'Preet Re (From "Dhadak 2")',
+        artist: 'Darshan Raval / Rochak Kohli / Jonita Gandhi / Gurpreet Saini',
+        album: 'Dhadak 2',
+        duration: 210,
+      }],
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+    await settings.update({ llm: originalLlm, search: originalSearch } as never);
+  }
+});

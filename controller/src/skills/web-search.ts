@@ -59,7 +59,13 @@ const cache = new BoundedKeyMap<{ val: SearchResponse; at: number }>({
   maxKeys: CACHE_MAX_KEYS,
   isLive: (rec, now) => now - rec.at < CACHE_TTL_MS,
 });
-const inFlight = new Map<string, Promise<SearchResponse>>();
+type InFlightSearch = {
+  promise: Promise<SearchResponse>;
+  controller: AbortController;
+  consumers: number;
+  settled: boolean;
+};
+const inFlight = new Map<string, InFlightSearch>();
 
 // Test seam.
 export function searchCacheSize(): number {
@@ -69,47 +75,72 @@ export function searchCacheSize(): number {
 async function memo(
   key: string,
   ttl: number,
-  fn: () => Promise<SearchResponse>,
+  fn: (signal: AbortSignal) => Promise<SearchResponse>,
   signal?: AbortSignal,
 ): Promise<SearchResponse> {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < ttl) return hit.val;
-  const pending = inFlight.get(key);
-  if (pending) return awaitWithAbort(pending, signal);
+  let shared = inFlight.get(key);
+  if (!shared) {
+    const controller = new AbortController();
   // Publish the promise before starting the provider call. Some fetch seams
   // invoke their mock synchronously; starting `fn()` first leaves a tiny race
   // where two same-tick callers both miss the in-flight map.
-  const request = Promise.resolve().then(fn).then(val => {
-    // Empty responses are usually transient provider failures or upstream
-    // timeouts represented as a successful empty JSON response. Caching them
-    // for the full TTL turns one bad search into a 30-minute outage for the
-    // request resolver. Keep useful evidence cached, but let the next request
-    // retry an empty result immediately.
-    if (val.answer.trim() || val.results.length > 0) cache.set(key, { val, at: Date.now() });
-    return val;
+    const request = Promise.resolve().then(() => fn(controller.signal)).then(val => {
+      // Empty responses are usually transient provider failures or upstream
+      // timeouts represented as a successful empty JSON response. Caching them
+      // for the full TTL turns one bad search into a 30-minute outage for the
+      // request resolver. Keep useful evidence cached, but let the next request
+      // retry an empty result immediately.
+      if (val.answer.trim() || val.results.length > 0) cache.set(key, { val, at: Date.now() });
+      return val;
+    });
+    shared = { promise: request, controller, consumers: 0, settled: false };
+    inFlight.set(key, shared);
+    const clear = () => {
+      shared!.settled = true;
+      if (inFlight.get(key) === shared) inFlight.delete(key);
+    };
+    request.then(clear, clear);
+  }
+  shared.consumers++;
+  const reason = signal?.reason;
+  return awaitWithAbort(shared.promise, signal, () => {
+    shared!.consumers--;
+    if (!shared!.settled && shared!.consumers === 0) shared!.controller.abort(reason);
   });
-  inFlight.set(key, request);
-  const clear = () => {
-    if (inFlight.get(key) === request) inFlight.delete(key);
-  };
-  request.then(clear, clear);
-  return awaitWithAbort(request, signal);
 }
 
-function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
+function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, onDone: () => void): Promise<T> {
+  if (!signal) return promise.finally(onDone);
+  if (signal.aborted) {
+    onDone();
+    return Promise.reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
+  }
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
-    const cleanup = () => signal.removeEventListener('abort', onAbort);
-    signal.addEventListener('abort', onAbort, { once: true });
+    let finished = false;
+    const abort = () => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      onDone();
+      reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
+    };
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    signal.addEventListener('abort', abort, { once: true });
     promise.then(
       value => {
+        if (finished) return;
+        finished = true;
         cleanup();
+        onDone();
         resolve(value);
       },
       error => {
+        if (finished) return;
+        finished = true;
         cleanup();
+        onDone();
         reject(error);
       },
     );
@@ -191,9 +222,8 @@ export async function tavilySearch(query: string, signal?: AbortSignal): Promise
 // The deadline matters more here than on the other backends: this is the
 // DEFAULT provider (see searchWeb below), and DDG is known to accept a
 // connection and then hold it, which without a timeout parks the request on
-// undici's ~300s default. memo() only caches AFTER the call resolves, so
-// concurrent duplicate queries each open their own socket rather than sharing
-// one.
+// undici's ~300s default. memo() shares concurrent identical searches and
+// cancels the provider fetch only after every waiting caller has detached.
 export async function duckduckgoSearch(query: string, signal?: AbortSignal): Promise<SearchResponse> {
   const url = new URL(DDG_ENDPOINT);
   url.searchParams.set('q', query);
@@ -450,11 +480,11 @@ export async function searchWeb(
   const recency = opts?.recency;
   const key = searchCacheKey(query, opts);
   try {
-    return await memo(key, CACHE_TTL_MS, () => {
-      if (provider === 'searxng') return searxngSearch(query, recency);
-      if (provider === 'tavily') return tavilySearch(query);
-      if (provider === 'brave') return braveSearch(query, recency);
-      return duckduckgoSearch(query);
+    return await memo(key, CACHE_TTL_MS, sharedSignal => {
+      if (provider === 'searxng') return searxngSearch(query, recency, sharedSignal);
+      if (provider === 'tavily') return tavilySearch(query, sharedSignal);
+      if (provider === 'brave') return braveSearch(query, recency, sharedSignal);
+      return duckduckgoSearch(query, sharedSignal);
     }, opts?.signal);
   } catch (error) {
     if (opts?.signal?.aborted) throw error;

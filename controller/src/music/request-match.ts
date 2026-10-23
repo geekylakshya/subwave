@@ -57,6 +57,7 @@ export interface RequestSong {
   id: string;
   title?: string;
   artist?: string;
+  artists?: Array<string | { name?: string }>;
   album?: string;
   year?: number;
   originalReleaseDate?: { year?: number; month?: number; day?: number };
@@ -66,18 +67,37 @@ export interface RequestSong {
   language?: string;
   languages?: string[];
   moods?: string[];
+  alternateTitles?: string[];
+  lyricExcerpt?: string | null;
+  lyrics?: string | null;
   [key: string]: unknown;
 }
 
+export interface RequestCandidateEvidence {
+  webText?: string;
+  lyricText?: string;
+  lyricsById?: ReadonlyMap<string, string> | Readonly<Record<string, string | null | undefined>>;
+}
+
+export interface RankedRequestCandidate {
+  song: RequestSong;
+  score: number;
+  titleScore: number;
+  artistScore: number;
+  alternateTitleScore: number;
+  lyricOverlap: number;
+  webEvidence: number;
+}
+
 export interface RequestCatalog {
-  searchPage(query: string, options: { songCount: number; songOffset: number }): Promise<{ songs: RequestSong[]; rawCount: number }>;
-  resolveArtist(name: string): Promise<{ id: string; name?: string } | null>;
-  getArtist(id: string): Promise<{ album?: Array<{ id: string; name?: string; title?: string; year?: number; originalReleaseDate?: { year?: number; month?: number; day?: number }; releaseDate?: string }> } | null>;
-  getAlbum(id: string): Promise<RequestSong[]>;
-  getTopSongs(name: string, options: { count: number }): Promise<RequestSong[]>;
-  resolveGenreName(name: string): Promise<string | null>;
-  getGenres?(): Promise<Array<{ value: string }>>;
-  getSongsByGenreSampled(genre: string, options: { count: number }): Promise<RequestSong[]>;
+  searchPage(query: string, options: { songCount: number; songOffset: number; signal?: AbortSignal }): Promise<{ songs: RequestSong[]; rawCount: number }>;
+  resolveArtist(name: string, options?: { signal?: AbortSignal }): Promise<{ id: string; name?: string } | null>;
+  getArtist(id: string, options?: { signal?: AbortSignal }): Promise<{ album?: Array<{ id: string; name?: string; title?: string; year?: number; originalReleaseDate?: { year?: number; month?: number; day?: number }; releaseDate?: string }> } | null>;
+  getAlbum(id: string, options?: { signal?: AbortSignal }): Promise<RequestSong[]>;
+  getTopSongs(name: string, options: { count: number; signal?: AbortSignal }): Promise<RequestSong[]>;
+  resolveGenreName(name: string, options?: { signal?: AbortSignal }): Promise<string | null>;
+  getGenres?(options?: { signal?: AbortSignal }): Promise<Array<{ value: string }>>;
+  getSongsByGenreSampled(genre: string, options: { count: number; signal?: AbortSignal }): Promise<RequestSong[]>;
 }
 
 // Speech-to-text clients commonly alternate between a digit
@@ -313,13 +333,13 @@ function requestGenreMatches(want: string, got: string): boolean {
 
 // Request-only strictness: shared genre resolution remains fuzzy for shows,
 // journeys and the picker. Prefer a strict catalogue hit over a fuzzy first hit.
-export async function resolveRequestGenre(catalog: RequestCatalog, name: string): Promise<string | null> {
+export async function resolveRequestGenre(catalog: RequestCatalog, name: string, signal?: AbortSignal): Promise<string | null> {
   if (catalog.getGenres) {
-    const genres = await catalog.getGenres();
+    const genres = await catalog.getGenres({ signal });
     return genres.find(g => requestName(g.value).replace(/ /g, '') === requestName(name).replace(/ /g, ''))?.value
       || genres.find(g => requestGenreMatches(name, g.value))?.value || null;
   }
-  const genre = await catalog.resolveGenreName(name);
+  const genre = await catalog.resolveGenreName(name, { signal });
   return genre && requestGenreMatches(name, genre) ? genre : null;
 }
 
@@ -359,6 +379,53 @@ export function requestArtistMatches(want: unknown, song: RequestSong): boolean 
       return variants.some((variant) => artists.includes(variant));
     });
   });
+}
+
+// Candidate verification is deliberately more permissive than recency and
+// blocklist matching. Navidrome has already supplied the catalogue row, so a
+// listener's primary-artist request may match one act inside a track credit
+// such as "Lead / Guest, feat. Producer". Keep this split local to request
+// identity; widening artistParticipantKeys would change absolute blocklist
+// semantics for names containing commas and ampersands.
+const CANDIDATE_ARTIST_SPLIT = /\s*(?:\/|&|,)\s*|\b(?:feat(?:uring)?|ft)\.?\s+/iu;
+
+function candidateArtistParts(value: unknown): string[] {
+  return String(value ?? '')
+    .split(CANDIDATE_ARTIST_SPLIT)
+    .map(part => part.trim())
+    .filter(Boolean);
+}
+
+function candidateArtistVariants(value: unknown): string[] {
+  const parts = candidateArtistParts(value);
+  const values = parts.length ? parts : [String(value ?? '')];
+  return values.flatMap(part => {
+    const variants = artistIdentityVariants(part);
+    return variants.length ? variants : [nameKey(part)];
+  }).filter(Boolean);
+}
+
+function candidateArtistCredits(song: RequestSong): string[] {
+  const credits = [
+    song.artist,
+    ...(Array.isArray(song.artists) ? song.artists.map(artist => typeof artist === 'string' ? artist : artist?.name) : []),
+  ].filter(Boolean);
+  return credits.flatMap(candidateArtistParts);
+}
+
+export function requestCandidateArtistMatches(want: unknown, song: RequestSong): boolean {
+  const wanted = candidateArtistVariants(want);
+  if (!wanted.length) return true;
+  const credits = candidateArtistCredits(song).flatMap(candidateArtistVariants);
+  return wanted.some(value => credits.includes(value));
+}
+
+function requestCandidateArtistSimilarity(want: unknown, song: RequestSong): number {
+  const wanted = candidateArtistVariants(want);
+  if (!wanted.length) return 1;
+  const credits = candidateArtistCredits(song).flatMap(candidateArtistVariants);
+  return wanted.reduce((best, value) => Math.max(best,
+    credits.reduce((inner, credit) => Math.max(inner, requestTextSimilarity(value, credit)), 0)), 0);
 }
 
 export function requestArtistSimilarity(want: unknown, song: RequestSong): number {
@@ -401,7 +468,10 @@ const FEATURED_CREDIT = [
   // Bare "Title feat. X" needs the dot, so "The Feat of Clay" keeps its title.
   /\s+(?:feat\.|ft\.|featuring)\s+[^)\]]+$/i,
 ];
-const EDITION = /\s*(?:[-–—]\s*|\(|\[)(?:(?:\d{4}\s+)?remaster(?:ed)?(?:\s+(?:\d{4}|version|edition))*|radio\s+edit|single\s+version|album\s+version|explicit(?:\s+version)?)[\])]?\s*$/i;
+const EDITION = [
+  /\s*(?:[-–—]\s*|\(|\[)(?:(?:\d{4}\s+)?remaster(?:ed)?(?:\s+(?:\d{4}|version|edition))*|radio\s+edit|single(?:\s+version)?|album\s+version|explicit(?:\s+version)?)[\])]?\s*$/iu,
+  /\s*(?:\(|\[)\s*from\s+(?:"[^"]+"|“[^”]+”|'[^']+'|[^)\]]+)\s*[\])]?\s*$/iu,
+];
 
 function undecorated(value: unknown, patterns: RegExp[]): string {
   let title = String(value ?? '');
@@ -422,8 +492,8 @@ export function requestTitleMatches(want: unknown, got: unknown): boolean {
   const gotKeys = requestNameVariants(got).map(titleIdentityKey);
   if (wantKeys.some(key => gotKeys.includes(key))) return true;
   const wanted = undecorated(want, FEATURED_CREDIT);
-  const edition = undecorated(want, [...FEATURED_CREDIT, EDITION]) !== wanted;
-  const gotTitle = undecorated(got, edition ? FEATURED_CREDIT : [...FEATURED_CREDIT, EDITION]);
+  const edition = undecorated(want, [...FEATURED_CREDIT, ...EDITION]) !== wanted;
+  const gotTitle = undecorated(got, edition ? FEATURED_CREDIT : [...FEATURED_CREDIT, ...EDITION]);
   return requestNameVariants(wanted).map(titleIdentityKey)
     .some(key => requestNameVariants(gotTitle).map(titleIdentityKey).includes(key));
 }
@@ -431,6 +501,100 @@ export function requestTitleMatches(want: unknown, got: unknown): boolean {
 export function requestTitleSimilarity(want: unknown, got: unknown): number {
   if (requestTitleMatches(want, got)) return 1;
   return requestTextSimilarity(undecorated(want, FEATURED_CREDIT), undecorated(got, FEATURED_CREDIT));
+}
+
+function evidenceText(evidence: RequestCandidateEvidence): string {
+  return requestName(evidence.webText || '');
+}
+
+function evidenceLyrics(evidence: RequestCandidateEvidence, song: RequestSong): string {
+  const byId = evidence.lyricsById;
+  const supplied = byId instanceof Map ? byId.get(song.id) : byId?.[song.id];
+  return String(supplied || song.lyricExcerpt || song.lyrics || '');
+}
+
+function meaningfulTokens(value: unknown): string[] {
+  return requestName(value).split(' ').filter(token => token.length >= 3);
+}
+
+function lyricOverlapScore(want: unknown, got: unknown): number {
+  if (!String(want ?? '').trim() || !String(got ?? '').trim()) return 0;
+  let best = 0;
+  for (const left of requestNameVariants(want)) {
+    const wanted = new Set(meaningfulTokens(left));
+    if (wanted.size < 3) continue;
+    for (const right of requestNameVariants(got)) {
+      const actual = new Set(meaningfulTokens(right));
+      const overlap = [...wanted].filter(token => actual.has(token)).length;
+      best = Math.max(best, overlap / wanted.size);
+    }
+  }
+  return Math.min(1, best);
+}
+
+function candidateAlternateTitles(song: RequestSong): string[] {
+  return Array.isArray(song.alternateTitles)
+    ? song.alternateTitles.filter((title): title is string => typeof title === 'string' && !!title.trim())
+    : [];
+}
+
+function alternateTitleScore(requestedTitle: string | null, song: RequestSong, evidence: RequestCandidateEvidence): number {
+  if (!requestedTitle) return 0;
+  const alternates = candidateAlternateTitles(song);
+  if (alternates.some(title => requestTitleSimilarity(requestedTitle, title) >= 0.82)) return 1;
+  const blob = evidenceText(evidence);
+  if (!blob) return 0;
+  const requested = requestNameVariants(requestedTitle);
+  const local = requestNameVariants(song.title);
+  const artist = candidateArtistCredits(song).flatMap(requestNameVariants);
+  const requestedInWeb = requested.some(value => value && blob.includes(value));
+  const localInWeb = local.some(value => value && blob.includes(value));
+  const artistInWeb = artist.some(value => value && blob.includes(value));
+  return requestedInWeb && localInWeb && artistInWeb ? 1 : 0;
+}
+
+function webEvidenceScore(requestedTitle: string | null, requestedArtist: string | null, song: RequestSong, evidence: RequestCandidateEvidence): number {
+  const blob = evidenceText(evidence);
+  if (!blob) return 0;
+  const localTitle = requestNameVariants(song.title).some(value => value && blob.includes(value));
+  const artistTerms = candidateArtistCredits(song).flatMap(requestNameVariants);
+  const requestedArtistTerms = candidateArtistVariants(requestedArtist).flatMap(requestNameVariants);
+  const artistInWeb = requestedArtist
+    ? requestedArtistTerms.some(value => value && blob.includes(value))
+    : artistTerms.some(value => value && blob.includes(value));
+  const requestedTitleInWeb = requestedTitle
+    ? requestNameVariants(requestedTitle).some(value => value && blob.includes(value))
+    : false;
+  if (localTitle && artistInWeb && (!requestedTitle || requestedTitleInWeb)) return 1;
+  if (localTitle && artistInWeb) return 0.5;
+  return 0;
+}
+
+export function rankRequestCandidates(
+  requestedTitle: string | null,
+  requestedArtist: string | null,
+  candidates: RequestSong[],
+  evidence: RequestCandidateEvidence = {},
+): RankedRequestCandidate[] {
+  return candidates
+    .filter(song => song?.id)
+    .map(song => {
+      const artistScore = requestedArtist ? (requestCandidateArtistMatches(requestedArtist, song) ? 1 : 0) : 1;
+      const titleScore = requestedTitle ? requestTitleSimilarity(requestedTitle, song.title) : 0;
+      const alternateScore = alternateTitleScore(requestedTitle, song, evidence);
+      const lyricScore = lyricOverlapScore(evidence.lyricText, evidenceLyrics(evidence, song));
+      const webScore = webEvidenceScore(requestedTitle, requestedArtist, song, evidence);
+      const strongSignal = titleScore >= 0.82 || alternateScore >= 0.7 || lyricScore >= 0.35 || webScore >= 0.8;
+      const score = artistScore * 0.25 + titleScore * 0.45 + alternateScore * 0.15 + lyricScore * 0.10 + webScore * 0.05;
+      return { song, score, titleScore, artistScore, alternateTitleScore: alternateScore, lyricOverlap: lyricScore, webEvidence: webScore, strongSignal };
+    })
+    .filter(row => row.artistScore > 0 && row.strongSignal)
+    .sort((a, b) => b.score - a.score
+      || b.titleScore - a.titleScore
+      || b.alternateTitleScore - a.alternateTitleScore
+      || b.lyricOverlap - a.lyricOverlap
+      || b.webEvidence - a.webEvidence
+      || String(a.song.id).localeCompare(String(b.song.id)));
 }
 
 // Alias verification is intentionally request-local. Web text can nominate a
@@ -443,26 +607,7 @@ export function rankAliasCandidates(
   candidates: RequestSong[],
   evidence: string,
 ): RequestSong | null {
-  const blob = requestName(evidence);
-  const wantedTitle = requestNameVariants(requestedTitle);
-  const wantedArtist = requestNameVariants(requestedArtist);
-  const rows = candidates
-    .filter(song => requestArtistMatches(requestedArtist, song))
-    .map(song => {
-      const titleScore = Math.max(...wantedTitle.map(value => requestTitleSimilarity(value, song.title)));
-      const localTitle = requestNameVariants(song.title);
-      const evidenceBacked = !!blob
-        && wantedTitle.some(value => blob.includes(value))
-        && localTitle.some(value => blob.includes(value))
-        && wantedArtist.some(value => blob.includes(value));
-      return { song, score: titleScore + (evidenceBacked ? 0.55 : 0), titleScore, evidenceBacked };
-    })
-    .filter(row => row.evidenceBacked || row.titleScore >= 0.92)
-    .sort((a, b) => b.score - a.score || String(a.song.id).localeCompare(String(b.song.id)));
-  const top = rows[0];
-  if (!top) return null;
-  const tied = rows[1] && Math.abs(rows[1].score - top.score) < 0.08;
-  return tied ? null : top.song;
+  return rankRequestCandidates(requestedTitle, requestedArtist, candidates, { webText: evidence })[0]?.song || null;
 }
 
 export function modelFreeRequest(text: string): RequestMatch {
@@ -722,6 +867,7 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   exactOnly?: boolean;
   random?: () => number;
   choose?(pool: RequestSong[]): RequestSong | null;
+  signal?: AbortSignal;
 }): Promise<RequestSelection> {
   const { catalog, recentIds, queuedIds, currentId } = deps;
   const errors: string[] = [];
@@ -733,7 +879,11 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   const unverifiedConditions = [...new Set([...(match.unverifiedConditions || []),
     ...(deps.text === undefined || match.kind === 'chat' ? [] : directRequestUnsupported(deps.text))])];
   const safe = async <T>(source: string, run: () => Promise<T>, fallback: T): Promise<T> => {
-    try { return await run(); } catch (err) { errors.push(`${source}: ${err instanceof Error ? err.message : String(err)}`); return fallback; }
+    try { return await run(); } catch (err) {
+      if (deps.signal?.aborted) throw err;
+      errors.push(`${source}: ${err instanceof Error ? err.message : String(err)}`);
+      return fallback;
+    }
   };
   let title = requestedTitle(match, deps.text);
   let artistName = match.artist;
@@ -761,14 +911,14 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   const energyMatches = (song: RequestSong) => !match.energy || requestName(song.energy) === requestName(match.energy);
   let resolvedArtistName = match.artist;
   const identity = (song: RequestSong) => (!title || requestTitleMatches(title, song.title))
-    && requestArtistMatches(resolvedArtistName, song) && (!match.album || requestName(song.album) === requestName(match.album));
+    && requestCandidateArtistMatches(resolvedArtistName, song) && (!match.album || requestName(song.album) === requestName(match.album));
   const tags = (song: RequestSong) => [song.genre, ...(song.genres || []).map(g => typeof g === 'string' ? g : g.name)].map(requestName).filter(Boolean);
   let genre: string | null = null;
   let languageGenre: string | null = null;
   // Small models may guess attributes despite the prompt. Only terms present
   // outside recognised names are hard requirements; guesses stay preferences.
-  if (match.genre) genre = await safe('genre resolution', () => resolveRequestGenre(catalog, match.genre!), null);
-  if (match.language) languageGenre = await safe('language resolution', () => resolveRequestGenre(catalog, match.language!), null);
+  if (match.genre) genre = await safe('genre resolution', () => resolveRequestGenre(catalog, match.genre!, deps.signal), null);
+  if (match.language) languageGenre = await safe('language resolution', () => resolveRequestGenre(catalog, match.language!, deps.signal), null);
   const genreMatches = (song: RequestSong) => !match.genre || tags(song).some(g => requestGenreMatches(genre || match.genre!, g));
   const languageMatches = (song: RequestSong) => !match.language
     || [song.language, ...(song.languages || []), ...tags(song)].some(value => requestLanguageTagMatches(match.language!, String(value ?? '')));
@@ -790,7 +940,7 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   let alternatives: Array<{ id: string; title: string; artist: string; confidence: number }> = [];
   const identityScore = (song: RequestSong): number => {
     const titleScore = title ? requestTitleSimilarity(title, song.title) : 1;
-    const artistScore = resolvedArtistName ? requestArtistSimilarity(resolvedArtistName, song) : 1;
+    const artistScore = resolvedArtistName ? requestCandidateArtistSimilarity(resolvedArtistName, song) : 1;
     const albumScore = match.album ? requestTextSimilarity(match.album, song.album) : 1;
     return titleScore * 0.55 + artistScore * 0.35 + albumScore * 0.10;
   };
@@ -798,7 +948,7 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     if (!title) return null;
     const scored = unique(songs)
       .filter(song => constraints(song, source) && eligible(song))
-      .map(song => ({ song, confidence: identityScore(song), titleScore: requestTitleSimilarity(title, song.title), artistScore: resolvedArtistName ? requestArtistSimilarity(resolvedArtistName, song) : 1 }))
+      .map(song => ({ song, confidence: identityScore(song), titleScore: requestTitleSimilarity(title, song.title), artistScore: resolvedArtistName ? requestCandidateArtistSimilarity(resolvedArtistName, song) : 1 }))
       // Keep a wider, still meaningful candidate set for clarification. Only
       // the stricter confidence and margin checks below may auto-select.
       .filter(row => row.titleScore >= 0.70 && (!resolvedArtistName || row.artistScore >= 0.70))
@@ -857,7 +1007,7 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
       const errorsBefore = errors.length;
       for (const query of queries) {
         for (let songOffset = 0; songOffset < 100; songOffset += 25) {
-          const page = await safe('search', () => catalog.searchPage(query, { songCount: 25, songOffset }), { songs: [], rawCount: 0 });
+    const page = await safe('search', () => catalog.searchPage(query, { songCount: 25, songOffset, signal: deps.signal }), { songs: [], rawCount: 0 });
           found.push(...page.songs);
           if (found.some(s => identity(s) && constraints(s, 'search') && (Boolean(title) || eligible(s))) || page.rawCount < 25) break;
         }
@@ -921,13 +1071,13 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   }
   if (artistName) {
     if (match.sort === 'popular' && !title && !match.album) {
-      const popular = await safe('popular songs', () => catalog.getTopSongs(artistName!, { count: 100 }), []);
+      const popular = await safe('popular songs', () => catalog.getTopSongs(artistName!, { count: 100, signal: deps.signal }), []);
       const candidates = unique(popular).filter(s => identity(s) && constraints(s, 'artist-popular'));
       const best = candidates.find(eligible) || candidates[0];
       const result = select(best ? [best] : [], 'artist-popular');
       if (result) return result;
     }
-    const artist = await safe('artist resolution', () => catalog.resolveArtist(artistName!), null);
+    const artist = await safe('artist resolution', () => catalog.resolveArtist(artistName!, { signal: deps.signal }), null);
     if (artist && ((!match.literal && !unverifiedConditions.length) || requestArtistMatches(artistName, { id: artist.id, artist: artist.name }))) {
       resolvedArtistName = artist.name || artistName;
       // The title search judged its hits against the listener's spelling of
@@ -936,7 +1086,7 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
         const exact = select(searched, 'search') || refusal();
         if (exact) return exact;
       }
-      const full = await safe('artist albums', () => catalog.getArtist(artist.id), null);
+      const full = await safe('artist albums', () => catalog.getArtist(artist.id, { signal: deps.signal }), null);
       let albums = full?.album || [];
       if (match.album) albums = albums.filter(a => requestName(a.name || a.title) === requestName(match.album));
       if (match.sort === 'latest' || match.sort === 'oldest') {
@@ -953,8 +1103,8 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
       const artistMoodPool: RequestSong[] = [];
       const rankIndividualTracks = !title && match.scope !== 'album' && (match.sort === 'latest' || match.sort === 'oldest');
       for (const album of albums.slice(0, 20)) {
-        const songs = await safe('album tracks', () => catalog.getAlbum(album.id), []);
-        if (title) artistAlternatives.push(...songs.filter(song => requestArtistMatches(resolvedArtistName, song)));
+        const songs = await safe('album tracks', () => catalog.getAlbum(album.id, { signal: deps.signal }), []);
+        if (title) artistAlternatives.push(...songs.filter(song => requestCandidateArtistMatches(resolvedArtistName, song)));
         if (rankIndividualTracks) {
           rankedSongs.push(...songs.map(song => ({ song, rank: requestReleaseRank(song) || requestReleaseRank(album) })));
           continue;
@@ -1010,11 +1160,11 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   // fuzzy result must be shown as alternatives instead of being queued.
   if (!title && !match.album) {
     if (genre) {
-      const result = select(await safe('genre tracks', () => catalog.getSongsByGenreSampled(genre!, { count: 100 }), []), `genre:${genre}`);
+      const result = select(await safe('genre tracks', () => catalog.getSongsByGenreSampled(genre!, { count: 100, signal: deps.signal }), []), `genre:${genre}`);
       if (result) return result;
     }
     if (languageGenre) {
-      const result = select(await safe('language tracks', () => catalog.getSongsByGenreSampled(languageGenre!, { count: 100 }), []), `language-genre:${languageGenre}`);
+      const result = select(await safe('language tracks', () => catalog.getSongsByGenreSampled(languageGenre!, { count: 100, signal: deps.signal }), []), `language-genre:${languageGenre}`);
       if (result) return result;
     }
     if (match.mood) {

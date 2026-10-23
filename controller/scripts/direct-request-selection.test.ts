@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  classifyListenerRequest, directRequestUnsupported, explicitRequestAttribute, looksLikeLyricRequest, modelFreeRequest, requestedTitle, repairRequestMatch, requestArtistMatches, requestReleaseRank, requestTitleMatches,
+  classifyListenerRequest, directRequestUnsupported, explicitRequestAttribute, looksLikeLyricRequest, modelFreeRequest, requestedTitle, rankAliasCandidates, rankRequestCandidates, repairRequestMatch, requestArtistMatches, requestCandidateArtistMatches, requestReleaseRank, requestTitleMatches,
   resolveDirectRequest, type RequestCatalog, type RequestMatch, type RequestSong,
 } from '../src/music/request-match.js';
 
@@ -559,6 +559,67 @@ test('featured credits and edition labels fold, but a requested edition stays st
   assert.ok(!requestTitleMatches('Song (Radio Edit)', 'Song'));
   assert.ok(!requestTitleMatches('Song (Radio Edit) (feat. X)', 'Song (Album Version)'));
   assert.ok(!requestTitleMatches('The', 'The Feat of Clay'));
+});
+
+test('harmless film and single labels fold in the generic candidate verifier', () => {
+  assert.ok(requestTitleMatches('Preet Re', 'Preet Re (From "Dhadak 2")'));
+  assert.ok(requestTitleMatches('Preet Re', 'Preet Re - Single'));
+  assert.ok(!requestTitleMatches('Preet Re', 'Preet Re (Live)'));
+});
+
+test('generic candidate artist verification matches a primary act inside composite credits', () => {
+  const song = {
+    id: 'preet-good',
+    title: 'Preet Re (From "Dhadak 2")',
+    artist: 'Darshan Raval / Rochak Kohli / Jonita Gandhi / Gurpreet Saini',
+  };
+  assert.ok(requestCandidateArtistMatches('Rochak Kohli', song));
+  assert.ok(requestCandidateArtistMatches('Jonita Gandhi', { ...song, artist: 'Darshan Raval & Jonita Gandhi' }));
+  assert.ok(requestCandidateArtistMatches('Rochak Kohli', { ...song, artist: 'Darshan Raval, feat. Rochak Kohli' }));
+  assert.equal(requestCandidateArtistMatches('Other Artist', song), false);
+});
+
+test('alias ranking keeps the verified Preet Re candidate over a same-title collision', () => {
+  const good = {
+    id: 'preet-good',
+    title: 'Preet Re (From "Dhadak 2")',
+    artist: 'Darshan Raval / Rochak Kohli / Jonita Gandhi / Gurpreet Saini',
+  };
+  const collision = { id: 'preet-wrong', title: 'Preet Re', artist: 'Other Artist' };
+  assert.equal(rankAliasCandidates('Preet Re', 'Rochak Kohli', [collision, good], 'Preet Re by Rochak Kohli')?.id, good.id);
+});
+
+test('alias ranking breaks an otherwise equal same-artist tie by track id', () => {
+  const tracks = [
+    { id: 'preet-z', title: 'Preet Re - Single', artist: 'Rochak Kohli' },
+    { id: 'preet-a', title: 'Preet Re', artist: 'Rochak Kohli' },
+  ];
+  assert.equal(rankAliasCandidates('Preet Re', 'Rochak Kohli', tracks, '')?.id, 'preet-a');
+});
+
+test('candidate ranking can use lyric overlap when the local title is an alias', () => {
+  const ranked = rankRequestCandidates('Chitte Suit Te', 'Geeta Zaildar', [{
+    id: 'white-suit', title: 'White Suit', artist: 'Geeta Zaildar',
+    lyricExcerpt: 'chitte suit te daag pai gaye gali teri vich gara',
+  }], { lyricText: 'chitte suit te daag pai gaye gali teri vich gara' });
+  assert.equal(ranked[0]?.song.id, 'white-suit');
+  assert.ok((ranked[0]?.lyricOverlap || 0) >= 0.8);
+});
+
+test('direct requests select decorated Preet Re from a composite credit over a title collision', async () => {
+  const good = {
+    id: 'preet-good',
+    title: 'Preet Re (From "Dhadak 2")',
+    artist: 'Darshan Raval / Rochak Kohli / Jonita Gandhi / Gurpreet Saini',
+  };
+  const collision = { id: 'preet-wrong', title: 'Preet Re', artist: 'Other Artist' };
+  const f = fixture({
+    searchPage: async () => ({ songs: [collision, good], rawCount: 2 }),
+    resolveArtist: async () => ({ id: 'rochak', name: 'Rochak Kohli' }),
+  });
+  const result = await resolveDirectRequest({ title: 'Preet Re', artist: 'Rochak Kohli', search_terms: ['Preet Re', 'Rochak Kohli'], scope: 'song' }, f.deps);
+  assert.equal(result.track?.id, good.id);
+  assert.equal(result.outcome, 'matched');
 });
 
 test('a literal "Title - Artist" is read the other way round only on catalogue proof', async () => {

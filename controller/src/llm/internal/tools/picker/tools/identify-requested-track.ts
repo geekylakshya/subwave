@@ -7,6 +7,7 @@ import { identifyTrackFromText } from '../../../prompts/request.js';
 import { definePickerTool } from '../defs.js';
 import { REQUEST_TEXT_MAX } from '../../../../../schemas/request.js';
 import { requestName } from '../../../../../music/request-normalize.js';
+import { rankRequestCandidates, requestCandidateArtistMatches } from '../../../../../music/request-match.js';
 
 // Search snippets sometimes make the performer obvious but an identification
 // model may leave `artist` null when several pages use different credits. Keep
@@ -225,7 +226,7 @@ async function lyricWebEvidence(reference: string, budget: EvidenceSearchBudget)
   const boundedRaw = raw.length > 240 ? `${raw.slice(0, 120)} ${raw.slice(-120)}` : raw;
   const firstQuery = wordCount >= 8
     ? lyricSearchQuery(reference, null, 'tail', hasRepeatedPhraseCue ? 'lyrics song artist' : 'lyrics')
-    : wordCount >= 3 ? shortLyricSearchQuery(reference) : boundedRaw;
+    : shortLyricSearchQuery(reference);
   const first = await budget.search(firstQuery);
   if (hasUsableLyricEvidence(reference, first)) return first;
 
@@ -282,19 +283,19 @@ export default definePickerTool({
             .filter((value, index, all): value is string => !!value && all.indexOf(value) === index);
           const q = [artistHints[0], candidate.title].filter(Boolean).join(' ');
           let resolvedArtistName: string | null = null;
-          let songs = await subsonic.search(q, { songCount: 25 });
+          let songs = await subsonic.search(q, { songCount: 25, signal });
           if (songs.length === 0) {
             for (const hint of artistHints) {
-              const a = await subsonic.resolveArtist(hint);
+              const a = await subsonic.resolveArtist(hint, { signal });
               if (!a) continue;
               resolvedArtistName = a.name;
-              songs = await subsonic.search(`${a.name} ${candidate.title}`, { songCount: 25 });
+              songs = await subsonic.search(`${a.name} ${candidate.title}`, { songCount: 25, signal });
               if (songs.length) break;
             }
           }
-          if (songs.length === 0) songs = await subsonic.search(candidate.title, { songCount: 25 });
+          if (songs.length === 0) songs = await subsonic.search(candidate.title, { songCount: 25, signal });
           if (songs.length === 0 && candidate.keyword && candidate.keyword !== candidate.title) {
-            songs = await subsonic.search(candidate.keyword, { songCount: 25 });
+            songs = await subsonic.search(candidate.keyword, { songCount: 25, signal });
           }
           // Web results and library tags often use translated aliases for the
           // same song, such as "Chitte Suit Te" versus "White Suit". When every
@@ -303,24 +304,40 @@ export default definePickerTool({
           // tracks because the web title would no longer identify which one.
           if (songs.length === 0 && (resolvedArtistName || artistHints.length)) {
             const artistName = resolvedArtistName || artistHints[0];
-            const artistSongs = await subsonic.search(artistName, { songCount: 25 });
-            const exactArtistSongs = artistSongs.filter(song => requestName(song.artist) === requestName(artistName));
+            const artistSongs = await subsonic.search(artistName, { songCount: 25, signal });
+            const exactArtistSongs = artistSongs.filter(song => requestCandidateArtistMatches(artistName, song));
             if (exactArtistSongs.length === 1) songs = exactArtistSongs;
           }
           return songs;
         };
 
         const hints = extractLyricTrackHints(web);
-        const verifyCandidate = (candidate: IdentifiedTrack, songs: any[]) => {
-          const titleKey = requestName(candidate.title);
-          const artistKey = requestName(candidate.artist);
-          const sameArtist = artistKey ? songs.filter(song => requestName(song?.artist) === artistKey) : songs;
-          const exactTitle = sameArtist.filter(song => requestName(song?.title) === titleKey);
-          // An exact title is safe when the artist is also exact (or when the
-          // candidate omitted the artist and the title is unique). A single
-          // same-artist result is the controlled alias case used for translated
-          // or transliterated library titles.
-          return exactTitle.length ? exactTitle : sameArtist.length === 1 ? sameArtist : [];
+        const verifyCandidate = async (candidate: IdentifiedTrack, songs: any[], evidenceText = blob) => {
+          const ranked = rankRequestCandidates(candidate.title, candidate.artist, songs, {
+            webText: evidenceText,
+            lyricText: reference,
+          });
+          if (ranked.length) return [ranked[0]!.song];
+          const sameArtist = candidate.artist
+            ? songs.filter(song => requestCandidateArtistMatches(candidate.artist, song))
+            : songs;
+          const lyricsById = new Map<string, string>();
+          await Promise.all(sameArtist.slice(0, 8).map(async song => {
+            signal?.throwIfAborted();
+            const lyrics = await subsonic.getLyrics(song.id, { signal });
+            if (lyrics) lyricsById.set(song.id, lyrics);
+          }));
+          const lyricRanked = rankRequestCandidates(candidate.title, candidate.artist, songs, {
+            webText: evidenceText,
+            lyricText: reference,
+            lyricsById,
+          });
+          if (lyricRanked.length) return [lyricRanked[0]!.song];
+          // A translated or transliterated title is still safe when the
+          // verified artist has exactly one local track. This preserves the
+          // existing controlled alias fallback without allowing a multi-track
+          // artist catalogue to become a lottery.
+          return sameArtist.length === 1 ? sameArtist : [];
         };
         const resolveHint = async (hint: LyricTrackHint) => {
           const hintedSongs = await resolveGuess({ title: hint.title, artist: hint.artist, keyword: hint.title }, blob);
@@ -341,7 +358,7 @@ export default definePickerTool({
           }
           if (guess && evidenceSupportsGuess(guess, blob)) {
             const modelSongs = await resolveGuess(guess, blob);
-            const modelCandidates = collect(verifyCandidate(guess, modelSongs));
+            const modelCandidates = collect(await verifyCandidate(guess, modelSongs));
             if (modelCandidates.length) return { candidates: modelCandidates };
           }
         }
@@ -380,7 +397,7 @@ export default definePickerTool({
         }
 
         const songs = await resolveGuess(guess, blob);
-        let verifiedSongs = verifyCandidate(guess, songs);
+        let verifiedSongs = await verifyCandidate(guess, songs);
 
         // Some providers rank a lyric mirror above the canonical song page and
         // the first identification can therefore be wrong even though the
@@ -395,7 +412,7 @@ export default definePickerTool({
             const focusedEvidence = focusedBlob + '\n' + blob;
             if (focusedGuess && evidenceSupportsGuess(focusedGuess, focusedEvidence)) {
               const focusedSongs = await resolveGuess(focusedGuess, focusedEvidence);
-              verifiedSongs = verifyCandidate(focusedGuess, focusedSongs);
+              verifiedSongs = await verifyCandidate(focusedGuess, focusedSongs, focusedEvidence);
             }
           }
         }

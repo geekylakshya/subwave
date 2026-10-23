@@ -28,12 +28,13 @@ import {
 } from '../middleware/ratelimit.js';
 import { validatePublicBody } from '../middleware/validate.js';
 import { listenerRequestSchema } from '../schemas/request.js';
-import { classifyListenerRequest, directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, rankAliasCandidates, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
+import { classifyListenerRequest, directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
+import { resolveNamedAlias } from '../music/request-alias.js';
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
 import { ARTIST_VARIETY_WINDOW, drawRequestCandidate } from '../broadcast/dj-agent/artist-guard.js';
 import { RequestIdentificationMiss } from '../broadcast/dj-agent/breaker.js';
-import { isWebSearchProviderError, searchReady, searchWeb } from '../skills/web-search.js';
+import { isWebSearchProviderError } from '../skills/web-search.js';
 
 export const router = express.Router();
 
@@ -68,8 +69,64 @@ export type ListenerRequestSubmission = {
   retryAfter?: number;
 };
 
+type ListenerRequestEntryStatus = 'pending' | 'resolved' | 'failed' | 'cancelled';
+type ListenerRequestTrack = { id?: string; title?: string; artist?: string; [key: string]: unknown };
+
+export interface ListenerRequestEntry {
+  id: string;
+  status: ListenerRequestEntryStatus;
+  requester: string;
+  text: string;
+  source: ListenerRequestSource;
+  createdAt: number;
+  startedAt?: number;
+  provider?: string;
+  rawText?: string;
+  injection?: string | null;
+  ack?: string | null;
+  track?: ListenerRequestTrack | null;
+  pick?: ListenerRequestTrack | null;
+  queuePosition?: number | null;
+  message?: string | null;
+  outcome?: string;
+  refused?: boolean;
+  path?: string;
+  pickSource?: string;
+  classification?: string;
+  intent?: string | null;
+  mood?: string | null;
+  energy?: string | null;
+  scope?: string | null;
+  sort?: string | null;
+  artist?: string | null;
+  title?: string | null;
+  album?: string | null;
+  genre?: string | null;
+  language?: string | null;
+  searchTerms?: string[] | null;
+  candidateCount?: number;
+  confidence?: number | null;
+  evidenceSource?: string | null;
+  finalReason?: string | null;
+  providerFailure?: string | null;
+  unsupported?: string[];
+  unmetPreferences?: string[];
+  lookupErrors?: string[];
+  stages?: string[];
+  guard?: string | null;
+  artistMiss?: string | null;
+  missedArtist?: string | null;
+  interpretationFallback?: boolean;
+  introFailure?: string | null;
+  introScript?: string | null;
+}
+
+function requestEntryCancelled(entry: ListenerRequestEntry): boolean {
+  return entry.status === 'cancelled';
+}
+
 // In-memory request index for fast polling and admission checks. The durable
-const requests = new Map();
+const requests = new Map<string, ListenerRequestEntry>();
 const REQUEST_TTL_MS = 10 * 60 * 1000;
 // A listener request is accepted asynchronously, but it must still reach a
 // terminal state promptly. Provider generation has a much larger safety
@@ -272,31 +329,6 @@ function modelFreeMatch(text: string): Awaited<ReturnType<typeof dj.matchRequest
   return { ...modelFreeRequest(text), literal: true } as Awaited<ReturnType<typeof dj.matchRequest>>;
 }
 
-async function resolveNamedAlias(
-  title: string,
-  artistName: string,
-  signal?: AbortSignal,
-): Promise<{ track: any; provider: string } | null> {
-  if (!searchReady()) return null;
-  const provider = settings.get().search?.provider || 'duckduckgo';
-  const web = await searchWeb(`"${title}" "${artistName}" alternate title song`, { signal });
-  const evidence = [web.answer, ...(web.results || []).map(result => `${result.title}: ${result.content}`)]
-    .filter(Boolean).join('\n').slice(0, 8000);
-  if (!evidence) return null;
-  const artist = await subsonic.resolveArtist(artistName, { signal });
-  if (!artist?.id) return null;
-  const full = await subsonic.getArtist(artist.id);
-  const albums = (full?.album || []).slice(0, 20);
-  const candidates: any[] = [];
-  for (const album of albums) {
-    throwIfRequestResolutionAborted(signal);
-    candidates.push(...await subsonic.getAlbum(album.id, { signal }));
-    if (candidates.length >= 300) break;
-  }
-  const track = rankAliasCandidates(title, artistName, candidates, evidence);
-  return track ? { track, provider } : null;
-}
-
 // Requests accepted but not yet resolved. Their track is not in the upcoming
 // queue until resolveRequest() pushes it, which can take the agent's whole
 // timeout, so the maxPending gate counts them alongside the queued ones.
@@ -306,12 +338,12 @@ function resolvingRequestCount(): number {
   return n;
 }
 
-async function resolveRequestCore(entry, signal?: AbortSignal) {
+async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSignal) {
   const { requester, text } = entry;
   entry.startedAt = Date.now();
 
   const resolved = ({ ack, track, queuePosition }) => {
-    if (entry.status === 'cancelled') return;
+    if (requestEntryCancelled(entry)) return;
     entry.outcome ||= entry.refused ? 'already-queued' : track ? 'matched' : 'chat';
     entry.status = 'resolved';
     entry.ack = ack || null;
@@ -320,14 +352,14 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     recordOutcome(entry);
   };
   const failed = (message) => {
-    if (entry.status === 'cancelled') return;
+    if (requestEntryCancelled(entry)) return;
     entry.outcome ||= 'no-match';
     entry.status = 'failed';
     entry.message = message;
     recordOutcome(entry);
   };
 
-  if (entry.status === 'cancelled') return;
+  if (requestEntryCancelled(entry)) return;
 
   let ctx;
   try {
@@ -410,7 +442,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
       queue.log('request-guard', `more-like-this intro echoed request text — ${generatedIntro.guard}`);
     }
     const introScript = generatedIntro.introScript;
-    if (entry.status === 'cancelled') return;
+    if (requestEntryCancelled(entry)) return;
     const pos = await queue.push({
       track: pick, requestedBy: requester, intent: 'more_like_this', introScript,
       introKind: 'dj-speak',
@@ -419,7 +451,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
       introPersona: generatedIntro.introPersona,
       introHostSpeech: generatedIntro.introHostSpeech,
     });
-    if (entry.status === 'cancelled' || signal?.aborted) {
+    if (requestEntryCancelled(entry) || signal?.aborted) {
       if (pos >= 0) await queue.removeUpcoming(pick.id).catch(() => undefined);
       throwIfRequestResolutionAborted(signal);
       return;
@@ -546,7 +578,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
         entry.candidateCount = agentRes.candidateCount || 1;
         entry.confidence = agentRes.confidence ?? 1;
         entry.introScript = agentRes.introScript || null;
-        if (entry.status === 'cancelled') return;
+        if (requestEntryCancelled(entry)) return;
         return resolved({
           ack: withWaitNotice(agentRes.ack, agentRes.track.id),
           track: agentRes.track,
@@ -686,6 +718,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     queuedIds: queue.queuedIds(),
     currentId: queue.current?.track?.id,
     exactOnly: explicitNamedRequest || likelyShortTitle || forcedNamedTitle,
+    signal,
     moodSongs: async mood => { await library.load(); return library.songsByMood(mood); },
     energySongs: async energy => { await library.load(); return library.songsByEnergy(energy); },
     fallbackSongs: async () => {
@@ -739,12 +772,13 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
       if (isWebSearchProviderError(err)) {
         entry.provider = err.provider;
         entry.providerFailure = err.reason;
-        // Alternate-title verification is an optional enrichment after the
-        // local identity lanes. A station using the built-in DDG default may
-        // be offline while still handling named requests deterministically;
-        // keep that miss honest instead of turning every explicit typo into a
-        // provider outage. Explicitly configured providers remain typed errors.
-        if (err.provider === 'duckduckgo') {
+        // DuckDuckGo is the keyless built-in and an unreachable default
+        // endpoint is intentionally optional: it must not turn every otherwise
+        // deterministic named request into an infrastructure error. Its
+        // structured failures (rate limits, CAPTCHAs, malformed responses and
+        // timeouts) still remain typed provider failures, as do all keyed or
+        // self-hosted providers.
+        if (err.provider === 'duckduckgo' && err.reason === 'unavailable') {
           entry.finalReason = `web-alias-${err.reason}`;
           entry.pickSource = 'no-match';
           entry.outcome = 'no-match';
@@ -829,7 +863,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   const introScript = generatedIntro.introScript;
 
   // 4. Enqueue. push() dedups a track a concurrent request already queued (#619).
-  if (entry.status === 'cancelled') return;
+  if (requestEntryCancelled(entry)) return;
   throwIfRequestResolutionAborted(signal);
   const pos = await queue.push({
     track: pick,
@@ -840,7 +874,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     introPersona: generatedIntro.introPersona,
     introHostSpeech: generatedIntro.introHostSpeech,
   });
-  if (entry.status === 'cancelled' || signal?.aborted) {
+  if (requestEntryCancelled(entry) || signal?.aborted) {
     if (pos >= 0) await queue.removeUpcoming(pick.id).catch(() => undefined);
     throwIfRequestResolutionAborted(signal);
     return;
@@ -880,7 +914,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
 // a normal terminal closure in resolveRequestCore or is failed here when the
 // bounded wall-clock budget expires. A stalled provider must never leave the
 // durable receipt pending forever.
-function typedResolution(entry): ListenerRequestResolution {
+function typedResolution(entry: ListenerRequestEntry): ListenerRequestResolution {
   const legacyOutcome = String(entry.outcome || 'no-match');
   const outcome: ListenerResolutionOutcome = legacyOutcome === 'already-queued' || legacyOutcome === 'cooldown'
     ? legacyOutcome
@@ -902,11 +936,11 @@ function typedResolution(entry): ListenerRequestResolution {
   };
 }
 
-export async function resolveListenerRequest(entry): Promise<ListenerRequestResolution> {
+export async function resolveListenerRequest(entry: ListenerRequestEntry): Promise<ListenerRequestResolution> {
   try {
     await withDeadline(requestResolutionTimeoutMs(), 'request resolution', signal => resolveRequestCore(entry, signal));
   } catch (err) {
-    if (entry.status === 'cancelled' || entry.status === 'resolved' || entry.status === 'failed') return typedResolution(entry);
+    if (requestEntryCancelled(entry) || entry.status === 'resolved' || entry.status === 'failed') return typedResolution(entry);
     const timedOut = err?.name === 'AgentDeadlineError'
       || /request resolution.*deadline|request resolution.*aborted/i.test(String(err?.message || ''));
     entry.outcome = timedOut ? 'timeout' : 'error';
@@ -985,7 +1019,7 @@ export async function submitListenerRequest(input: {
   const requester = cleanRequesterName(rawName, reservedNames);
 
   const ip = input.ip;
-  let entry: any;
+  let entry: ListenerRequestEntry;
   const releaseAdmission = await acquireAdmissionLock();
   try {
     // Janitor runs BEFORE the gates: the one-pending hold returns 429 without

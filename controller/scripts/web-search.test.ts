@@ -271,6 +271,49 @@ test('concurrent identical searches share one provider request', async t => {
   assert.equal(calls, 1);
 });
 
+test('aborting the last waiting caller aborts the shared provider fetch', async t => {
+  await settings.load();
+  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://abort.test', searxngEngines: '' } });
+  let providerSignal: AbortSignal | undefined;
+  t.mock.method(globalThis, 'fetch', async (_input: string | URL | Request, init?: RequestInit) => {
+    providerSignal = init?.signal as AbortSignal | undefined;
+    await new Promise<never>((_, reject) => {
+      providerSignal?.addEventListener('abort', () => reject(providerSignal?.reason), { once: true });
+    });
+    throw new Error('unreachable');
+  });
+  const controller = new AbortController();
+  const request = searchWeb(`abort-search-${Date.now()}`, { signal: controller.signal });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(providerSignal, 'provider should receive the resolver signal');
+  controller.abort(new Error('cancelled'));
+  await assert.rejects(request, /cancelled/);
+  assert.equal(providerSignal.aborted, true);
+});
+
+test('one aborted caller does not cancel a shared search still needed by another', async t => {
+  await settings.load();
+  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://shared-abort.test', searxngEngines: '' } });
+  let providerSignal: AbortSignal | undefined;
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  t.mock.method(globalThis, 'fetch', async (_input: string | URL | Request, init?: RequestInit) => {
+    providerSignal = init?.signal as AbortSignal | undefined;
+    await blocked;
+    return Response.json({ results: [{ title: 'Shared', content: 'evidence' }] });
+  });
+  const firstController = new AbortController();
+  const query = `shared-abort-${Date.now()}`;
+  const first = searchWeb(query, { signal: firstController.signal });
+  const second = searchWeb(query);
+  await new Promise(resolve => setImmediate(resolve));
+  firstController.abort(new Error('first caller cancelled'));
+  await assert.rejects(first, /first caller cancelled/);
+  assert.equal(providerSignal?.aborted, false);
+  release();
+  assert.equal((await second).results[0]?.title, 'Shared');
+});
+
 test('rate limits become typed provider failures and are never cached', async t => {
   await settings.load();
   await settings.update({ search: { provider: 'searxng', baseUrl: 'https://rate-limit.test', searxngEngines: '' } });

@@ -1761,6 +1761,10 @@ export async function runRequest(queue: any, { requester, text, signal }: { requ
 
 async function runRequestViaAgent(queue: any, { requester, text, signal }: { requester: string; text: string; signal?: AbortSignal }) {
   return withTrace({ kind: 'request', requester }, async () => {
+    const throwIfAborted = () => {
+      if (!signal?.aborted) return;
+      throw signal.reason instanceof Error ? signal.reason : new Error('request resolution aborted');
+    };
     const requestSpeech = session.captureAutomaticHostSpeech(session.onAirPersona());
     // Requests stay near-unfiltered — listeners must be able to re-request a
     // song from earlier in the day. 2h covers the "don't repeat the song still
@@ -1806,6 +1810,7 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
       persona: requestSpeech.persona,
       ...(signal ? { abortSignal: signal } : {}),
     });
+    throwIfAborted();
     const { toolCalls, extras } = run;
     // Reassigned when the unknown-id salvage below (repickRequestFromSeen)
     // lands a corrective re-pick — same let-after-destructure shape
@@ -1867,6 +1872,9 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
     // claim re-pick, or the stand-in spacing re-pick — whichever comes first.
     let corrected = false;
 
+    const providerFailure = extras.failures?.find((failure: any) => failure?.providerFailure === true);
+    if (providerFailure) throw providerFailure;
+
     let song = object?.id ? extras.seen.get(object.id) : null;
     // Near-miss repair, same as the pick path: an unambiguous prefix /
     // clear-winner edit-distance match against the run's own candidates
@@ -1885,6 +1893,7 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
     // caller's stateless matcher cascade is still the fallback when this
     // misses too (empty seen, or the re-pick call itself fails).
     if (!song && extras.seen.size) {
+      throwIfAborted();
       corrected = true;
       const repicked = await repickRequestFromSeen({
         seen: spacedOffer(extras.seen), badId: object?.id ?? null, requester, text,
@@ -1899,8 +1908,6 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
       }
     }
     if (!song) {
-      const providerFailure = extras.failures?.find((failure: any) => failure?.providerFailure === true);
-      if (providerFailure) throw providerFailure;
       // idInSessionWindow (D2 telemetry): does the bad id appear verbatim
       // anywhere in the EXACT window this run saw (the local `messages` array
       // built above, not a fresh session.windowMessages() call — a concurrent
@@ -1945,11 +1952,13 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
       const pool = new Map(extras.seen);
       const lookup = canRepick ? claimLookupQuery(firstMiss, toolCalls) : null;
       if (lookup) {
+        throwIfAborted();
         for (const [id, hit] of await lookupRequestClaim(lookup, scope)) if (!pool.has(id)) pool.set(id, hit);
       }
       const claimed = [...new Set(firstMiss.flatMap((m) => m.claims.map((c) => `"${c.text}"`)))].join(', ');
       queue.log('request-guard', `agent ${firstMiss.map((m) => m.field).join('+')} named ${claimed} over "${song.title}" by ${song.artist}${lookup ? ` — looked up "${lookup}"` : ''}`);
       if (canRepick) corrected = true;
+      throwIfAborted();
       const repicked = canRepick
         ? await repickRequestFromSeen({
           seen: spacedOffer(pool), badId: object?.id ?? null, requester, text,
@@ -2054,10 +2063,12 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
     const modelIntro = typeof object.intro === 'string' ? object.intro.trim() : '';
     let rawIntro = '';
     if (autoVoiceAllowed()) {
+      throwIfAborted();
       rawIntro = !plainLines.has('intro') ? modelIntro
         : plainRequestIntro(song, requester, requestSpeech.persona)
           || String((await regenerateIntro().catch(() => null)) ?? '').trim();
     }
+    throwIfAborted();
     const guarded = await guardIntro(rawIntro || null, echoTexts, regenerateIntro);
     if (guarded.guard) queue.log('request-guard', `agent intro echoed request text — ${guarded.guard}`);
     const currentSpeech = session.finalizeAutomaticHostSpeech(guarded.script, requestSpeech);
@@ -2076,6 +2087,7 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
     // in the intro, after misnaming the track) — join rather than let one
     // verdict hide another.
     const guardVerdict = [claimGuard, spacingGuard, guarded.guard, screened.guard].filter(Boolean).join('+') || null;
+    throwIfAborted();
     const pos = await queue.push({
       track: trackFields(song),
       requestedBy: requester,
@@ -2086,6 +2098,10 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
       introPersona: currentSpeech.persona,
       introHostSpeech: currentSpeech.hostSpeech,
     });
+    if (signal?.aborted) {
+      if (pos >= 0) await queue.removeUpcoming(song.id).catch(() => undefined);
+      throwIfAborted();
+    }
     // Never-play blocklist refused the pick — throw so the route's stateless
     // fallback cascade runs; its own resolution is blocklist-filtered, so the
     // listener gets the standard not-found decline rather than a silent drop.

@@ -28,10 +28,11 @@ import { startListenerMonitor } from './broadcast/listeners.js';
 import { startStreamIdleMonitor } from './broadcast/stream-idle.js';
 import { startAudienceMonitor } from './broadcast/audience.js';
 import * as likes from './broadcast/likes.js';
-import { configureHttp, httpErrorHandler } from './middleware/http.js';
+import { configureHttp, configureJsonBody, httpErrorHandler } from './middleware/http.js';
 import { createStartupGate } from './middleware/startup.js';
 import { assertAdminConfigured } from './middleware/auth.js';
 import { router as publicRoutes } from './routes/public.js';
+import { router as alexaRoutes } from './routes/alexa.js';
 import { router as authRoutes } from './routes/auth.js';
 import { router as requestRoutes } from './routes/request.js';
 import { router as settingsRoutes } from './routes/settings.js';
@@ -105,12 +106,21 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 const app = express();
 
-configureHttp(app);
+// Alexa signature verification needs the untouched request bytes. The normal
+// JSON parser is mounted immediately after the Alexa router below.
+configureHttp(app, { parseJson: false });
 
 // Keep health checks and every state consumer behind the same startup barrier.
 // CORS preflight stays available while the controller initializes.
 const startup = createStartupGate();
 app.use(startup.middleware);
+
+// Amazon's official Express adapter must see the raw request body before any
+// JSON parser runs; it verifies Alexa's signature against those exact bytes.
+// Mount this route before the controller-wide parser, while still keeping it
+// behind the startup gate like every other state consumer.
+app.use(alexaRoutes);
+configureJsonBody(app);
 
 // Routes. `requireAdmin` is applied per-route inside the admin modules.
 app.use(publicRoutes);

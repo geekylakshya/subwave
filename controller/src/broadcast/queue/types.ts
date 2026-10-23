@@ -81,6 +81,9 @@ export interface MixDrop {
 // source added.
 export interface QueueItem {
   track: Track;
+  // Listener request receipt that caused this queue item. Optional so queue
+  // files written before durable request receipts remain compatible.
+  requestId?: string | null;
   requestedBy?: string | null;
   // This item was queued by the OPERATOR, not by a listener. It exists because
   // `requestedBy` cannot answer that question: the studio queue pushes

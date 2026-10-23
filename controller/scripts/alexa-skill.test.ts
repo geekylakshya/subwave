@@ -33,7 +33,10 @@ function envelope(
       System: {
         application: { applicationId },
         user: { userId: 'amzn1.ask.account.test' },
-        device: { deviceId: 'amzn1.ask.device.test', supportedInterfaces: { AudioPlayer: {} } },
+        device: {
+          deviceId: 'amzn1.ask.device.test',
+          supportedInterfaces: { AudioPlayer: {} },
+        },
         apiEndpoint: 'https://api.amazonalexa.com',
       },
     },
@@ -47,31 +50,19 @@ function launch() {
     requestId: 'EdwRequestId.launch',
     timestamp: '2026-10-21T12:00:00Z',
     locale: 'en-IN',
-  });
+  }, skillId);
 }
 
-function intent(name: string) {
-  return envelope({
+function intent(name: string, slots: Record<string, unknown> = {}, attributes: Record<string, unknown> = {}) {
+  const result = envelope({
     type: 'IntentRequest',
     requestId: `EdwRequestId.${name}`,
     timestamp: '2026-10-21T12:00:00Z',
     locale: 'en-IN',
-    intent: { name, confirmationStatus: 'NONE', slots: {} },
+    intent: { name, confirmationStatus: 'NONE', slots },
   });
-}
-
-function songRequest(text: string) {
-  return envelope({
-    type: 'IntentRequest',
-    requestId: 'EdwRequestId.song-request',
-    timestamp: '2026-10-21T12:00:00Z',
-    locale: 'en-IN',
-    intent: {
-      name: 'RequestSongIntent',
-      confirmationStatus: 'NONE',
-      slots: { request: { name: 'request', value: text, confirmationStatus: 'NONE' } },
-    },
-  });
+  (result.session as any).attributes = attributes;
+  return result;
 }
 
 const runtime = {
@@ -92,7 +83,6 @@ test('Alexa is disabled by default and its patch accepts one skill id', () => {
     skillId,
   });
 });
-
 test('Alexa cannot be enabled without a Skill ID and supports a private listener stream', async () => {
   await settings.load();
   await assert.rejects(
@@ -122,8 +112,21 @@ test('Alexa launches the currently configured station and uses its public stream
         token: 'subwave-live-stream',
         offsetInMilliseconds: 0,
       },
+      metadata: {
+        title: 'EXAMPLE STATION',
+        subtitle: 'Live station',
+      },
     },
   }]);
+});
+
+test('Alexa keeps playback available when optional now-playing metadata fails', async () => {
+  const response = (await createAlexaSkill({
+    ...runtime,
+    nowPlaying: async () => { throw new Error('catalogue unavailable'); },
+  }).invoke(launch())).response as any;
+  assert.equal(response.directives[0].type, 'AudioPlayer.Play');
+  assert.equal(response.directives[0].audioItem.metadata.subtitle, 'Live station');
 });
 
 test('Alexa creates a fresh mount-bound token for protected playback', async () => {
@@ -174,36 +177,147 @@ test('pause and stop stop live playback, while resume starts at the live edge', 
   assert.equal(resume.directives[0].audioItem.stream.offsetInMilliseconds, 0);
 });
 
-test('Alexa song requests use the shared listener resolver and preserve typed outcomes', async () => {
-  let received: { text: string; name?: string; ip: string; source: 'alexa' } | null = null;
-  const alexaRuntime = {
+test('Alexa acknowledges a song request immediately through the shared request pipeline', async () => {
+  const submitted: Array<{ text: string; userId: string }> = [];
+  const response = await createAlexaSkill({
     ...runtime,
-    submitListenerRequest: async (input: typeof received extends infer T ? T & {} : never) => {
-      received = input as typeof received;
+    submitRequest: async (text, userId) => {
+      submitted.push({ text, userId });
+      return { accepted: true, statusCode: 202, requestId: 'request-1', status: 'pending' };
+    },
+  }).invoke(intent('RequestSongIntent', {
+    requestText: { name: 'requestText', value: 'play Daft Punk', confirmationStatus: 'NONE' },
+  }));
+  const body = response.response as any;
+
+  assert.equal(body.outputSpeech.ssml, '<speak>Your request was sent to the booth. It will play when available.</speak>');
+  assert.equal(body.shouldEndSession, true);
+  assert.deepEqual(submitted, [{ text: 'play Daft Punk', userId: 'amzn1.ask.account.test' }]);
+});
+
+test('Alexa asks for confirmation only when a named request has several catalogue matches', async () => {
+  const submitted: string[] = [];
+  const candidates = [
+    { id: 'track-1', title: 'Single', artist: 'Taylor Swift', album: 'First album' },
+    { id: 'track-2', title: 'Single', artist: 'Taylor Swift', album: 'Second album' },
+  ];
+  const skill = createAlexaSkill({
+    ...runtime,
+    previewRequest: async () => candidates,
+    submitRequest: async text => {
+      submitted.push(text);
+      return { accepted: true, statusCode: 202, requestId: 'request-confirmed', status: 'pending' };
+    },
+  });
+  const questionResult = await skill.invoke(intent('RequestSongIntent', {
+    requestText: { name: 'requestText', value: 'request single by Taylor Swift' },
+  }));
+  const question = questionResult.response as any;
+  assert.match(question.outputSpeech.ssml, /I found Single by Taylor Swift/);
+  assert.equal(question.shouldEndSession, false);
+  assert.equal(question.reprompt.outputSpeech.ssml, '<speak>Say yes to request it, or no to hear the next match.</speak>');
+
+  const yes = (await skill.invoke(intent('AMAZON.YesIntent', {}, questionResult.sessionAttributes))).response as any;
+  assert.match(yes.outputSpeech.ssml, /Your request was sent/);
+  assert.deepEqual(submitted, ['play "Single" by "Taylor Swift"']);
+});
+
+test('Alexa advances to the next candidate after a no response', async () => {
+  const candidates = [
+    { id: 'track-1', title: 'Single', artist: 'Taylor Swift', album: 'First album' },
+    { id: 'track-2', title: 'Single', artist: 'Taylor Swift', album: 'Second album' },
+  ];
+  const skill = createAlexaSkill({ ...runtime, previewRequest: async () => candidates });
+  const questionResult = await skill.invoke(intent('RequestSongIntent', {
+    requestText: { name: 'requestText', value: 'request single by Taylor Swift' },
+  }));
+  const no = (await skill.invoke(intent('AMAZON.NoIntent', {}, questionResult.sessionAttributes))).response as any;
+  assert.match(no.outputSpeech.ssml, /I found Single by Taylor Swift/);
+  assert.equal(no.shouldEndSession, false);
+});
+
+test('Alexa reports the latest request phase for the current account', async () => {
+  const response = await createAlexaSkill({
+    ...runtime,
+    latestRequestStatus: async identity => {
+      assert.equal(typeof identity, 'string');
       return {
-        accepted: true as const,
-        requestId: 'request-alexa-test',
-        status: 'pending' as const,
-        completion: Promise.resolve({
-          outcome: 'matched' as const,
-          legacyOutcome: 'matched',
-          ack: 'Queued Bohemian Rhapsody by Queen.',
-          message: null,
-          track: { id: 'bohemian-rhapsody', title: 'Bohemian Rhapsody', artist: 'Queen' },
-          queuePosition: 1,
-        }),
+        status: 'pending',
+        success: false,
+        requestId: 'request-2',
+        phase: 'queued',
+        track: { title: 'Around the World', artist: 'Daft Punk' },
       };
     },
+  }).invoke(intent('RequestStatusIntent'));
+  const body = response.response as any;
+
+  assert.equal(body.outputSpeech.ssml, '<speak>Your latest request for Around the World is queued.</speak>');
+  assert.equal(body.shouldEndSession, true);
+});
+
+test('Alexa reports ETA and supports request cancellation and replacement', async () => {
+  const status = {
+    status: 'pending' as const,
+    success: false,
+    requestId: 'request-eta',
+    phase: 'queued' as const,
+    queuePosition: 2,
+    etaSeconds: 180,
+    track: { title: 'Around the World', artist: 'Daft Punk' },
   };
-  const response = (await createAlexaSkill(alexaRuntime).invoke(songRequest('Queen Bohemian Rhapsody'))).response as any;
-  assert.deepEqual(received, {
-    text: 'Queen Bohemian Rhapsody',
-    name: 'Alexa listener',
-    ip: 'alexa:amzn1.ask.account.test',
-    source: 'alexa',
-  });
-  assert.equal(response.outputSpeech.ssml, '<speak>Queued Bohemian Rhapsody by Queen.</speak>');
-  assert.equal(response.shouldEndSession, true);
+  const queued = (await createAlexaSkill({
+    ...runtime,
+    latestRequestStatus: async () => status,
+  }).invoke(intent('RequestStatusIntent'))).response as any;
+  assert.match(queued.outputSpeech.ssml, /position 2/);
+  assert.match(queued.outputSpeech.ssml, /about 3 minutes/);
+
+  const cancelled = (await createAlexaSkill({
+    ...runtime,
+    cancelRequest: async () => ({ ...status, status: 'cancelled', success: false, phase: 'cancelled' }),
+  }).invoke(intent('CancelRequestIntent'))).response as any;
+  assert.match(cancelled.outputSpeech.ssml, /cancelled/);
+
+  const replaced = (await createAlexaSkill({
+    ...runtime,
+    replaceRequest: async () => ({ accepted: true, statusCode: 202, requestId: 'request-new', status: 'pending' }),
+  }).invoke(intent('ReplaceRequestIntent', { requestText: { name: 'requestText', value: 'new song' } }))).response as any;
+  assert.match(replaced.outputSpeech.ssml, /replaced/);
+});
+
+test('Alexa reports the current track and the next queued track', async () => {
+  const current = await createAlexaSkill({
+    ...runtime,
+    nowPlaying: async () => ({ title: 'Current Song', artist: 'Current Artist' }),
+  }).invoke(intent('NowPlayingIntent'));
+  const upcoming = await createAlexaSkill({
+    ...runtime,
+    upcoming: async () => [{ title: 'Next Song', artist: 'Next Artist' }],
+  }).invoke(intent('UpcomingIntent'));
+
+  assert.equal(
+    (current.response as any).outputSpeech.ssml,
+    '<speak>Currently playing Current Song by Current Artist.</speak>',
+  );
+  assert.equal(
+    (upcoming.response as any).outputSpeech.ssml,
+    '<speak>The next song is Next Song by Next Artist.</speak>',
+  );
+});
+
+test('Alexa gives a useful answer when no current or upcoming track is available', async () => {
+  const current = await createAlexaSkill({
+    ...runtime,
+    nowPlaying: async () => null,
+  }).invoke(intent('NowPlayingIntent'));
+  const upcoming = await createAlexaSkill({
+    ...runtime,
+    upcoming: async () => [],
+  }).invoke(intent('UpcomingIntent'));
+
+  assert.equal((current.response as any).outputSpeech.ssml, '<speak>Nothing is playing right now.</speak>');
+  assert.equal((upcoming.response as any).outputSpeech.ssml, '<speak>There is no song queued next.</speak>');
 });
 
 test('Alexa rejects a skill request with the wrong configured skill id', async () => {

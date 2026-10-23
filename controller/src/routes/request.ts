@@ -34,6 +34,7 @@ import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-cl
 import { ARTIST_VARIETY_WINDOW, drawRequestCandidate } from '../broadcast/dj-agent/artist-guard.js';
 import { RequestIdentificationMiss } from '../broadcast/dj-agent/breaker.js';
 import { isWebSearchProviderError, searchReady, searchWeb } from '../skills/web-search.js';
+import * as requestLedger from '../broadcast/request-ledger.js';
 
 export const router = express.Router();
 
@@ -318,6 +319,16 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     entry.track = track || null;
     entry.queuePosition = typeof queuePosition === 'number' ? queuePosition : null;
     recordOutcome(entry);
+    void requestLedger.update(entry.id, {
+      status: 'resolved',
+      ack: entry.ack,
+      outcome: entry.outcome,
+      track: entry.pick
+        ? { id: entry.pick.id, title: entry.pick.title, artist: entry.pick.artist }
+        : entry.track,
+      queuePosition: entry.queuePosition,
+      message: entry.message || null,
+    }).catch(err => queue.log('error', `request ledger update failed: ${err.message}`));
   };
   const failed = (message) => {
     if (entry.status === 'cancelled') return;
@@ -325,6 +336,15 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     entry.status = 'failed';
     entry.message = message;
     recordOutcome(entry);
+    void requestLedger.update(entry.id, {
+      status: 'failed',
+      outcome: entry.outcome,
+      message,
+      track: entry.pick
+        ? { id: entry.pick.id, title: entry.pick.title, artist: entry.pick.artist }
+        : null,
+      queuePosition: null,
+    }).catch(err => queue.log('error', `request ledger update failed: ${err.message}`));
   };
 
   if (entry.status === 'cancelled') return;
@@ -412,7 +432,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     const introScript = generatedIntro.introScript;
     if (entry.status === 'cancelled') return;
     const pos = await queue.push({
-      track: pick, requestedBy: requester, intent: 'more_like_this', introScript,
+      track: pick, requestId: entry.id, requestedBy: requester, intent: 'more_like_this', introScript,
       introKind: 'dj-speak',
       // Voice it as whoever wrote it: render and air happen later and would
       // otherwise re-resolve the speaker off the wall clock.
@@ -420,7 +440,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
       introHostSpeech: generatedIntro.introHostSpeech,
     });
     if (entry.status === 'cancelled' || signal?.aborted) {
-      if (pos >= 0) await queue.removeUpcoming(pick.id).catch(() => undefined);
+      if (pos >= 0) await queue.removeUpcomingRequest(entry.id).catch(() => undefined);
       throwIfRequestResolutionAborted(signal);
       return;
     }
@@ -833,6 +853,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   throwIfRequestResolutionAborted(signal);
   const pos = await queue.push({
     track: pick,
+    requestId: entry.id,
     requestedBy: requester,
     intent: matched.intent,
     introScript,
@@ -841,7 +862,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     introHostSpeech: generatedIntro.introHostSpeech,
   });
   if (entry.status === 'cancelled' || signal?.aborted) {
-    if (pos >= 0) await queue.removeUpcoming(pick.id).catch(() => undefined);
+    if (pos >= 0) await queue.removeUpcomingRequest(entry.id).catch(() => undefined);
     throwIfRequestResolutionAborted(signal);
     return;
   }
@@ -916,6 +937,11 @@ export async function resolveListenerRequest(entry): Promise<ListenerRequestReso
       : 'Something went wrong in the booth — try again.';
     queue.log('error', `Request resolution ${timedOut ? 'timed out' : 'failed'}: ${err?.message || err}`);
     recordOutcome(entry);
+    await requestLedger.update(entry.id, {
+      status: 'failed',
+      outcome: entry.outcome,
+      message: entry.message,
+    }).catch(updateError => queue.log('error', `request ledger failure update failed: ${updateError.message}`));
   }
   return typedResolution(entry);
 }
@@ -931,6 +957,7 @@ export async function submitListenerRequest(input: {
   name?: string;
   ip: string;
   source: ListenerRequestSource;
+  alexaIdentity?: string;
 }): Promise<ListenerRequestSubmission> {
   // Keep every caller behind the same shape/size boundary. The browser
   // middleware already parsed this schema, but Alexa and future voice clients
@@ -1036,15 +1063,11 @@ export async function submitListenerRequest(input: {
       };
     }
 
-    // Spend the hourly budgets only after the queue-state gates: those reject
-    // without queueing, and charging them burned the station-wide cap to zero on
-    // rejections alone. The per-IP cooldown was already spent by checkRateLimit.
-    commitRateLimit(ip);
-    commitGlobalRateLimit();
-
     const id = randomUUID();
     entry = {
       id, status: 'pending', requester, text, source: input.source,
+      clientKey: ip,
+      alexaIdentity: input.alexaIdentity,
       provider: settings.get().search?.provider || 'duckduckgo',
       rawText: sanitizeRequestText(rawText),
       injection: stripped.injection,
@@ -1053,6 +1076,30 @@ export async function submitListenerRequest(input: {
     };
     requests.set(id, entry);
     lastByIp.set(ip, entry);
+
+    // Persist the receipt while admission is still serialized. An accepted
+    // request must never be returned without a durable status for Alexa to
+    // query after a restart.
+    try {
+      await requestLedger.createPending({
+        id,
+        createdAt: entry.createdAt,
+        source: input.source === 'browser' ? 'web' : 'alexa',
+        requester,
+        text,
+        alexaIdentity: input.alexaIdentity,
+      });
+    } catch (error) {
+      requests.delete(id);
+      if (lastByIp.get(ip) === entry) lastByIp.delete(ip);
+      queue.log('error', `request ledger create failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+      return { accepted: false, statusCode: 500, message: 'Unable to record the request right now.' };
+    }
+
+    // Spend the hourly budgets only after the queue-state gates and durable
+    // receipt. Rejected or unrecorded requests do not consume a station slot.
+    commitRateLimit(ip);
+    commitGlobalRateLimit();
   } finally {
     // Resolution can spend tens of seconds in the model and web search. It must
     // never hold the admission mutex while doing that slow work.
@@ -1084,20 +1131,164 @@ router.post('/request', validatePublicBody(listenerRequestSchema), async (req, r
   res.status(202).json({ success: true, requestId: submission.requestId, status: submission.status });
 });
 
+export type RequestPhase = 'pending' | 'queued' | 'playing' | 'finished' | 'interrupted' | 'cancelled' | 'resolved' | 'failed';
+
+export interface ListenerRequestStatus {
+  status: 'pending' | 'resolved' | 'failed' | 'cancelled' | 'unknown';
+  success: boolean;
+  requestId?: string;
+  phase?: RequestPhase;
+  ack?: string | null;
+  track?: { title?: string | null; artist?: string | null } | null;
+  queuePosition?: number | null;
+  etaSeconds?: number | null;
+  outcome?: string | null;
+  message?: string | null;
+}
+
+function queueStatusFor(id: string): { phase: RequestPhase; queuePosition?: number; etaSeconds?: number | null } | null {
+  const upcomingIndex = queue.upcoming.findIndex(item => item.requestId === id);
+  if (upcomingIndex >= 0) {
+    return {
+      phase: 'queued',
+      queuePosition: upcomingIndex + 1,
+      etaSeconds: queue.airForecastSec(queue.upcoming[upcomingIndex]),
+    };
+  }
+  if (queue.current?.requestId === id) return { phase: 'playing' };
+  if (queue.history.some(item => item.requestId === id)) return { phase: 'finished' };
+  return null;
+}
+
+function statusFromRecord(record: requestLedger.RequestLedgerRecord): ListenerRequestStatus {
+  const queueState = queueStatusFor(record.id);
+  const phase: RequestPhase = queueState?.phase
+    || (record.status === 'pending' ? 'pending' : record.status);
+  return {
+    status: record.status === 'interrupted' ? 'failed' : record.status,
+    success: record.status === 'resolved',
+    requestId: record.id,
+    phase,
+    ack: record.ack ?? null,
+    track: record.track ?? null,
+    queuePosition: queueState?.queuePosition ?? record.queuePosition ?? null,
+    etaSeconds: queueState?.etaSeconds ?? null,
+    outcome: record.outcome ?? null,
+    message: record.message ?? null,
+  };
+}
+
+export function getListenerRequestStatus(id: string): ListenerRequestStatus {
+  const entry = requests.get(id);
+  if (entry) {
+    const queueState = queueStatusFor(id);
+    return {
+      status: entry.status,
+      success: entry.status === 'resolved',
+      requestId: id,
+      phase: queueState?.phase || (entry.status === 'pending' ? 'pending' : entry.status),
+      ack: entry.ack,
+      track: entry.track,
+      queuePosition: queueState?.queuePosition ?? entry.queuePosition,
+      etaSeconds: queueState?.etaSeconds ?? null,
+      outcome: entry.outcome,
+      message: entry.message,
+    };
+  }
+  const record = requestLedger.get(id);
+  return record ? statusFromRecord(record) : { status: 'unknown', success: false };
+}
+
+export async function getLatestAlexaRequestStatus(identity: string): Promise<ListenerRequestStatus | null> {
+  const record = requestLedger.latestForAlexa(identity);
+  return record ? getListenerRequestStatus(record.id) : null;
+}
+
+type RequestCancellationDecision = 'cancelled' | 'cancelable' | 'too-late' | 'unknown';
+
+function requestCancellationDecision(status: ListenerRequestStatus): RequestCancellationDecision {
+  if (status.phase === 'cancelled') return 'cancelled';
+  if (status.phase === 'pending' || status.phase === 'queued') return 'cancelable';
+  if (status.phase === 'playing' || status.phase === 'finished') return 'too-late';
+  return 'unknown';
+}
+
+async function cancelRequestById(id: string): Promise<ListenerRequestStatus | null> {
+  const entry = requests.get(id);
+  if (entry?.status === 'cancelled') return getListenerRequestStatus(id);
+
+  if (entry?.status === 'pending') {
+    entry.status = 'cancelled';
+    entry.outcome = 'cancelled';
+    entry.message = 'Cancelled by listener.';
+    if (lastByIp.get(entry.clientKey) === entry) lastByIp.delete(entry.clientKey);
+    recordOutcome(entry);
+    await requestLedger.update(id, { status: 'cancelled', outcome: entry.outcome, message: entry.message });
+    return getListenerRequestStatus(id);
+  }
+
+  const current = getListenerRequestStatus(id);
+  const decision = requestCancellationDecision(current);
+  if (decision === 'cancelled' || decision === 'too-late') return current;
+  if (decision !== 'cancelable') return null;
+  const removed = await queue.removeUpcomingRequest(id);
+  if (!removed.ok) return removed.reason === 'already-playing' ? getListenerRequestStatus(id) : null;
+
+  if (entry) {
+    entry.status = 'cancelled';
+    entry.outcome = 'cancelled';
+    entry.message = 'Cancelled by listener.';
+    recordOutcome(entry);
+  }
+  await requestLedger.update(id, { status: 'cancelled', outcome: 'cancelled', message: 'Cancelled by listener.' });
+  return getListenerRequestStatus(id);
+}
+
+export async function cancelLatestAlexaRequest(identity: string): Promise<ListenerRequestStatus | null> {
+  const record = requestLedger.latestForAlexa(identity);
+  return record ? cancelRequestById(record.id) : null;
+}
+
+export async function replaceLatestAlexaRequest(identity: string, text: string): Promise<ListenerRequestSubmission> {
+  const current = requestLedger.latestForAlexa(identity);
+  if (current) {
+    const status = getListenerRequestStatus(current.id);
+    const decision = requestCancellationDecision(status);
+    if (decision === 'too-late') {
+      return { accepted: false, statusCode: 429, message: 'Your previous request is already playing or has finished.' };
+    }
+    if (decision === 'cancelable') {
+      const cancelled = await cancelRequestById(current.id);
+      if (cancelled?.phase !== 'cancelled') {
+        return { accepted: false, statusCode: 429, message: 'Your previous request could not be replaced because it has reached the player.' };
+      }
+    }
+  }
+  const identityKey = `alexa:${identity}`;
+  return submitListenerRequest({
+    text,
+    name: '',
+    ip: identityKey,
+    source: 'alexa',
+    alexaIdentity: identity,
+  });
+}
+
+/** Reconcile durable receipts with queue.json after queue.recover(). */
+export async function reconcileRequestLedger(): Promise<void> {
+  const known = new Set<string>();
+  for (const item of [...queue.upcoming, queue.current, ...queue.history]) {
+    if (item?.requestId) known.add(item.requestId);
+  }
+  await requestLedger.interruptUnresolved(known);
+}
+
 // Poll for the outcome of a submitted request.
 router.get('/request/:id', (req, res) => {
-  const entry = requests.get(req.params.id);
-  if (!entry) {
+  const status = getListenerRequestStatus(req.params.id);
+  if (status.status === 'unknown') {
     // Never existed, or pruned / lost to a restart; the UI stops polling.
     return res.status(404).json({ status: 'unknown' });
   }
-  res.json({
-    status: entry.status,
-    success: entry.status === 'resolved',
-    ack: entry.ack,
-    track: entry.track,
-    queuePosition: entry.queuePosition,
-    outcome: entry.outcome,
-    message: entry.message,
-  });
+  return res.json(status);
 });

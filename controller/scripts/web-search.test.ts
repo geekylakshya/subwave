@@ -310,3 +310,41 @@ test('malformed provider data becomes a typed failure and is never cached', asyn
   }
   assert.equal(calls, 2);
 });
+
+test('dispatcher honors every configured search provider without cross-provider fallback', async t => {
+  await settings.load();
+  const calls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    calls.push(`${url.origin}${url.pathname}`);
+    if (url.origin === 'https://api.tavily.com') {
+      return Response.json({ answer: 'Tavily answer', results: [{ title: 'Tavily', content: 'evidence' }] });
+    }
+    if (url.origin === 'https://api.search.brave.com') {
+      return Response.json({ web: { results: [{ title: 'Brave', description: 'evidence' }] } });
+    }
+    if (url.origin === 'https://api.duckduckgo.com') {
+      return Response.json({ AbstractText: 'DDG answer', RelatedTopics: [{ Text: 'evidence', FirstURL: 'https://example.test' }] });
+    }
+    // The real endpoints are intentionally replaced by the fixture response;
+    // the request shape still proves the selected dispatcher branch.
+    if (init?.method === 'POST') return Response.json({ answer: 'Tavily answer', results: [] });
+    return Response.json({ web: { results: [{ title: 'Brave', description: 'evidence' }] } });
+  });
+
+  await settings.update({ search: { provider: 'tavily', apiKey: 'fixture-key' } });
+  const tavily = await searchWeb(`provider-tavily-${Date.now()}`);
+  await settings.update({ search: { provider: 'brave', apiKey: 'fixture-key' } });
+  const brave = await searchWeb(`provider-brave-${Date.now()}`);
+  await settings.update({ search: { provider: 'duckduckgo' } });
+  const duck = await searchWeb(`provider-duck-${Date.now()}`);
+
+  assert.equal(tavily.answer, 'Tavily answer');
+  assert.equal(brave.results[0]?.title, 'Brave');
+  assert.equal(duck.answer, 'DDG answer');
+  assert.deepEqual(calls, [
+    'https://api.tavily.com/search',
+    'https://api.search.brave.com/res/v1/web/search',
+    'https://api.duckduckgo.com/',
+  ]);
+});

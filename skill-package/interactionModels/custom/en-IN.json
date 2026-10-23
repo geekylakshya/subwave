@@ -178,8 +178,10 @@
         {
           "name": "AnotherByArtistIntent",
           "samples": [
-            "another song by this artist",
-            "play another by this artist",
+            "another track from this artist",
+            "more songs from this artist",
+            "give me another from this artist",
+            "one more song by this artist",
             "same artist ka ek aur gaana",
             "is artist ka aur gaana bajao",
             "isi artist ka kuch aur chalao"

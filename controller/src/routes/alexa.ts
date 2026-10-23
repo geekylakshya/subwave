@@ -1,6 +1,5 @@
 import express from 'express';
-import { SkillBuilders, escapeXmlCharacters, type HandlerInput } from 'ask-sdk-core';
-import type { Response as AlexaResponse } from 'ask-sdk-model';
+import { SkillBuilders, escapeXmlCharacters } from 'ask-sdk-core';
 import { ExpressAdapter } from 'ask-sdk-express-adapter';
 import * as settings from '../settings.js';
 import { getStreamStatus } from '../broadcast/listeners.js';
@@ -43,7 +42,6 @@ import {
   submitListenerRequest,
   type ListenerRequestStatus,
 } from './request.js';
-import { addAlexaAplDirective, type AlexaAplTrack, type AlexaAplView } from '../alexa/presentation.js';
 
 const router = express.Router();
 const ALEXA_SKILL_ID_RE = /^amzn1\.ask\.skill\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -375,18 +373,16 @@ function stationName(runtime: AlexaRuntime): string {
   return runtime.getSettings().station.trim() || 'SUB/WAVE';
 }
 
-function inputLocale(input: HandlerInput): string {
+function inputLocale(input: any): string {
   return String(input.requestEnvelope?.request?.locale || 'en-IN');
 }
 
-function offlineResponse(input: HandlerInput, station = 'SUB/WAVE') {
+function offlineResponse(input: any) {
   const copy = messages(inputLocale(input));
-  return requestSpeech(input, copy.offline, {
-    kind: 'status',
-    heading: station,
-    message: copy.offline,
-    tone: 'warning',
-  }, station);
+  return input.responseBuilder
+    .speak(copy.offline)
+    .withShouldEndSession(true)
+    .getResponse();
 }
 
 function playbackStreamUrl(runtime: AlexaRuntime): string {
@@ -405,10 +401,10 @@ function playbackStreamUrl(runtime: AlexaRuntime): string {
   return `${current.streamUrl}${separator}auth=${encodeURIComponent(token)}`;
 }
 
-async function playResponse(input: HandlerInput, runtime: AlexaRuntime, opening: string) {
+async function playResponse(input: any, runtime: AlexaRuntime, opening: string) {
   const station = stationName(runtime);
   const streamUrl = playbackStreamUrl(runtime);
-  if (!runtime.isStreamOnline() || !streamUrl) return offlineResponse(input, station);
+  if (!runtime.isStreamOnline() || !streamUrl) return offlineResponse(input);
 
   let track: AlexaTrack | null = null;
   try {
@@ -433,7 +429,7 @@ async function playResponse(input: HandlerInput, runtime: AlexaRuntime, opening:
   return response.withShouldEndSession(true).getResponse();
 }
 
-function stopResponse(input: HandlerInput, message: string) {
+function stopResponse(input: any, message: string) {
   return input.responseBuilder
     .speak(message)
     .addAudioPlayerStopDirective()
@@ -441,29 +437,23 @@ function stopResponse(input: HandlerInput, message: string) {
     .getResponse();
 }
 
-function helpResponse(input: HandlerInput, station = 'SUB/WAVE') {
-  const responseBuilder = input.responseBuilder
+function helpResponse(input: any) {
+  return input.responseBuilder
     .speak(messages(inputLocale(input)).help)
-    .withShouldEndSession(false);
-  addAlexaAplDirective(input, responseBuilder, {
-    kind: 'help',
-    heading: station,
-    message: messages(inputLocale(input)).help,
-    examples: ['Ask what is playing', 'Request a song', 'Ask for request status'],
-  }, station);
-  return responseBuilder.getResponse();
+    .withShouldEndSession(false)
+    .getResponse();
 }
 
-function intentHandler(names: readonly string[], handle: (input: HandlerInput) => AlexaResponse | Promise<AlexaResponse>) {
+function intentHandler(names: readonly string[], handle: (input: any) => any) {
   return {
-    canHandle: (input: HandlerInput) =>
+    canHandle: (input: any) =>
       input.requestEnvelope.request.type === 'IntentRequest' &&
       names.includes(input.requestEnvelope.request.intent?.name),
     handle,
   };
 }
 
-function alexaUserId(input: HandlerInput): string {
+function alexaUserId(input: any): string {
   return String(
     input.requestEnvelope?.session?.user?.userId
       || input.requestEnvelope?.context?.System?.user?.userId
@@ -471,14 +461,18 @@ function alexaUserId(input: HandlerInput): string {
   ).trim();
 }
 
-function alexaPersonId(input: HandlerInput): string {
-  return String(input.requestEnvelope?.context?.System?.person?.personId || '').trim();
+function alexaPersonId(input: any): string {
+  return String(
+    input.requestEnvelope?.context?.System?.person?.personId
+      || input.requestEnvelope?.session?.user?.personId
+      || '',
+  ).trim();
 }
 
 // Person IDs are stable for Alexa's person-aware requests. When Alexa does not
 // provide one, keep the existing skill-scoped account fallback: the ledger
 // stores only its salted, non-reversible identity key.
-function alexaRequestIdentity(input: HandlerInput): string {
+function alexaRequestIdentity(input: any): string {
   const personId = alexaPersonId(input);
   return personId ? `person:${personId}` : alexaIdentityKey(alexaUserId(input) || 'unknown');
 }
@@ -497,45 +491,22 @@ function featureTrack(track: AlexaListenerTrack): AlexaTrack {
   };
 }
 
-function requestSpeech(
-  input: HandlerInput,
-  text: string,
-  view?: AlexaAplView,
-  station = 'SUB/WAVE',
-) {
-  const responseBuilder = input.responseBuilder
+function requestSpeech(input: any, text: string) {
+  return input.responseBuilder
     .speak(text)
-    .withShouldEndSession(true);
-  if (view) addAlexaAplDirective(input, responseBuilder, view, station);
-  return responseBuilder.getResponse();
-}
-
-function aplTrack(track: AlexaPresentationTrack): AlexaAplTrack {
-  return {
-    title: track.title,
-    artist: track.artist,
-    album: track.album || null,
-    artworkUrl: track.artworkUrl || null,
-  };
-}
-
-function aplStatus(
-  heading: string,
-  message: string,
-  tone: 'normal' | 'success' | 'warning' = 'normal',
-): AlexaAplView {
-  return { kind: 'status', heading, message, tone };
+    .withShouldEndSession(true)
+    .getResponse();
 }
 
 function dynamicSpeech(value: string | null | undefined, fallback: string): string {
   return value ? escapeXmlCharacters(value) : fallback;
 }
 
-function sessionAttributes(input: HandlerInput): Record<string, unknown> {
+function sessionAttributes(input: any): Record<string, unknown> {
   return input.attributesManager?.getSessionAttributes?.() || {};
 }
 
-function saveSessionAttributes(input: HandlerInput, attributes: Record<string, unknown>): void {
+function saveSessionAttributes(input: any, attributes: Record<string, unknown>): void {
   input.attributesManager?.setSessionAttributes?.(attributes);
 }
 
@@ -547,12 +518,12 @@ function isRequestCandidate(value: unknown): value is AlexaRequestCandidate {
     && typeof candidate.artist === 'string';
 }
 
-function requestCandidates(input: HandlerInput): AlexaRequestCandidate[] {
+function requestCandidates(input: any): AlexaRequestCandidate[] {
   const candidates = sessionAttributes(input).alexaRequestCandidates;
   return Array.isArray(candidates) ? candidates.filter(isRequestCandidate).slice(0, 3) : [];
 }
 
-function clearRequestClarification(input: HandlerInput): void {
+function clearRequestClarification(input: any): void {
   const attributes = sessionAttributes(input);
   delete attributes.alexaRequestCandidates;
   delete attributes.alexaRequestText;
@@ -570,7 +541,7 @@ function candidateTrack(candidate: AlexaRequestCandidate): AlexaTrack {
 }
 
 function clarificationResponse(
-  input: HandlerInput,
+  input: any,
   runtime: AlexaRuntime,
   candidate: AlexaRequestCandidate,
   remaining: AlexaRequestCandidate[],
@@ -584,16 +555,10 @@ function clarificationResponse(
     .speak(copy.candidate(trackSpeech(track)))
     .reprompt(copy.candidateReprompt)
     .withShouldEndSession(false);
-  addAlexaAplDirective(input, response, {
-    kind: 'track',
-    heading: 'Confirm request',
-    track: aplTrack(track),
-    supporting: 'Say yes to request this track or no to hear another match.',
-  }, stationName(runtime));
   return response.getResponse();
 }
 
-async function nowPlayingResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function nowPlayingResponse(input: any, runtime: AlexaRuntime) {
   const track = runtime.nowPlaying
     ? await runtime.nowPlaying()
     : await defaultRuntime().nowPlaying!();
@@ -601,14 +566,10 @@ async function nowPlayingResponse(input: HandlerInput, runtime: AlexaRuntime) {
   return requestSpeech(
     input,
     track ? copy.current(trackSpeech(track)) : copy.noCurrent,
-    track
-      ? { kind: 'track', heading: 'Now playing', track: aplTrack(track) }
-      : aplStatus('Now playing', copy.noCurrent, 'warning'),
-    stationName(runtime),
   );
 }
 
-async function upcomingResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function upcomingResponse(input: any, runtime: AlexaRuntime) {
   const tracks = runtime.upcoming
     ? await runtime.upcoming()
     : await defaultRuntime().upcoming!();
@@ -617,14 +578,10 @@ async function upcomingResponse(input: HandlerInput, runtime: AlexaRuntime) {
   return requestSpeech(
     input,
     next ? copy.next(trackSpeech(next)) : copy.noNext,
-    next
-      ? { kind: 'track', heading: 'Up next', track: aplTrack(next) }
-      : aplStatus('Up next', copy.noNext, 'warning'),
-    stationName(runtime),
   );
 }
 
-async function previousResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function previousResponse(input: any, runtime: AlexaRuntime) {
   const track = runtime.previous
     ? await runtime.previous()
     : await defaultRuntime().previous!();
@@ -632,14 +589,10 @@ async function previousResponse(input: HandlerInput, runtime: AlexaRuntime) {
   return requestSpeech(
     input,
     track ? copy.previous(trackSpeech(track)) : copy.noPrevious,
-    track
-      ? { kind: 'track', heading: 'Previous track', track: aplTrack(track) }
-      : aplStatus('Previous track', copy.noPrevious, 'warning'),
-    stationName(runtime),
   );
 }
 
-async function queuePreviewResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function queuePreviewResponse(input: any, runtime: AlexaRuntime) {
   const tracks = runtime.upcoming
     ? await runtime.upcoming()
     : await defaultRuntime().upcoming!();
@@ -648,22 +601,13 @@ async function queuePreviewResponse(input: HandlerInput, runtime: AlexaRuntime) 
   return requestSpeech(
     input,
     selected.length ? copy.nextMany(selected.map(trackSpeech).join(', ')) : copy.noNext,
-    selected.length
-      ? {
-          kind: 'list',
-          heading: 'Queue preview',
-          items: selected.map(aplTrack),
-        }
-      : aplStatus('Queue preview', copy.noNext, 'warning'),
-    stationName(runtime),
   );
 }
 
 type AlexaDetailType = 'album' | 'artist' | 'year' | 'genre' | 'language' | 'all';
 
-function detailType(input: HandlerInput): AlexaDetailType {
-  const request = input.requestEnvelope.request;
-  const value = String((request.type === 'IntentRequest' ? request.intent?.slots?.detailType?.value : '') || '')
+function detailType(input: any): AlexaDetailType {
+  const value = String(input.requestEnvelope?.request?.intent?.slots?.detailType?.value || '')
     .trim().toLocaleLowerCase();
   if (value === 'album' || value === 'artist' || value === 'year' || value === 'genre' || value === 'language') {
     return value;
@@ -672,7 +616,7 @@ function detailType(input: HandlerInput): AlexaDetailType {
 }
 
 function detailLabels(locale: string | null | undefined): { unavailable: string; all: string; labels: Record<AlexaDetailType, string> } {
-  if (String(locale || 'en-IN') === 'hi-IN') {
+  if (inputLocale({ requestEnvelope: { request: { locale } } }) === 'hi-IN') {
     return {
       unavailable: 'उपलब्ध नहीं',
       all: 'सारी जानकारी',
@@ -686,11 +630,7 @@ function detailLabels(locale: string | null | undefined): { unavailable: string;
   };
 }
 
-function detailEntries(
-  details: AlexaTrackDetails,
-  requested: AlexaDetailType,
-  locale: string | null | undefined,
-): Array<{ label: string; value: string }> {
+function detailFields(details: AlexaTrackDetails, requested: AlexaDetailType, locale: string | null | undefined): string {
   const labels = detailLabels(locale);
   const values: Record<Exclude<AlexaDetailType, 'all'>, string | null> = {
     album: details.album,
@@ -702,28 +642,11 @@ function detailEntries(
   const keys: Array<Exclude<AlexaDetailType, 'all'>> = requested === 'all'
     ? ['album', 'artist', 'year', 'genre', 'language']
     : [requested];
-  return keys.map(key => ({
-    label: labels.labels[key],
-    value: values[key] || labels.unavailable,
-  }));
-}
-
-function detailFields(details: AlexaTrackDetails, requested: AlexaDetailType, locale: string | null | undefined): string {
-  return detailEntries(details, requested, locale)
-    .map(entry => `${entry.label} "${escapeXmlCharacters(entry.value)}"`)
-    .join(', ');
-}
-
-function detailFieldValues(
-  details: AlexaTrackDetails,
-  requested: AlexaDetailType,
-  locale: string | null | undefined,
-): Array<{ label: string; value: string }> {
-  return detailEntries(details, requested, locale);
+  return keys.map(key => `${labels.labels[key]} ${values[key] ? `"${escapeXmlCharacters(values[key] as string)}"` : labels.unavailable}`).join(', ');
 }
 
 async function listenerFeatureRequestResponse(
-  input: HandlerInput,
+  input: any,
   runtime: AlexaRuntime,
   kind: 'moreLikeThis' | 'anotherByArtist',
 ) {
@@ -734,10 +657,10 @@ async function listenerFeatureRequestResponse(
       ? await listenerFeatures(runtime).moreLikeThis()
       : await listenerFeatures(runtime).anotherByArtist();
   } catch {
-    return requestSpeech(input, copy.featureFailed, aplStatus('Request', copy.featureFailed, 'warning'), stationName(runtime));
+    return requestSpeech(input, copy.featureFailed);
   }
-  if (result.kind === 'no-current') return requestSpeech(input, copy.noCurrent, aplStatus('Request', copy.noCurrent, 'warning'), stationName(runtime));
-  if (result.kind === 'no-match') return requestSpeech(input, copy.featureNoMatch, aplStatus('Request', copy.featureNoMatch, 'warning'), stationName(runtime));
+  if (result.kind === 'no-current') return requestSpeech(input, copy.noCurrent);
+  if (result.kind === 'no-match') return requestSpeech(input, copy.featureNoMatch);
 
   const candidate = result.value;
   const userId = alexaUserId(input) || 'unknown';
@@ -750,53 +673,41 @@ async function listenerFeatureRequestResponse(
       ? await runtime.submitRequest(requestText, userId, verified, personId)
       : await defaultRuntime().submitRequest!(requestText, userId, verified, personId);
   } catch {
-    return requestSpeech(input, copy.featureFailed, aplStatus('Request', copy.featureFailed, 'warning'), stationName(runtime));
+    return requestSpeech(input, copy.featureFailed);
   }
   if (!submitted.accepted) {
-    const message = dynamicSpeech(submitted.message || submitted.error, copy.featureFailed);
-    return requestSpeech(input, message, aplStatus('Request', message, 'warning'), stationName(runtime));
+    return requestSpeech(input, dynamicSpeech(submitted.message || submitted.error, copy.featureFailed));
   }
   return requestSpeech(
     input,
     kind === 'moreLikeThis'
       ? copy.moreLikeThis(trackSpeech(featureTrack(candidate)))
       : copy.anotherByArtist(escapeXmlCharacters(candidate.artist)),
-    {
-      kind: 'track',
-      heading: kind === 'moreLikeThis' ? 'More like this' : 'Another by this artist',
-      track: aplTrack(featureTrack(candidate)),
-      supporting: 'The request was sent to the booth.',
-    },
-    stationName(runtime),
   );
 }
 
-async function recentTracksResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function recentTracksResponse(input: any, runtime: AlexaRuntime) {
   const copy = messages(inputLocale(input));
   try {
     const tracks = await listenerFeatures(runtime).recentTracks();
     return requestSpeech(input, tracks.length
       ? copy.recent(tracks.map(track => trackSpeech(featureTrack(track))).join(', '))
-      : copy.recentEmpty,
-    tracks.length
-      ? { kind: 'list', heading: 'Recently played', items: tracks.map(track => aplTrack(featureTrack(track))) }
-      : aplStatus('Recently played', copy.recentEmpty, 'warning'),
-    stationName(runtime));
+      : copy.recentEmpty);
   } catch {
-    return requestSpeech(input, copy.recentEmpty, aplStatus('Recently played', copy.recentEmpty, 'warning'), stationName(runtime));
+    return requestSpeech(input, copy.recentEmpty);
   }
 }
 
-async function trackDetailsResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function trackDetailsResponse(input: any, runtime: AlexaRuntime) {
   const copy = messages(inputLocale(input));
   let result;
   try {
     result = await listenerFeatures(runtime).trackDetails();
   } catch {
-    return requestSpeech(input, copy.featureFailed, aplStatus('Track details', copy.featureFailed, 'warning'), stationName(runtime));
+    return requestSpeech(input, copy.featureFailed);
   }
-  if (result.kind === 'no-current') return requestSpeech(input, copy.noCurrent, aplStatus('Track details', copy.noCurrent, 'warning'), stationName(runtime));
-  if (result.kind === 'no-match') return requestSpeech(input, copy.featureNoMatch, aplStatus('Track details', copy.featureNoMatch, 'warning'), stationName(runtime));
+  if (result.kind === 'no-current') return requestSpeech(input, copy.noCurrent);
+  if (result.kind === 'no-match') return requestSpeech(input, copy.featureNoMatch);
   const requested = detailType(input);
   const labels = detailLabels(inputLocale(input));
   const details = result.value;
@@ -807,17 +718,10 @@ async function trackDetailsResponse(input: HandlerInput, runtime: AlexaRuntime) 
       labels.labels[requested],
       detailFields(details, requested, inputLocale(input)),
     ),
-    {
-      kind: 'details',
-      heading: labels.labels[requested],
-      track: aplTrack(details),
-      fields: detailFieldValues(details, requested, inputLocale(input)),
-    },
-    stationName(runtime),
   );
 }
 
-async function currentShowResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function currentShowResponse(input: any, runtime: AlexaRuntime) {
   const copy = messages(inputLocale(input));
   let show: AlexaCurrentShow | null = null;
   try {
@@ -827,29 +731,21 @@ async function currentShowResponse(input: HandlerInput, runtime: AlexaRuntime) {
     // when schedule state is unavailable instead of inventing a programme.
   }
   if (!show?.name) {
-    const message = copy.noShow(show?.dj ? escapeXmlCharacters(show.dj) : null);
-    return requestSpeech(input, message, aplStatus('Current show', message, 'warning'), stationName(runtime));
+    return requestSpeech(input, copy.noShow(show?.dj ? escapeXmlCharacters(show.dj) : null));
   }
   const dj = dynamicSpeech(show.dj, 'the DJ');
   const guests = (Array.isArray(show.guests) ? show.guests : [])
     .map(guest => escapeXmlCharacters(guest)).join(', ');
-  return requestSpeech(input, copy.currentShow(escapeXmlCharacters(show.name), dj, guests), {
-    kind: 'show',
-    heading: 'Current show',
-    name: show.name,
-    dj: show.dj,
-    guests: show.guests,
-  }, stationName(runtime));
+  return requestSpeech(input, copy.currentShow(escapeXmlCharacters(show.name), dj, guests));
 }
 
-async function requestSongResponse(input: HandlerInput, runtime: AlexaRuntime) {
-  const request = input.requestEnvelope.request;
-  const rawText = String((request.type === 'IntentRequest' ? request.intent?.slots?.requestText?.value : '') || '').trim();
+async function requestSongResponse(input: any, runtime: AlexaRuntime) {
+  const rawText = String(input.requestEnvelope.request.intent?.slots?.requestText?.value || '').trim();
   const parsed = listenerRequestSchema.safeParse({ text: rawText, name: '' });
   const copy = messages(inputLocale(input));
   clearRequestClarification(input);
   if (!parsed.success) {
-    return requestSpeech(input, copy.requestPrompt, aplStatus('Song request', copy.requestPrompt, 'warning'), stationName(runtime));
+    return requestSpeech(input, copy.requestPrompt);
   }
   if (runtime.previewRequest) {
     try {
@@ -868,21 +764,20 @@ async function requestSongResponse(input: HandlerInput, runtime: AlexaRuntime) {
     ? await runtime.submitRequest(parsed.data.text, userId, undefined, personId)
     : await defaultRuntime().submitRequest!(parsed.data.text, userId, undefined, personId);
   if (result.accepted) {
-    return requestSpeech(input, copy.requestAccepted, aplStatus('Song request', copy.requestAccepted, 'success'), stationName(runtime));
+    return requestSpeech(input, copy.requestAccepted);
   }
-  const message = dynamicSpeech(result.message || result.error, copy.requestFailed);
-  return requestSpeech(input, message, aplStatus('Song request', message, 'warning'), stationName(runtime));
+  return requestSpeech(input, dynamicSpeech(result.message || result.error, copy.requestFailed));
 }
 
-async function confirmationResponse(input: HandlerInput, runtime: AlexaRuntime, confirmed: boolean) {
+async function confirmationResponse(input: any, runtime: AlexaRuntime, confirmed: boolean) {
   const candidates = requestCandidates(input);
-  if (!candidates.length) return helpResponse(input, stationName(runtime));
+  if (!candidates.length) return helpResponse(input);
   const copy = messages(inputLocale(input));
   if (!confirmed) {
     const [, ...remaining] = candidates;
     if (!remaining.length) {
       clearRequestClarification(input);
-      return requestSpeech(input, copy.candidateNo, aplStatus('Song request', copy.candidateNo), stationName(runtime));
+      return requestSpeech(input, copy.candidateNo);
     }
     const [next, ...rest] = remaining;
     return clarificationResponse(input, runtime, next, rest);
@@ -896,8 +791,7 @@ async function confirmationResponse(input: HandlerInput, runtime: AlexaRuntime, 
   const result = runtime.submitRequest
     ? await runtime.submitRequest(text, userId, undefined, personId)
     : await defaultRuntime().submitRequest!(text, userId, undefined, personId);
-  const message = result.accepted ? copy.requestAccepted : dynamicSpeech(result.message || result.error, copy.requestFailed);
-  return requestSpeech(input, message, aplStatus('Song request', message, result.accepted ? 'success' : 'warning'), stationName(runtime));
+  return requestSpeech(input, result.accepted ? copy.requestAccepted : dynamicSpeech(result.message || result.error, copy.requestFailed));
 }
 
 function statusSpeech(status: ListenerRequestStatus | null, locale?: string | null): string {
@@ -930,7 +824,7 @@ function statusSpeech(status: ListenerRequestStatus | null, locale?: string | nu
   }
 }
 
-async function requestStatusResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function requestStatusResponse(input: any, runtime: AlexaRuntime) {
   const identity = alexaRequestIdentity(input);
   const status = runtime.latestRequestStatus
     ? await runtime.latestRequestStatus(identity)
@@ -938,53 +832,40 @@ async function requestStatusResponse(input: HandlerInput, runtime: AlexaRuntime)
   return requestSpeech(
     input,
     statusSpeech(status, inputLocale(input)),
-    aplStatus('Request status', statusSpeech(status, inputLocale(input))),
-    stationName(runtime),
   );
 }
 
-async function cancelRequestResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function cancelRequestResponse(input: any, runtime: AlexaRuntime) {
   const identity = alexaRequestIdentity(input);
   const status = runtime.cancelRequest
     ? await runtime.cancelRequest(identity)
     : await defaultRuntime().cancelRequest!(identity);
   const copy = messages(inputLocale(input));
-  if (!status) return requestSpeech(input, copy.cancelEmpty, aplStatus('Cancel request', copy.cancelEmpty, 'warning'), stationName(runtime));
+  if (!status) return requestSpeech(input, copy.cancelEmpty);
   if (status.phase === 'cancelled') {
-    const message = copy.cancelSuccess(dynamicSpeech(status.track?.title, 'song'));
-    return requestSpeech(input, message, aplStatus('Cancel request', message, 'success'), stationName(runtime));
+    return requestSpeech(input, copy.cancelSuccess(dynamicSpeech(status.track?.title, 'song')));
   }
-  return requestSpeech(input, copy.cancelTooLate, aplStatus('Cancel request', copy.cancelTooLate, 'warning'), stationName(runtime));
+  return requestSpeech(input, copy.cancelTooLate);
 }
 
-async function replaceRequestResponse(input: HandlerInput, runtime: AlexaRuntime) {
-  const request = input.requestEnvelope.request;
-  const rawText = String((request.type === 'IntentRequest' ? request.intent?.slots?.requestText?.value : '') || '').trim();
+async function replaceRequestResponse(input: any, runtime: AlexaRuntime) {
+  const rawText = String(input.requestEnvelope.request.intent?.slots?.requestText?.value || '').trim();
   const parsed = listenerRequestSchema.safeParse({ text: rawText, name: '' });
   const copy = messages(inputLocale(input));
-  if (!parsed.success) return requestSpeech(input, copy.replacePrompt, aplStatus('Replace request', copy.replacePrompt, 'warning'), stationName(runtime));
+  if (!parsed.success) return requestSpeech(input, copy.replacePrompt);
   const identity = alexaRequestIdentity(input);
   const result = runtime.replaceRequest
     ? await runtime.replaceRequest(identity, parsed.data.text)
     : await defaultRuntime().replaceRequest!(identity, parsed.data.text);
-  const message = result.accepted ? copy.replaceAccepted : dynamicSpeech(result.message || result.error, copy.requestFailed);
   return requestSpeech(
     input,
-    message,
-    aplStatus('Replace request', message, result.accepted ? 'success' : 'warning'),
-    stationName(runtime),
+    result.accepted ? copy.replaceAccepted : dynamicSpeech(result.message || result.error, copy.requestFailed),
   );
 }
 
-async function stationStatusResponse(input: HandlerInput, runtime: AlexaRuntime) {
+async function stationStatusResponse(input: any, runtime: AlexaRuntime) {
   const copy = messages(inputLocale(input));
-  const online = runtime.isStreamOnline();
-  return requestSpeech(
-    input,
-    online ? copy.stationOnline : copy.stationOffline,
-    aplStatus('Station status', online ? copy.stationOnline : copy.stationOffline, online ? 'success' : 'warning'),
-    stationName(runtime),
-  );
+  return requestSpeech(input, runtime.isStreamOnline() ? copy.stationOnline : copy.stationOffline);
 }
 
 /**
@@ -999,7 +880,7 @@ export function createAlexaSkill(runtime: AlexaRuntime = defaultRuntime()) {
   const builder = SkillBuilders.custom().withSkillId(configured.skillId || '__disabled__');
 
   return builder
-    .addRequestHandler('LaunchRequest', (input: HandlerInput) => playResponse(input, runtime, messages(inputLocale(input)).starting))
+    .addRequestHandler('LaunchRequest', (input: any) => playResponse(input, runtime, messages(inputLocale(input)).starting))
     .addRequestHandlers(
       intentHandler(['RequestSongIntent'], input => requestSongResponse(input, runtime)),
       intentHandler(['AMAZON.YesIntent'], input => confirmationResponse(input, runtime, true)),
@@ -1028,27 +909,24 @@ export function createAlexaSkill(runtime: AlexaRuntime = defaultRuntime()) {
       intentHandler(['AMAZON.StopIntent'], input =>
         stopResponse(input, messages(inputLocale(input)).stopped)),
       intentHandler(['AMAZON.CancelIntent'], input => cancelRequestResponse(input, runtime)),
-      intentHandler(['AMAZON.HelpIntent'], (input: HandlerInput) =>
-        helpResponse(input, stationName(runtime))),
-      intentHandler(['AMAZON.FallbackIntent'], (input: HandlerInput) =>
-        helpResponse(input, stationName(runtime))),
+      intentHandler(['AMAZON.HelpIntent'], (input: any) =>
+        helpResponse(input)),
+      intentHandler(['AMAZON.FallbackIntent'], (input: any) =>
+        helpResponse(input)),
       {
-        canHandle: (input: HandlerInput) => input.requestEnvelope.request.type === 'SessionEndedRequest',
+        canHandle: (input: any) => input.requestEnvelope.request.type === 'SessionEndedRequest',
         handle: () => ({}),
       },
-      intentHandler(['AMAZON.NavigateHomeIntent'], (input: HandlerInput) =>
+      intentHandler(['AMAZON.NavigateHomeIntent'], (input: any) =>
         stopResponse(input, messages(inputLocale(input)).stopped)),
       {
-        canHandle: (input: HandlerInput) => input.requestEnvelope.request.type === 'IntentRequest',
-        handle: (input: HandlerInput) => helpResponse(input, stationName(runtime)),
+        canHandle: (input: any) => input.requestEnvelope.request.type === 'IntentRequest',
+        handle: (input: any) => helpResponse(input),
       },
     )
     .addErrorHandler(
       () => true,
-      (input: HandlerInput) => {
-        const message = messages(inputLocale(input)).error;
-        return requestSpeech(input, message, aplStatus('Error', message, 'warning'), stationName(runtime));
-      },
+      (input: any) => requestSpeech(input, messages(inputLocale(input)).error),
     )
     .create();
 }

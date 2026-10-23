@@ -451,6 +451,21 @@ test('a Punjabi genre tag can satisfy the overlapping Punjabi language request',
   assert.equal(r.outcome, 'matched');
 });
 
+test('an untagged genre can use explicit title or album evidence from local search', async () => {
+  const punjabi = { ...filler, id: 'punjabi-title', title: 'Punjabi Wedding Song', album: 'Hasee Toh Phasee' };
+  const f = fixture({
+    getGenres: async () => [],
+    getSongsByGenreSampled: async () => [],
+    searchPage: async query => /punjabi/i.test(query) ? { songs: [punjabi], rawCount: 1 } : { songs: [], rawCount: 0 },
+  });
+  const r = await resolveDirectRequest(
+    { genre: 'Punjabi', language: 'Punjabi', scope: 'song' },
+    { ...f.deps, text: 'play some Punjabi music' },
+  );
+  assert.equal(r.track?.id, punjabi.id);
+  assert.equal(r.outcome, 'matched');
+});
+
 test('a named Punjabi recording can use Punjabi genre metadata when language metadata is an ISO code', async () => {
   const punjabi = { ...exact, id: 'punjabi-named', title: 'Punjabi Song', artist: 'Punjabi Artist', genre: 'Punjabi Pop', language: 'pa' };
   const f = fixture({
@@ -727,6 +742,40 @@ test('ambiguous fuzzy title matching returns alternatives instead of guessing', 
   assert.equal(result.track, null);
   assert.equal(result.outcome, 'no-match');
   assert.equal(result.alternatives?.length, 2);
+});
+
+for (const typo of ['choor bazari', 'chhor bazari']) {
+  test(`a multi-word title typo uses local fuzzy candidates without fallback: ${typo}`, async () => {
+    const wanted = { id: 'chor-bazaari', title: 'Chor Bazaari', artist: 'Sunidhi Chauhan & Neeraj Shridhar' };
+    const f = fixture({
+      searchPage: async () => ({ songs: [], rawCount: 0 }),
+      fuzzySearch: async () => [wanted],
+    });
+    const result = await resolveDirectRequest(
+      { title: typo, artist: null, search_terms: [typo], scope: 'song' },
+      { ...f.deps, exactOnly: true },
+    );
+    assert.equal(result.track?.id, wanted.id);
+    assert.equal(result.outcome, 'matched');
+    assert.equal(f.fallbackCalls(), 0);
+  });
+}
+
+test('same-title local fuzzy collisions remain no-match instead of guessing', async () => {
+  const first = { id: 'chor-a', title: 'Chor Bazaari', artist: 'Sunidhi Chauhan & Neeraj Shridhar' };
+  const second = { id: 'chor-b', title: 'Chor Bazaari', artist: 'Other Artist' };
+  const f = fixture({
+    searchPage: async () => ({ songs: [], rawCount: 0 }),
+    fuzzySearch: async () => [first, second],
+  });
+  const result = await resolveDirectRequest(
+    { title: 'choor bazari', artist: null, search_terms: ['choor bazari'], scope: 'song' },
+    { ...f.deps, exactOnly: true },
+  );
+  assert.equal(result.track, null);
+  assert.equal(result.outcome, 'no-match');
+  assert.equal(result.alternatives?.length, 2);
+  assert.equal(f.fallbackCalls(), 0);
 });
 
 test('energy is a soft preference for named tracks and a selectable pool for generic requests', async () => {

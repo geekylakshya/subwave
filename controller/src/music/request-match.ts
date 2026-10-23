@@ -91,6 +91,10 @@ export interface RankedRequestCandidate {
 
 export interface RequestCatalog {
   searchPage(query: string, options: { songCount: number; songOffset: number; signal?: AbortSignal }): Promise<{ songs: RequestSong[]; rawCount: number }>;
+  // Local catalogue candidates used after exact/token search misses. This is
+  // intentionally optional so resolver tests and non-library callers can
+  // retain the existing Navidrome-only behaviour.
+  fuzzySearch?(query: string, options?: { signal?: AbortSignal }): Promise<RequestSong[]>;
   resolveArtist(name: string, options?: { signal?: AbortSignal }): Promise<{ id: string; name?: string } | null>;
   getArtist(id: string, options?: { signal?: AbortSignal }): Promise<{ album?: Array<{ id: string; name?: string; title?: string; year?: number; originalReleaseDate?: { year?: number; month?: number; day?: number }; releaseDate?: string }> } | null>;
   getAlbum(id: string, options?: { signal?: AbortSignal }): Promise<RequestSong[]>;
@@ -922,9 +926,22 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   const genreMatches = (song: RequestSong) => !match.genre || tags(song).some(g => requestGenreMatches(genre || match.genre!, g));
   const languageMatches = (song: RequestSong) => !match.language
     || [song.language, ...(song.languages || []), ...tags(song)].some(value => requestLanguageTagMatches(match.language!, String(value ?? '')));
+  // Some Navidrome libraries have useful language/scene evidence in the
+  // recording or album name but no genre tags at all. A search result is
+  // eligible for the attribute lane only when the requested term is present
+  // in that metadata; this never turns an arbitrary pool track into evidence
+  // and keeps named-song verification strict.
+  const attributeNameEvidence = (song: RequestSong, value: string | null | undefined): boolean => {
+    if (!value) return false;
+    const fields = [song.title, song.album].flatMap(requestNameVariants).filter(Boolean);
+    return requestNameVariants(value).some(term => fields.some(field => field === term || ` ${field} `.includes(` ${term} `)));
+  };
+  const attributeEvidenceMatches = (song: RequestSong) =>
+    (!requiredGenre || genreMatches(song) || attributeNameEvidence(song, match.genre))
+    && (!requiredLanguage || languageMatches(song) || attributeNameEvidence(song, match.language));
   const constraints = (song: RequestSong, source: string) =>
-    (!requiredGenre || (genre && source === `genre:${genre}`) || genreMatches(song))
-    && (!requiredLanguage || (languageGenre && source === `language-genre:${languageGenre}`) || languageMatches(song));
+    (!requiredGenre || (genre && source === `genre:${genre}`) || genreMatches(song) || (source === 'attribute-search' && attributeEvidenceMatches(song)))
+    && (!requiredLanguage || (languageGenre && source === `language-genre:${languageGenre}`) || languageMatches(song) || (source === 'attribute-search' && attributeEvidenceMatches(song)));
   const eligible = (song: RequestSong) => !recentIds.has(song.id) && !queuedIds.has(song.id) && song.id !== currentId;
   const unique = (songs: RequestSong[]) => [...new Map(songs.filter(s => s?.id).map(s => [s.id, s])).values()];
   const choose = (songs: RequestSong[]) => {
@@ -961,7 +978,12 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     }));
     const top = scored[0];
     const margin = top && scored[1] ? top.confidence - scored[1].confidence : 1;
-    if (!top || top.confidence < 0.92 || margin < 0.08) return null;
+    // A title-only request has no artist signal to contribute, so one speech
+    // recognition typo can land just below the explicit title+artist floor.
+    // Keep a meaningful title threshold and the same ambiguity margin; a
+    // collision therefore remains a no-match rather than becoming a guess.
+    const minimumConfidence = resolvedArtistName ? 0.92 : 0.88;
+    if (!top || top.confidence < minimumConfidence || margin < 0.08) return null;
     return {
       track: top.song,
       source: `${source}:fuzzy`,
@@ -1027,6 +1049,15 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
       if (heldExact) return heldExact;
       const fuzzy = selectFuzzy(searched, 'search');
       if (fuzzy) return fuzzy;
+      // Navidrome's token search is intentionally bounded and may miss a
+      // misspelled multi-word title entirely. Ask the local catalogue for a
+      // bounded candidate set before any artist/pool fallback. The verifier
+      // above still owns title/artist similarity and ambiguity decisions.
+      if (catalog.fuzzySearch) {
+        const local = await safe('local fuzzy search', () => catalog.fuzzySearch!(title!, { signal: deps.signal }), []);
+        const localFuzzy = selectFuzzy(local, 'local-fuzzy');
+        if (localFuzzy) return localFuzzy;
+      }
     // "One Crowded Hour - Augie March" reads either way round. The other
     // reading counts only on catalogue proof of both its title and artist.
     if (match.reversible && artistName) {
@@ -1173,6 +1204,18 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     }
     if (match.energy) {
       const result = select(energyPool, `library-energy:${match.energy}`);
+      if (result) return result;
+    }
+    // A genre/language may be absent from Navidrome's genre index even though
+    // searchable recordings carry the term in their title or album. Search
+    // each requested attribute and let the same hard-constraint verifier
+    // accept only evidence-bearing rows.
+    if (match.genre || match.language) {
+      const attributeCandidates = unique((await Promise.all(
+        [match.genre, match.language].filter((value): value is string => !!value)
+          .map(value => safe(`attribute search:${value}`, () => search(value), [])),
+      )).flat());
+      const result = select(attributeCandidates, 'attribute-search');
       if (result) return result;
     }
     const constrainedRefusal = refusal();

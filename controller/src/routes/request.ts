@@ -28,7 +28,7 @@ import {
 } from '../middleware/ratelimit.js';
 import { validatePublicBody } from '../middleware/validate.js';
 import { listenerRequestSchema } from '../schemas/request.js';
-import { classifyListenerRequest, directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
+import { classifyListenerRequest, directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, requestTitleSimilarity, resolveDirectRequest } from '../music/request-match.js';
 import { resolveNamedAlias } from '../music/request-alias.js';
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
@@ -518,6 +518,16 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     // a broad instruction ("surprise me"), so a local miss must still reach
     // interpretation instead of being frozen into the wrong identity.
     && literal.title!.trim().split(/\s+/u).length === 1;
+  // A multi-word title-only request is still an identity claim once the
+  // literal parser has ruled out attributes and conversational frames. It may
+  // use interpretation for repair, but a miss must never become an unrelated
+  // fallback track.
+  const titleOnlyNamedRequest = !lyricLike
+    && literal.kind === 'track'
+    && Boolean(literal.title?.trim())
+    && !literal.artist && !literal.album
+    && !literal.genre && !literal.language && !literal.mood && !literal.energy
+    && !/^(?:hello|hi|hey|surprise|anything|something|music)(?:\s+(?:me|dj|radio|there|subwave|chill\s+zone))?[.!?]*$/iu.test(literal.title!.trim());
   const explicitNoMatchCue = /\b(?:no\s+such|doesn['’]?t\s+exist|does\s+not\s+exist|not\s+in\s+(?:the\s+)?(?:library|catalog(?:ue)?))\b/iu.test(literal.title || '');
   // A framed, unquoted multi-word name is still an identity claim when no
   // artist/attribute is present. Keep a miss honest instead of letting a model
@@ -640,6 +650,12 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     // invent an artist that would widen the lookup.
     matched = { ...matched, kind: 'track', title: literal.title, artist: null, album: null, scope: 'song', literal: false, titleOnly: true };
   }
+  // The literal wording alone is not enough to harden an ambiguous phrase:
+  // the existing interpreter may have verified an artist-led request such as
+  // "Queen Bohemian Rhapsody", which intentionally retains the alternative
+  // policy. A title-only identity with no artist, however, is a named song
+  // and must never enter the unrelated fallback pool.
+  const exactTitleOnlyRequest = titleOnlyNamedRequest && !matched.artist?.trim();
   const unsupported = directRequestUnsupported(text, matched);
   if (unsupported.length) {
     entry.path = 'cascade';
@@ -700,6 +716,33 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
         searches.push({ term, hits: page.songs });
         return page;
       },
+      fuzzySearch: async (term, options = {}) => {
+        await library.load();
+        throwIfRequestResolutionAborted(options.signal);
+        // Keep the database walk local and bounded. Candidate ranking remains
+        // in request-match; this prefilter only avoids handing the resolver
+        // the entire library and excludes blocked rows at the source.
+        return library.candidateFilterTracks()
+          .filter(row => row.title)
+          .map(row => ({
+            row,
+            score: requestTitleSimilarity(term, row.title),
+          }))
+          .filter(candidate => candidate.score >= 0.60)
+          .sort((a, b) => b.score - a.score || a.row.id.localeCompare(b.row.id))
+          .slice(0, 250)
+          .filter(({ row }) => !library.isBlockedId(row.id))
+          .slice(0, 100)
+          .map(({ row }) => ({
+            id: row.id,
+            title: row.title ?? undefined,
+            artist: row.artist ?? undefined,
+            genres: row.genres,
+            genre: row.genre ?? undefined,
+            moods: row.moods,
+            energy: row.energy,
+          }));
+      },
     },
     choose: pool => {
       const isStandIn = matchedRequestStandIn(named, {
@@ -717,7 +760,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     recentIds: cdMin > 0 ? queue.recentlyPlayedIds(cdMin / 60) : new Set<string>(),
     queuedIds: queue.queuedIds(),
     currentId: queue.current?.track?.id,
-    exactOnly: explicitNamedRequest || likelyShortTitle || forcedNamedTitle,
+    exactOnly: explicitNamedRequest || likelyShortTitle || exactTitleOnlyRequest || forcedNamedTitle,
     signal,
     moodSongs: async mood => { await library.load(); return library.songsByMood(mood); },
     energySongs: async energy => { await library.load(); return library.songsByEnergy(energy); },

@@ -208,13 +208,16 @@ function hasWebEvidence(web: WebSearchResponse): boolean {
   return !!String(web.answer || '').trim() || !!web.results?.length;
 }
 
-function hasUsableLyricEvidence(reference: string, web: WebSearchResponse): boolean {
+function hasUsableLyricEvidence(web: WebSearchResponse): boolean {
   if (!hasWebEvidence(web)) return false;
-  const requested = requestName(reference).split(' ').filter(word => word.length >= 4);
-  const evidence = requestName(webBlob(web, 5000));
-  const overlap = new Set(requested.filter(word => evidence.includes(word))).size;
-  return extractLyricTrackHints(web).length > 0
-    || overlap >= Math.min(4, Math.max(3, Math.ceil(requested.length * 0.35)));
+  // A lyric mirror can echo enough of the submitted verse to pass a raw word
+  // overlap check while still omitting every title/artist credit (Scribd and
+  // generic lyric-finder pages do this frequently). Treat that as incomplete
+  // evidence so the bounded second fragment and, later, the title/artist
+  // follow-up get a chance to establish identity. A model can still use the
+  // returned lyric text; this gate only controls whether we spend the next
+  // search on a more identifying query.
+  return extractLyricTrackHints(web).length > 0;
 }
 
 async function lyricWebEvidence(reference: string, budget: EvidenceSearchBudget): Promise<WebSearchResponse> {
@@ -228,7 +231,7 @@ async function lyricWebEvidence(reference: string, budget: EvidenceSearchBudget)
     ? lyricSearchQuery(reference, null, 'tail', hasRepeatedPhraseCue ? 'lyrics song artist' : 'lyrics')
     : shortLyricSearchQuery(reference);
   const first = await budget.search(firstQuery);
-  if (hasUsableLyricEvidence(reference, first)) return first;
+  if (hasUsableLyricEvidence(first)) return first;
 
   // Only an unusable first fragment earns a second, distinct fragment.
   // Provider failures throw and stop here; they are not identification misses.
@@ -383,8 +386,11 @@ export default definePickerTool({
         // A noisy meta-search response can contain the lyric but omit the
         // credit. A bounded title-and-artist follow-up gives the same provider
         // a better query before we decide the local library has no match.
-        if (!guess.artist && !webArtistHints(blob, guess.title, guess.keyword).length) {
-          const followUp = await searchBudget.search(String(guess.title) + ' song artist');
+        if (!evidenceSupportsGuess(guess, blob)) {
+          const identityQuery = [guess.title, guess.artist]
+            .filter((value): value is string => !!value && value.trim().length > 0)
+            .join(' ');
+          const followUp = await searchBudget.search(`${identityQuery} song artist`);
           const extra = webBlob(followUp, 3000);
           if (extra) blob = (blob + '\n' + extra).slice(0, 8000);
         }

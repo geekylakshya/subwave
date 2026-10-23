@@ -345,6 +345,16 @@ test('an explicit named miss is reported without silently substituting another t
   assert.doesNotMatch(result.ack || '', /alternative|Freddie|Queen/);
 });
 
+test('a framed impossible title is not mistaken for lyric evidence and substituted', async () => {
+  searchEmpty = true;
+  const result = await submit('play qzxv no such recording 918273');
+  assert.equal(result.outcome, 'no-match');
+  assert.equal(result.track, null);
+  assert.equal(queue.upcoming.length, 0);
+  assert.equal(agentCalls, 0);
+  assert.equal(bodies.length, 0);
+});
+
 test('chat responses do not queue a track', async () => {
   modelOutput = { kind: 'chat', ack: 'Hello from the booth.' };
   const result = await submit('Hello DJ');

@@ -1,0 +1,486 @@
+{
+  "type": "APL",
+  "version": "1.9",
+  "theme": "dark",
+  "import": [
+    {
+      "name": "alexa-layouts",
+      "version": "1.7.0"
+    }
+  ],
+  "mainTemplate": {
+    "parameters": [
+      "payload"
+    ],
+    "items": [
+      {
+        "type": "Container",
+        "width": "100%",
+        "height": "100%",
+        "items": [
+          {
+            "type": "AlexaBackground",
+            "backgroundColor": "${payload.subwaveData.properties.backgroundColor}",
+            "backgroundImageSource": "${payload.subwaveData.properties.backgroundImage}",
+            "backgroundScale": "best-fill",
+            "backgroundBlur": true,
+            "colorOverlay": true,
+            "overlayGradient": true,
+            "overlayNoise": true
+          },
+          {
+            "type": "Container",
+            "when": "${payload.subwaveData.properties.viewportClass == 'round'}",
+            "width": "100%",
+            "height": "100%",
+            "items": [
+              {
+                "type": "Container",
+                "when": "${payload.subwaveData.properties.isTiny}",
+                "width": "100%",
+                "height": "100%",
+                "padding": "8dp",
+                "alignItems": "center",
+                "justifyContent": "center",
+                "items": [
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.primary || payload.subwaveData.properties.message}",
+                    "color": "${payload.subwaveData.properties.textColor}",
+                    "fontSize": "14dp",
+                    "fontWeight": 700,
+                    "maxLines": 2,
+                    "textAlign": "center"
+                  }
+                ]
+              },
+              {
+                "type": "Container",
+                "when": "${payload.subwaveData.properties.isSmall && payload.subwaveData.properties.isTiny != true}",
+                "width": "100%",
+                "height": "100%",
+                "padding": "12dp",
+                "alignItems": "center",
+                "justifyContent": "center",
+                "items": [
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.primary || payload.subwaveData.properties.message}",
+                    "color": "${payload.subwaveData.properties.textColor}",
+                    "fontSize": "18dp",
+                    "fontWeight": 700,
+                    "maxLines": 2,
+                    "textAlign": "center"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.secondary}",
+                    "color": "${payload.subwaveData.properties.mutedColor}",
+                    "fontSize": "14dp",
+                    "maxLines": 1,
+                    "textAlign": "center"
+                  }
+                ]
+              },
+              {
+                "type": "Container",
+                "when": "${payload.subwaveData.properties.isSmall != true}",
+                "width": "100%",
+                "height": "100%",
+                "paddingLeft": "48dp",
+                "paddingRight": "48dp",
+                "paddingTop": "36dp",
+                "paddingBottom": "36dp",
+                "alignItems": "center",
+                "justifyContent": "center",
+                "items": [
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.station}",
+                    "color": "${payload.subwaveData.properties.accentColor}",
+                    "fontSize": "18dp",
+                    "fontWeight": 700,
+                    "letterSpacing": "2dp",
+                    "maxLines": 1,
+                    "textAlign": "center"
+                  },
+                  {
+                    "type": "Image",
+                    "when": "${payload.subwaveData.properties.artwork}",
+                    "source": "${payload.subwaveData.properties.artwork}",
+                    "width": "46%",
+                    "height": "46%",
+                    "scale": "best-fill"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.primary || payload.subwaveData.properties.message}",
+                    "color": "${payload.subwaveData.properties.textColor}",
+                    "fontSize": "28dp",
+                    "fontWeight": 700,
+                    "maxLines": 2,
+                    "textAlign": "center",
+                    "textAlignVertical": "center",
+                    "marginTop": "18dp"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.secondary}",
+                    "color": "${payload.subwaveData.properties.mutedColor}",
+                    "fontSize": "20dp",
+                    "maxLines": 1,
+                    "textAlign": "center"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "Container",
+            "when": "${payload.subwaveData.properties.viewportClass == 'compact'}",
+            "width": "100%",
+            "height": "100%",
+            "items": [
+              {
+                "type": "Container",
+                "when": "${payload.subwaveData.properties.isTiny}",
+                "width": "100%",
+                "height": "100%",
+                "padding": "8dp",
+                "alignItems": "center",
+                "justifyContent": "center",
+                "items": [
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.primary || payload.subwaveData.properties.message}",
+                    "color": "${payload.subwaveData.properties.textColor}",
+                    "fontSize": "14dp",
+                    "fontWeight": 700,
+                    "maxLines": 2,
+                    "textAlign": "center"
+                  }
+                ]
+              },
+              {
+                "type": "Container",
+                "when": "${payload.subwaveData.properties.isSmall && payload.subwaveData.properties.isTiny != true}",
+                "width": "100%",
+                "height": "100%",
+                "padding": "16dp",
+                "alignItems": "center",
+                "justifyContent": "center",
+                "items": [
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.primary || payload.subwaveData.properties.message}",
+                    "color": "${payload.subwaveData.properties.textColor}",
+                    "fontSize": "24dp",
+                    "fontWeight": 700,
+                    "maxLines": 2,
+                    "textAlign": "center"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.secondary}",
+                    "color": "${payload.subwaveData.properties.mutedColor}",
+                    "fontSize": "17dp",
+                    "maxLines": 1,
+                    "textAlign": "center"
+                  }
+                ]
+              },
+              {
+                "type": "Container",
+                "when": "${payload.subwaveData.properties.isSmall != true}",
+                "width": "100%",
+                "height": "100%",
+                "padding": "32dp",
+                "alignItems": "center",
+                "justifyContent": "center",
+                "items": [
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.station}",
+                    "color": "${payload.subwaveData.properties.accentColor}",
+                    "fontSize": "16dp",
+                    "fontWeight": 700,
+                    "maxLines": 1,
+                    "textAlign": "center"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.heading}",
+                    "color": "${payload.subwaveData.properties.textColor}",
+                    "fontSize": "22dp",
+                    "fontWeight": 700,
+                    "maxLines": 1,
+                    "textAlign": "center",
+                    "marginTop": "14dp"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.primary}",
+                    "color": "${payload.subwaveData.properties.textColor}",
+                    "fontSize": "30dp",
+                    "fontWeight": 700,
+                    "maxLines": 2,
+                    "textAlign": "center",
+                    "marginTop": "10dp"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.secondary}",
+                    "color": "${payload.subwaveData.properties.mutedColor}",
+                    "fontSize": "21dp",
+                    "maxLines": 1,
+                    "textAlign": "center"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.message}",
+                    "color": "${payload.subwaveData.properties.messageColor}",
+                    "fontSize": "17dp",
+                    "maxLines": 2,
+                    "textAlign": "center",
+                    "marginTop": "14dp"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "Container",
+            "when": "${payload.subwaveData.properties.viewportClass == 'portrait'}",
+            "width": "100%",
+            "height": "100%",
+            "items": [
+              {
+                "type": "Container",
+                "when": "${payload.subwaveData.properties.isSmall}",
+                "width": "100%",
+                "height": "100%",
+                "padding": "20dp",
+                "justifyContent": "center",
+                "items": [
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.primary || payload.subwaveData.properties.message}",
+                    "color": "${payload.subwaveData.properties.textColor}",
+                    "fontSize": "30dp",
+                    "fontWeight": 700,
+                    "maxLines": 3
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.secondary}",
+                    "color": "${payload.subwaveData.properties.mutedColor}",
+                    "fontSize": "20dp",
+                    "maxLines": 1
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.message}",
+                    "color": "${payload.subwaveData.properties.messageColor}",
+                    "fontSize": "17dp",
+                    "maxLines": 3,
+                    "marginTop": "12dp"
+                  }
+                ]
+              },
+              {
+                "type": "Container",
+                "when": "${payload.subwaveData.properties.isSmall != true}",
+                "width": "100%",
+                "height": "100%",
+                "padding": "48dp",
+                "items": [
+                  {
+                    "type": "AlexaHeader",
+                    "headerTitle": "${payload.subwaveData.properties.station}",
+                    "headerSubtitle": "${payload.subwaveData.properties.heading}"
+                  },
+                  {
+                    "type": "Image",
+                    "when": "${payload.subwaveData.properties.artwork}",
+                    "source": "${payload.subwaveData.properties.artwork}",
+                    "width": "100%",
+                    "height": "42%",
+                    "scale": "best-fill",
+                    "marginTop": "24dp"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.primary}",
+                    "color": "${payload.subwaveData.properties.textColor}",
+                    "fontSize": "42dp",
+                    "fontWeight": 700,
+                    "maxLines": 2,
+                    "marginTop": "26dp"
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.secondary}",
+                    "color": "${payload.subwaveData.properties.mutedColor}",
+                    "fontSize": "28dp",
+                    "maxLines": 1
+                  },
+                  {
+                    "type": "Text",
+                    "text": "${payload.subwaveData.properties.message}",
+                    "color": "${payload.subwaveData.properties.messageColor}",
+                    "fontSize": "23dp",
+                    "maxLines": 4,
+                    "marginTop": "18dp"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "Container",
+            "when": "${payload.subwaveData.properties.viewportClass == 'wide'}",
+            "width": "100%",
+            "height": "100%",
+            "items": [
+              {
+                "type": "AlexaHeader",
+                "headerTitle": "${payload.subwaveData.properties.station}",
+                "headerSubtitle": "${payload.subwaveData.properties.heading}",
+                "height": "15%",
+                "paddingLeft": "48dp",
+                "paddingRight": "48dp"
+              },
+              {
+                "type": "Container",
+                "direction": "row",
+                "width": "100%",
+                "height": "65%",
+                "paddingLeft": "48dp",
+                "paddingRight": "48dp",
+                "alignItems": "center",
+                "items": [
+                  {
+                    "type": "Image",
+                    "when": "${payload.subwaveData.properties.artwork}",
+                    "source": "${payload.subwaveData.properties.artwork}",
+                    "width": "38%",
+                    "height": "100%",
+                    "scale": "best-fill"
+                  },
+                  {
+                    "type": "Container",
+                    "width": "62%",
+                    "paddingLeft": "42dp",
+                    "justifyContent": "center",
+                    "items": [
+                      {
+                        "type": "Text",
+                        "text": "${payload.subwaveData.properties.primary}",
+                        "color": "${payload.subwaveData.properties.textColor}",
+                        "fontSize": "54dp",
+                        "fontWeight": 700,
+                        "maxLines": 2
+                      },
+                      {
+                        "type": "Text",
+                        "text": "${payload.subwaveData.properties.secondary}",
+                        "color": "${payload.subwaveData.properties.mutedColor}",
+                        "fontSize": "34dp",
+                        "maxLines": 1,
+                        "marginTop": "12dp"
+                      },
+                      {
+                        "type": "Text",
+                        "text": "${payload.subwaveData.properties.tertiary}",
+                        "color": "${payload.subwaveData.properties.mutedColor}",
+                        "fontSize": "24dp",
+                        "maxLines": 1,
+                        "marginTop": "12dp"
+                      },
+                      {
+                        "type": "Text",
+                        "when": "${payload.subwaveData.properties.view != 'details'}",
+                        "text": "${payload.subwaveData.properties.message}",
+                        "color": "${payload.subwaveData.properties.messageColor}",
+                        "fontSize": "25dp",
+                        "maxLines": 5,
+                        "marginTop": "22dp"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": "Sequence",
+                "when": "${payload.subwaveData.properties.view != 'details' && payload.subwaveData.properties.items.length > 0}",
+                "data": "${payload.subwaveData.properties.items}",
+                "width": "100%",
+                "height": "20%",
+                "paddingLeft": "48dp",
+                "paddingRight": "48dp",
+                "scrollDirection": "horizontal",
+                "items": {
+                  "type": "Container",
+                  "direction": "row",
+                  "width": "320dp",
+                  "height": "100%",
+                  "paddingRight": "20dp",
+                  "items": [
+                    {
+                      "type": "Text",
+                      "text": "${data.title}",
+                      "color": "${payload.subwaveData.properties.textColor}",
+                      "fontSize": "22dp",
+                      "maxLines": 1
+                    },
+                    {
+                      "type": "Text",
+                      "text": "${data.artist}",
+                      "color": "${payload.subwaveData.properties.mutedColor}",
+                      "fontSize": "18dp",
+                      "maxLines": 1,
+                      "marginLeft": "10dp"
+                    }
+                  ]
+                }
+              },
+              {
+                "type": "Sequence",
+                "when": "${payload.subwaveData.properties.view == 'details' && payload.subwaveData.properties.items.length > 0}",
+                "data": "${payload.subwaveData.properties.items}",
+                "width": "100%",
+                "height": "20%",
+                "paddingLeft": "48dp",
+                "paddingRight": "48dp",
+                "scrollDirection": "horizontal",
+                "items": {
+                  "type": "Container",
+                  "width": "280dp",
+                  "height": "100%",
+                  "paddingRight": "20dp",
+                  "items": [
+                    {
+                      "type": "Text",
+                      "text": "${data.label}",
+                      "color": "${payload.subwaveData.properties.accentColor}",
+                      "fontSize": "20dp",
+                      "maxLines": 1
+                    },
+                    {
+                      "type": "Text",
+                      "text": "${data.value}",
+                      "color": "${payload.subwaveData.properties.textColor}",
+                      "fontSize": "18dp",
+                      "maxLines": 2,
+                      "marginTop": "8dp"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

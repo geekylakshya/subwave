@@ -52,6 +52,15 @@ const MESSAGES: Record<AlexaLocale, {
   candidate: (track: string) => string;
   candidateReprompt: string;
   candidateNo: string;
+  moreLikeThis: (track: string) => string;
+  anotherByArtist: (track: string) => string;
+  featureNoMatch: string;
+  featureFailed: string;
+  recent: (tracks: string) => string;
+  recentEmpty: string;
+  details: (title: string, detailType: string, fields: string) => string;
+  currentShow: (name: string, dj: string, guests: string) => string;
+  noShow: (dj: string | null) => string;
 }> = {
   'en-US': {
     offline: 'The station is currently offline.',
@@ -90,6 +99,15 @@ const MESSAGES: Record<AlexaLocale, {
     candidate: track => `I found ${track}. Is that the song you want?`,
     candidateReprompt: 'Say yes to request it, or no to hear the next match.',
     candidateNo: 'Okay. I will keep looking for another match.',
+    moreLikeThis: track => `More like ${track} is on the way.`,
+    anotherByArtist: track => `Another track by ${track} is on the way.`,
+    featureNoMatch: 'I could not find another matching track in the library.',
+    featureFailed: 'I could not send that track request right now.',
+    recent: tracks => `Recently played: ${tracks}.`,
+    recentEmpty: 'There are no recently played tracks available.',
+    details: (title, detailType, fields) => `For ${title}, ${detailType}: ${fields}.`,
+    currentShow: (name, dj, guests) => guests ? `${name} is on now with ${dj} and ${guests}.` : `${name} is on now with ${dj}.`,
+    noShow: dj => dj ? `There is no scheduled show right now. ${dj} is on air.` : 'There is no scheduled show right now.',
   },
   'en-IN': {
     offline: 'The station is currently offline.',
@@ -128,6 +146,15 @@ const MESSAGES: Record<AlexaLocale, {
     candidate: track => `I found ${track}. Is that the song you want?`,
     candidateReprompt: 'Say yes to request it, or no to hear the next match.',
     candidateNo: 'Okay. I will keep looking for another match.',
+    moreLikeThis: track => `More like ${track} is on the way.`,
+    anotherByArtist: track => `Another track by ${track} is on the way.`,
+    featureNoMatch: 'I could not find another matching track in the library.',
+    featureFailed: 'I could not send that track request right now.',
+    recent: tracks => `Recently played: ${tracks}.`,
+    recentEmpty: 'There are no recently played tracks available.',
+    details: (title, detailType, fields) => `For ${title}, ${detailType}: ${fields}.`,
+    currentShow: (name, dj, guests) => guests ? `${name} is on now with ${dj} and ${guests}.` : `${name} is on now with ${dj}.`,
+    noShow: dj => dj ? `There is no scheduled show right now. ${dj} is on air.` : 'There is no scheduled show right now.',
   },
   'hi-IN': {
     offline: 'स्टेशन अभी offline है।',
@@ -166,6 +193,15 @@ const MESSAGES: Record<AlexaLocale, {
     candidate: track => `मुझे ${track} मिला है। क्या यही गाना चाहिए?`,
     candidateReprompt: 'Request करने के लिए हाँ, या अगला match सुनने के लिए नहीं कहिए।',
     candidateNo: 'ठीक है। मैं अगला match देखता हूँ।',
+    moreLikeThis: track => `${track} जैसा एक और गाना queue में भेज दिया है।`,
+    anotherByArtist: track => `${track} का एक और गाना queue में भेज दिया है।`,
+    featureNoMatch: 'Library में कोई दूसरा matching track नहीं मिला।',
+    featureFailed: 'अभी यह track request भेजी नहीं जा सकी।',
+    recent: tracks => `हाल में बजे गाने: ${tracks}।`,
+    recentEmpty: 'हाल में बजा हुआ कोई track उपलब्ध नहीं है।',
+    details: (title, detailType, fields) => `${title} के लिए ${detailType}: ${fields}।`,
+    currentShow: (name, dj, guests) => guests ? `${name} अभी ${dj} और ${guests} के साथ on air है।` : `${name} अभी ${dj} के साथ on air है।`,
+    noShow: dj => dj ? 'अभी कोई scheduled show नहीं है। ' + `${dj} on air हैं।` : 'अभी कोई scheduled show नहीं है।',
   },
 };
 

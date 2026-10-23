@@ -12,7 +12,9 @@ process.env.SITE_URL = 'https://radio.example';
 const { DEFAULTS } = await import('../src/settings/defaults.js');
 const { alexaPatchSchema } = await import('../src/schemas/settings.js');
 const { verifyAlexaStreamToken } = await import('../src/alexa/token.js');
+const { AlexaListenerFeatureService } = await import('../src/alexa/listener-features.js');
 const { createAlexaSkill, router, testAlexaConnection } = await import('../src/routes/alexa.js');
+const { verifiedCandidateMatches } = await import('../src/routes/request.js');
 const settings = await import('../src/settings.js');
 
 const skillId = 'amzn1.ask.skill.11111111-1111-4111-8111-111111111111';
@@ -53,12 +55,12 @@ function launch() {
   }, skillId);
 }
 
-function intent(name: string, slots: Record<string, unknown> = {}, attributes: Record<string, unknown> = {}) {
+function intent(name: string, slots: Record<string, unknown> = {}, attributes: Record<string, unknown> = {}, locale = 'en-IN') {
   const result = envelope({
     type: 'IntentRequest',
     requestId: `EdwRequestId.${name}`,
     timestamp: '2026-10-21T12:00:00Z',
-    locale: 'en-IN',
+    locale,
     intent: { name, confirmationStatus: 'NONE', slots },
   });
   (result.session as any).attributes = attributes;
@@ -318,6 +320,89 @@ test('Alexa gives a useful answer when no current or upcoming track is available
 
   assert.equal((current.response as any).outputSpeech.ssml, '<speak>Nothing is playing right now.</speak>');
   assert.equal((upcoming.response as any).outputSpeech.ssml, '<speak>There is no song queued next.</speak>');
+});
+
+test('Alexa listener features submit a verified candidate through the shared request pipeline', async () => {
+  const submitted: Array<{ text: string; candidate?: { id: string } }> = [];
+  const featureRuntime = {
+    ...runtime,
+    listenerFeatures: new AlexaListenerFeatureService({
+      nowPlaying: () => ({ id: 'current', title: 'Current Song', artist: 'Current Artist', album: null }),
+      recentTracks: () => [],
+      similarCandidates: () => [{ id: 'similar-1', title: 'Similar Song', artist: 'Other Artist', similarity: 0.9 }],
+    }),
+    submitRequest: async (text: string, _userId: string, candidate?: { id: string }) => {
+      submitted.push({ text, candidate });
+      return { accepted: true as const, statusCode: 202 as const, requestId: 'feature-request', status: 'pending' as const };
+    },
+  };
+
+  const response = await createAlexaSkill(featureRuntime).invoke(intent('MoreLikeThisIntent'));
+  assert.match((response.response as any).outputSpeech.ssml, /More like Similar Song by Other Artist is on the way/);
+  assert.deepEqual(submitted, [{
+    text: 'play "Similar Song" by "Other Artist"',
+    candidate: { id: 'similar-1', title: 'Similar Song', artist: 'Other Artist', album: null },
+  }]);
+});
+
+test('the shared request resolver rejects a generated candidate substitution', () => {
+  const candidate = { id: 'expected', title: 'Expected', artist: 'Artist' };
+  assert.equal(verifiedCandidateMatches({ id: 'expected' }, candidate), true);
+  assert.equal(verifiedCandidateMatches({ id: 'different' }, candidate), false);
+  assert.equal(verifiedCandidateMatches(null, candidate), false);
+  assert.equal(verifiedCandidateMatches({ id: 'different' }, undefined), true);
+});
+
+test('Alexa reports no current track for generated listener selections', async () => {
+  const featureRuntime = {
+    ...runtime,
+    listenerFeatures: new AlexaListenerFeatureService({ nowPlaying: () => null }),
+  };
+  const response = await createAlexaSkill(featureRuntime).invoke(intent('AnotherByArtistIntent'));
+  assert.equal((response.response as any).outputSpeech.ssml, '<speak>Nothing is playing right now.</speak>');
+});
+
+test('Alexa lists recent tracks in order and reports an inactive show without inventing one', async () => {
+  const featureRuntime = {
+    ...runtime,
+    listenerFeatures: new AlexaListenerFeatureService({
+      recentTracks: () => [
+        { id: 'recent-1', title: 'First', artist: 'Artist One', album: null },
+        { id: 'recent-2', title: 'Second', artist: 'Artist Two', album: null },
+      ],
+      currentShow: () => ({ name: null, dj: 'DJ Name', guests: [] }),
+    }),
+  };
+  const recent = await createAlexaSkill(featureRuntime).invoke(intent('RecentTracksIntent'));
+  assert.match((recent.response as any).outputSpeech.ssml, /First by Artist One, Second by Artist Two/);
+
+  const show = await createAlexaSkill(featureRuntime).invoke(intent('CurrentShowIntent'));
+  assert.match((show.response as any).outputSpeech.ssml, /no scheduled show/);
+  assert.match((show.response as any).outputSpeech.ssml, /DJ Name/);
+});
+
+test('TrackDetailsIntent supports all detail slots in all supported locales and keeps missing values unavailable', async () => {
+  const featureRuntime = {
+    ...runtime,
+    listenerFeatures: new AlexaListenerFeatureService({
+      nowPlaying: () => ({ id: 'details', title: 'Details Song', artist: 'Details Artist', album: null }),
+      trackMetadata: () => ({ genre: 'Jazz' }),
+    }),
+  };
+  for (const locale of ['en-IN', 'en-US', 'hi-IN']) {
+    for (const detailType of ['album', 'artist', 'year', 'genre', 'language', 'all']) {
+      const response = await createAlexaSkill(featureRuntime).invoke(intent('TrackDetailsIntent', {
+        detailType: { name: 'detailType', value: detailType },
+      }, {}, locale));
+      const speech = (response.response as any).outputSpeech.ssml as string;
+      assert.match(speech, /Details Song/);
+      assert.doesNotMatch(speech, /undefined|null/);
+    }
+  }
+  const missing = await createAlexaSkill(featureRuntime).invoke(intent('TrackDetailsIntent', {
+    detailType: { name: 'detailType', value: 'all' },
+  }, {}, 'en-US'));
+  assert.match((missing.response as any).outputSpeech.ssml, /unavailable/);
 });
 
 test('Alexa rejects a skill request with the wrong configured skill id', async () => {

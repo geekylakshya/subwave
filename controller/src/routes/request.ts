@@ -35,8 +35,16 @@ import { ARTIST_VARIETY_WINDOW, drawRequestCandidate } from '../broadcast/dj-age
 import { RequestIdentificationMiss } from '../broadcast/dj-agent/breaker.js';
 import { isWebSearchProviderError, searchReady, searchWeb } from '../skills/web-search.js';
 import * as requestLedger from '../broadcast/request-ledger.js';
+import type { AlexaVerifiedCandidate } from '../alexa/listener-features.js';
 
 export const router = express.Router();
+
+export function verifiedCandidateMatches(
+  pick: { id?: unknown } | null | undefined,
+  candidate: AlexaVerifiedCandidate | null | undefined,
+): boolean {
+  return !candidate || String(pick?.id || '') === candidate.id;
+}
 
 export type ListenerRequestSource = 'browser' | 'alexa';
 export type ListenerResolutionOutcome =
@@ -798,6 +806,15 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     }
     return failed(sorryNoMatch(requester));
   }
+  // Generated listener features already selected a concrete library track.
+  // Keep the shared resolver's safety checks, but do not let its substitution
+  // policy silently replace that selection with a different song when the
+  // catalogue changed between feature lookup and request resolution.
+  if (!verifiedCandidateMatches(pick, entry.verifiedCandidate)) {
+    entry.pickSource = `${pickSource}:verified-candidate-mismatch`;
+    entry.outcome = 'no-match';
+    return failed('The selected track could not be verified in the library. Please try that request again.');
+  }
   // A search in the listener's own spelling answers in the library's ("Tupac"
   // finds 2Pac). That may be the same act, so the intro is not told it is not.
   if (selection.outcome === 'substituted' && matched.artist && !requestArtistMatches(matched.artist, pick)
@@ -958,6 +975,12 @@ export async function submitListenerRequest(input: {
   ip: string;
   source: ListenerRequestSource;
   alexaIdentity?: string;
+  /**
+   * A catalogue selection made by a typed listener feature. The normal
+   * resolver still performs all admission, blocklist and cooldown checks, but
+   * it may not turn this exact selection into an unrelated substitution.
+   */
+  verifiedCandidate?: AlexaVerifiedCandidate;
 }): Promise<ListenerRequestSubmission> {
   // Keep every caller behind the same shape/size boundary. The browser
   // middleware already parsed this schema, but Alexa and future voice clients
@@ -1068,6 +1091,7 @@ export async function submitListenerRequest(input: {
       id, status: 'pending', requester, text, source: input.source,
       clientKey: ip,
       alexaIdentity: input.alexaIdentity,
+      verifiedCandidate: input.verifiedCandidate,
       provider: settings.get().search?.provider || 'duckduckgo',
       rawText: sanitizeRequestText(rawText),
       injection: stripped.injection,

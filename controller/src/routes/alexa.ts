@@ -26,6 +26,16 @@ import {
 } from '../alexa/experience.js';
 import { previewAlexaRequest, type AlexaRequestCandidate } from '../alexa/request-preview.js';
 import {
+  createAlexaListenerFeatureService,
+  verifiedCandidateFor,
+  verifiedRequestText,
+  type AlexaCurrentShow,
+  type AlexaListenerFeatureService,
+  type AlexaListenerTrack,
+  type AlexaTrackDetails,
+  type AlexaVerifiedCandidate,
+} from '../alexa/listener-features.js';
+import {
   getLatestAlexaRequestStatus,
   cancelLatestAlexaRequest,
   replaceLatestAlexaRequest,
@@ -64,11 +74,17 @@ export interface AlexaRuntime {
   nowPlaying?: () => Promise<AlexaTrack | null> | AlexaTrack | null;
   upcoming?: () => Promise<AlexaTrack[]> | AlexaTrack[];
   previous?: () => Promise<AlexaTrack | null> | AlexaTrack | null;
-  submitRequest?: (text: string, userId: string) => Promise<AlexaSubmitResult>;
+  submitRequest?: (
+    text: string,
+    userId: string,
+    verifiedCandidate?: AlexaVerifiedCandidate,
+    personId?: string,
+  ) => Promise<AlexaSubmitResult>;
   latestRequestStatus?: (identity: string) => Promise<ListenerRequestStatus | null>;
   cancelRequest?: (identity: string) => Promise<ListenerRequestStatus | null>;
   replaceRequest?: (identity: string, text: string) => Promise<AlexaSubmitResult>;
   previewRequest?: (text: string) => Promise<AlexaRequestCandidate[]>;
+  listenerFeatures?: AlexaListenerFeatureService;
 }
 
 export interface AlexaTrack extends AlexaPresentationTrack {
@@ -139,14 +155,17 @@ function defaultRuntime(): AlexaRuntime {
       .map(item => toAlexaTrack(item.track))
       .filter((track): track is AlexaTrack => track !== null),
     previous: () => toAlexaTrack(queue.history[0]?.track),
-    submitRequest: (text, userId) => {
-      const identity = alexaIdentityKey(userId || 'unknown');
+    submitRequest: (text, userId, verifiedCandidate, personId) => {
+      const identity = personId
+        ? `person:${personId}`
+        : alexaIdentityKey(userId || 'unknown');
       return submitListenerRequest({
         text,
         name: '',
         ip: `alexa:${identity}`,
         source: 'alexa',
         alexaIdentity: identity,
+        verifiedCandidate,
       }).then(result => result.accepted
         ? { accepted: true, statusCode: 202 as const, requestId: result.requestId, status: 'pending' as const }
         : result);
@@ -157,6 +176,7 @@ function defaultRuntime(): AlexaRuntime {
       ? { accepted: true, statusCode: 202 as const, requestId: result.requestId, status: 'pending' as const }
       : result),
     previewRequest: previewAlexaRequest,
+    listenerFeatures: createAlexaListenerFeatureService(),
   };
 }
 
@@ -441,6 +461,36 @@ function alexaUserId(input: any): string {
   ).trim();
 }
 
+function alexaPersonId(input: any): string {
+  return String(
+    input.requestEnvelope?.context?.System?.person?.personId
+      || input.requestEnvelope?.session?.user?.personId
+      || '',
+  ).trim();
+}
+
+// Person IDs are stable for Alexa's person-aware requests. When Alexa does not
+// provide one, keep the existing skill-scoped account fallback: the ledger
+// stores only its salted, non-reversible identity key.
+function alexaRequestIdentity(input: any): string {
+  const personId = alexaPersonId(input);
+  return personId ? `person:${personId}` : alexaIdentityKey(alexaUserId(input) || 'unknown');
+}
+
+function listenerFeatures(runtime: AlexaRuntime): AlexaListenerFeatureService {
+  return runtime.listenerFeatures || createAlexaListenerFeatureService();
+}
+
+function featureTrack(track: AlexaListenerTrack): AlexaTrack {
+  return {
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    album: track.album,
+    artworkUrl: track.artworkUrl || null,
+  };
+}
+
 function requestSpeech(input: any, text: string) {
   return input.responseBuilder
     .speak(text)
@@ -554,6 +604,141 @@ async function queuePreviewResponse(input: any, runtime: AlexaRuntime) {
   );
 }
 
+type AlexaDetailType = 'album' | 'artist' | 'year' | 'genre' | 'language' | 'all';
+
+function detailType(input: any): AlexaDetailType {
+  const value = String(input.requestEnvelope?.request?.intent?.slots?.detailType?.value || '')
+    .trim().toLocaleLowerCase();
+  if (value === 'album' || value === 'artist' || value === 'year' || value === 'genre' || value === 'language') {
+    return value;
+  }
+  return 'all';
+}
+
+function detailLabels(locale: string | null | undefined): { unavailable: string; all: string; labels: Record<AlexaDetailType, string> } {
+  if (inputLocale({ requestEnvelope: { request: { locale } } }) === 'hi-IN') {
+    return {
+      unavailable: 'उपलब्ध नहीं',
+      all: 'सारी जानकारी',
+      labels: { album: 'album', artist: 'artist', year: 'year', genre: 'genre', language: 'language', all: 'सारी जानकारी' },
+    };
+  }
+  return {
+    unavailable: 'unavailable',
+    all: 'all details',
+    labels: { album: 'album', artist: 'artist', year: 'year', genre: 'genre', language: 'language', all: 'all details' },
+  };
+}
+
+function detailFields(details: AlexaTrackDetails, requested: AlexaDetailType, locale: string | null | undefined): string {
+  const labels = detailLabels(locale);
+  const values: Record<Exclude<AlexaDetailType, 'all'>, string | null> = {
+    album: details.album,
+    artist: details.artist,
+    year: details.year == null ? null : String(details.year),
+    genre: details.genre,
+    language: details.language,
+  };
+  const keys: Array<Exclude<AlexaDetailType, 'all'>> = requested === 'all'
+    ? ['album', 'artist', 'year', 'genre', 'language']
+    : [requested];
+  return keys.map(key => `${labels.labels[key]} ${values[key] ? `"${escapeXmlCharacters(values[key] as string)}"` : labels.unavailable}`).join(', ');
+}
+
+async function listenerFeatureRequestResponse(
+  input: any,
+  runtime: AlexaRuntime,
+  kind: 'moreLikeThis' | 'anotherByArtist',
+) {
+  const copy = messages(inputLocale(input));
+  let result;
+  try {
+    result = kind === 'moreLikeThis'
+      ? await listenerFeatures(runtime).moreLikeThis()
+      : await listenerFeatures(runtime).anotherByArtist();
+  } catch {
+    return requestSpeech(input, copy.featureFailed);
+  }
+  if (result.kind === 'no-current') return requestSpeech(input, copy.noCurrent);
+  if (result.kind === 'no-match') return requestSpeech(input, copy.featureNoMatch);
+
+  const candidate = result.value;
+  const userId = alexaUserId(input) || 'unknown';
+  const personId = alexaPersonId(input) || undefined;
+  const requestText = verifiedRequestText(candidate);
+  const verified = verifiedCandidateFor(candidate);
+  let submitted: AlexaSubmitResult;
+  try {
+    submitted = runtime.submitRequest
+      ? await runtime.submitRequest(requestText, userId, verified, personId)
+      : await defaultRuntime().submitRequest!(requestText, userId, verified, personId);
+  } catch {
+    return requestSpeech(input, copy.featureFailed);
+  }
+  if (!submitted.accepted) {
+    return requestSpeech(input, dynamicSpeech(submitted.message || submitted.error, copy.featureFailed));
+  }
+  return requestSpeech(
+    input,
+    kind === 'moreLikeThis'
+      ? copy.moreLikeThis(trackSpeech(featureTrack(candidate)))
+      : copy.anotherByArtist(escapeXmlCharacters(candidate.artist)),
+  );
+}
+
+async function recentTracksResponse(input: any, runtime: AlexaRuntime) {
+  const copy = messages(inputLocale(input));
+  try {
+    const tracks = await listenerFeatures(runtime).recentTracks();
+    return requestSpeech(input, tracks.length
+      ? copy.recent(tracks.map(track => trackSpeech(featureTrack(track))).join(', '))
+      : copy.recentEmpty);
+  } catch {
+    return requestSpeech(input, copy.recentEmpty);
+  }
+}
+
+async function trackDetailsResponse(input: any, runtime: AlexaRuntime) {
+  const copy = messages(inputLocale(input));
+  let result;
+  try {
+    result = await listenerFeatures(runtime).trackDetails();
+  } catch {
+    return requestSpeech(input, copy.featureFailed);
+  }
+  if (result.kind === 'no-current') return requestSpeech(input, copy.noCurrent);
+  if (result.kind === 'no-match') return requestSpeech(input, copy.featureNoMatch);
+  const requested = detailType(input);
+  const labels = detailLabels(inputLocale(input));
+  const details = result.value;
+  return requestSpeech(
+    input,
+    copy.details(
+      escapeXmlCharacters(details.title),
+      labels.labels[requested],
+      detailFields(details, requested, inputLocale(input)),
+    ),
+  );
+}
+
+async function currentShowResponse(input: any, runtime: AlexaRuntime) {
+  const copy = messages(inputLocale(input));
+  let show: AlexaCurrentShow | null = null;
+  try {
+    show = await listenerFeatures(runtime).currentShow();
+  } catch {
+    // A show lookup is informational; use the same grounded no-show response
+    // when schedule state is unavailable instead of inventing a programme.
+  }
+  if (!show?.name) {
+    return requestSpeech(input, copy.noShow(show?.dj ? escapeXmlCharacters(show.dj) : null));
+  }
+  const dj = dynamicSpeech(show.dj, 'the DJ');
+  const guests = (Array.isArray(show.guests) ? show.guests : [])
+    .map(guest => escapeXmlCharacters(guest)).join(', ');
+  return requestSpeech(input, copy.currentShow(escapeXmlCharacters(show.name), dj, guests));
+}
+
 async function requestSongResponse(input: any, runtime: AlexaRuntime) {
   const rawText = String(input.requestEnvelope.request.intent?.slots?.requestText?.value || '').trim();
   const parsed = listenerRequestSchema.safeParse({ text: rawText, name: '' });
@@ -574,9 +759,10 @@ async function requestSongResponse(input: any, runtime: AlexaRuntime) {
     }
   }
   const userId = alexaUserId(input) || 'unknown';
+  const personId = alexaPersonId(input) || undefined;
   const result = runtime.submitRequest
-    ? await runtime.submitRequest(parsed.data.text, userId)
-    : await defaultRuntime().submitRequest!(parsed.data.text, userId);
+    ? await runtime.submitRequest(parsed.data.text, userId, undefined, personId)
+    : await defaultRuntime().submitRequest!(parsed.data.text, userId, undefined, personId);
   if (result.accepted) {
     return requestSpeech(input, copy.requestAccepted);
   }
@@ -600,10 +786,11 @@ async function confirmationResponse(input: any, runtime: AlexaRuntime, confirmed
   const selected = candidates[0];
   clearRequestClarification(input);
   const userId = alexaUserId(input) || 'unknown';
+  const personId = alexaPersonId(input) || undefined;
   const text = `play "${selected.title}" by "${selected.artist}"`;
   const result = runtime.submitRequest
-    ? await runtime.submitRequest(text, userId)
-    : await defaultRuntime().submitRequest!(text, userId);
+    ? await runtime.submitRequest(text, userId, undefined, personId)
+    : await defaultRuntime().submitRequest!(text, userId, undefined, personId);
   return requestSpeech(input, result.accepted ? copy.requestAccepted : dynamicSpeech(result.message || result.error, copy.requestFailed));
 }
 
@@ -638,7 +825,7 @@ function statusSpeech(status: ListenerRequestStatus | null, locale?: string | nu
 }
 
 async function requestStatusResponse(input: any, runtime: AlexaRuntime) {
-  const identity = alexaIdentityKey(alexaUserId(input) || 'unknown');
+  const identity = alexaRequestIdentity(input);
   const status = runtime.latestRequestStatus
     ? await runtime.latestRequestStatus(identity)
     : await defaultRuntime().latestRequestStatus!(identity);
@@ -649,7 +836,7 @@ async function requestStatusResponse(input: any, runtime: AlexaRuntime) {
 }
 
 async function cancelRequestResponse(input: any, runtime: AlexaRuntime) {
-  const identity = alexaIdentityKey(alexaUserId(input) || 'unknown');
+  const identity = alexaRequestIdentity(input);
   const status = runtime.cancelRequest
     ? await runtime.cancelRequest(identity)
     : await defaultRuntime().cancelRequest!(identity);
@@ -666,7 +853,7 @@ async function replaceRequestResponse(input: any, runtime: AlexaRuntime) {
   const parsed = listenerRequestSchema.safeParse({ text: rawText, name: '' });
   const copy = messages(inputLocale(input));
   if (!parsed.success) return requestSpeech(input, copy.replacePrompt);
-  const identity = alexaIdentityKey(alexaUserId(input) || 'unknown');
+  const identity = alexaRequestIdentity(input);
   const result = runtime.replaceRequest
     ? await runtime.replaceRequest(identity, parsed.data.text)
     : await defaultRuntime().replaceRequest!(identity, parsed.data.text);
@@ -707,6 +894,11 @@ export function createAlexaSkill(runtime: AlexaRuntime = defaultRuntime()) {
       intentHandler(['UpcomingIntent', 'NextSongIntent', 'WhatIsNextIntent'], input =>
         upcomingResponse(input, runtime)),
       intentHandler(['QueuePreviewIntent'], input => queuePreviewResponse(input, runtime)),
+      intentHandler(['MoreLikeThisIntent'], input => listenerFeatureRequestResponse(input, runtime, 'moreLikeThis')),
+      intentHandler(['AnotherByArtistIntent'], input => listenerFeatureRequestResponse(input, runtime, 'anotherByArtist')),
+      intentHandler(['RecentTracksIntent'], input => recentTracksResponse(input, runtime)),
+      intentHandler(['TrackDetailsIntent'], input => trackDetailsResponse(input, runtime)),
+      intentHandler(['CurrentShowIntent'], input => currentShowResponse(input, runtime)),
       intentHandler(['StationStatusIntent'], input => stationStatusResponse(input, runtime)),
       intentHandler(['StartRadioIntent', 'PlayRadioIntent'], input =>
         playResponse(input, runtime, messages(inputLocale(input)).starting)),

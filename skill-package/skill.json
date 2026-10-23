@@ -6,6 +6,32 @@
           "sslCertificateType": "Wildcard",
           "uri": "https://subwave.citadels.studio/api/alexa"
         },
+        "regions": {
+          "NA": {
+            "endpoint": {
+              "sslCertificateType": "Wildcard",
+              "uri": "https://subwave.citadels.studio/api/alexa"
+            }
+          },
+          "EU": {
+            "endpoint": {
+              "sslCertificateType": "Wildcard",
+              "uri": "https://subwave.citadels.studio/api/alexa"
+            }
+          },
+          "FE": {
+            "endpoint": {
+              "sslCertificateType": "Wildcard",
+              "uri": "https://subwave.citadels.studio/api/alexa"
+            }
+          },
+          "IN": {
+            "endpoint": {
+              "sslCertificateType": "Wildcard",
+              "uri": "https://subwave.citadels.studio/api/alexa"
+            }
+          }
+        },
         "interfaces": [
           {
             "type": "AUDIO_PLAYER"

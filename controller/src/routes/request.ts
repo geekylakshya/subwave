@@ -28,12 +28,12 @@ import {
 } from '../middleware/ratelimit.js';
 import { validatePublicBody } from '../middleware/validate.js';
 import { listenerRequestSchema } from '../schemas/request.js';
-import { classifyListenerRequest, directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
+import { classifyListenerRequest, directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, rankAliasCandidates, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
 import { ARTIST_VARIETY_WINDOW, drawRequestCandidate } from '../broadcast/dj-agent/artist-guard.js';
 import { RequestIdentificationMiss } from '../broadcast/dj-agent/breaker.js';
-import { isWebSearchProviderError } from '../skills/web-search.js';
+import { isWebSearchProviderError, searchReady, searchWeb } from '../skills/web-search.js';
 
 export const router = express.Router();
 
@@ -195,7 +195,7 @@ function recordOutcome(entry) {
       interpretationFallback: entry.interpretationFallback ?? false,
       unsupported: entry.unsupported ?? [],
       unmetPreferences: entry.unmetPreferences ?? [],
-      provider: entry.provider ?? settings.get().search?.provider ?? null,
+      provider: entry.provider ?? null,
       providerFailure: entry.providerFailure ?? null,
       classification: entry.classification ?? null,
       stages: entry.stages ?? [],
@@ -270,6 +270,31 @@ const EVIDENCE_MISS_REFUSAL = `I couldn't identify that song from the descriptio
 // The resolver still verifies its title/artist against the actual catalogue.
 function modelFreeMatch(text: string): Awaited<ReturnType<typeof dj.matchRequest>> {
   return { ...modelFreeRequest(text), literal: true } as Awaited<ReturnType<typeof dj.matchRequest>>;
+}
+
+async function resolveNamedAlias(
+  title: string,
+  artistName: string,
+  signal?: AbortSignal,
+): Promise<{ track: any; provider: string } | null> {
+  if (!searchReady()) return null;
+  const provider = settings.get().search?.provider || 'duckduckgo';
+  const web = await searchWeb(`"${title}" "${artistName}" alternate title song`, { signal });
+  const evidence = [web.answer, ...(web.results || []).map(result => `${result.title}: ${result.content}`)]
+    .filter(Boolean).join('\n').slice(0, 8000);
+  if (!evidence) return null;
+  const artist = await subsonic.resolveArtist(artistName, { signal });
+  if (!artist?.id) return null;
+  const full = await subsonic.getArtist(artist.id);
+  const albums = (full?.album || []).slice(0, 20);
+  const candidates: any[] = [];
+  for (const album of albums) {
+    throwIfRequestResolutionAborted(signal);
+    candidates.push(...await subsonic.getAlbum(album.id, { signal }));
+    if (candidates.length >= 300) break;
+  }
+  const track = rankAliasCandidates(title, artistName, candidates, evidence);
+  return track ? { track, provider } : null;
 }
 
 // Requests accepted but not yet resolved. Their track is not in the upcoming
@@ -394,8 +419,9 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
       introPersona: generatedIntro.introPersona,
       introHostSpeech: generatedIntro.introHostSpeech,
     });
-    if (entry.status === 'cancelled') {
-      await queue.removeUpcoming(pick.id).catch(() => undefined);
+    if (entry.status === 'cancelled' || signal?.aborted) {
+      if (pos >= 0) await queue.removeUpcoming(pick.id).catch(() => undefined);
+      throwIfRequestResolutionAborted(signal);
       return;
     }
     entry.pick = pick;
@@ -473,7 +499,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     entry.stages.push('web-evidence');
     entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
     try {
-      const agentRes = await djAgent.runRequest(queue, { requester, text });
+      const agentRes = await djAgent.runRequest(queue, { requester, text, signal });
       throwIfRequestResolutionAborted(signal);
       if (agentRes) {
         // Thread the agent's own echo-guard verdict into the durable log; the
@@ -485,6 +511,8 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
           queue.log('request', `agent chat-answered (no track)`);
           entry.path = 'chat';
           entry.pickSource = 'agent-chat';
+          entry.candidateCount = agentRes.candidateCount || 0;
+          entry.confidence = agentRes.confidence ?? null;
           return resolved({ ack: agentRes.ack, track: null, queuePosition: null });
         }
         if (agentRes.refused) {
@@ -494,6 +522,8 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
           entry.path = 'agent';
           entry.pickSource = `agent:${agentRes.refused}`;
           entry.pick = agentRes.track;
+          entry.candidateCount = agentRes.candidateCount || 1;
+          entry.confidence = agentRes.confidence ?? 1;
           entry.refused = true;
           entry.outcome = agentRes.refused;
           return resolved({ ack: agentRes.ack, track: agentRes.track, queuePosition: null });
@@ -502,6 +532,8 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
         entry.path = 'agent';
         entry.pickSource = 'agent';
         entry.pick = agentRes.track;
+        entry.candidateCount = agentRes.candidateCount || 1;
+        entry.confidence = agentRes.confidence ?? 1;
         entry.introScript = agentRes.introScript || null;
         if (entry.status === 'cancelled') return;
         return resolved({
@@ -611,7 +643,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   const searches: Array<{ term: string; hits: any[] }> = [];
   const varietyWindow = settings.get().llm?.artistVarietyWindow ?? ARTIST_VARIETY_WINDOW;
   const cdMin = Number(settings.get().requests.repeatCooldownMin ?? 120);
-  const selection = await resolveDirectRequest(matched, {
+  let selection = await resolveDirectRequest(matched, {
     text,
     catalog: {
       ...subsonic,
@@ -659,8 +691,8 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
       ? { similarSongs: () => subsonic.getSimilarSongs(currentTrack.id, { count: 20 }) } : {}),
   });
   throwIfRequestResolutionAborted(signal);
-  const pick = selection.track;
-  const pickSource = selection.source;
+  let pick = selection.track;
+  let pickSource = selection.source;
   entry.stages.push('local-candidate-ranking');
   entry.candidateCount = new Set([
     ...searches.flatMap(search => search.hits.map(hit => hit?.id).filter(Boolean)),
@@ -668,6 +700,47 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     ...(selection.track?.id ? [selection.track.id] : []),
   ]).size;
   entry.confidence = selection.confidence ?? (selection.track ? 1 : null);
+  if (!selection.track && explicitNamedRequest && literal.title && literal.artist && selection.outcome !== 'unsupported') {
+    entry.stages.push('web-alias-verification');
+    try {
+      const alias = await resolveNamedAlias(literal.title, literal.artist, signal);
+      if (alias) {
+        selection = {
+          ...selection,
+          track: alias.track,
+          source: 'web-alias',
+          outcome: 'matched',
+          confidence: 0.95,
+          alternatives: [],
+        };
+        pick = selection.track;
+        pickSource = selection.source;
+        entry.evidenceSource = alias.provider;
+        entry.candidateCount = Math.max(entry.candidateCount, 1);
+        entry.confidence = selection.confidence;
+      }
+    } catch (err) {
+      if (isWebSearchProviderError(err)) {
+        entry.provider = err.provider;
+        entry.providerFailure = err.reason;
+        // Alternate-title verification is an optional enrichment after the
+        // local identity lanes. A station using the built-in DDG default may
+        // be offline while still handling named requests deterministically;
+        // keep that miss honest instead of turning every explicit typo into a
+        // provider outage. Explicitly configured providers remain typed errors.
+        if (err.provider === 'duckduckgo') {
+          entry.finalReason = `web-alias-${err.reason}`;
+          entry.pickSource = 'no-match';
+          entry.outcome = 'no-match';
+          return failed(EVIDENCE_MISS_REFUSAL);
+        }
+        entry.outcome = 'provider-error';
+        return failed('The configured search provider could not verify that alternate title. Try again shortly.');
+      }
+      if (signal?.aborted) throw err;
+      queue.log('error', `request alias verification failed: ${err.message}`);
+    }
+  }
   entry.outcome = selection.outcome;
   entry.lookupErrors = selection.errors;
   entry.unmetPreferences = selection.unmetPreferences || [];
@@ -751,8 +824,9 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     introPersona: generatedIntro.introPersona,
     introHostSpeech: generatedIntro.introHostSpeech,
   });
-  if (entry.status === 'cancelled') {
-    await queue.removeUpcoming(pick.id).catch(() => undefined);
+  if (entry.status === 'cancelled' || signal?.aborted) {
+    if (pos >= 0) await queue.removeUpcoming(pick.id).catch(() => undefined);
+    throwIfRequestResolutionAborted(signal);
     return;
   }
   entry.pick = pick;
@@ -842,6 +916,17 @@ export async function submitListenerRequest(input: {
   ip: string;
   source: ListenerRequestSource;
 }): Promise<ListenerRequestSubmission> {
+  // Keep every caller behind the same shape/size boundary. The browser
+  // middleware already parsed this schema, but Alexa and future voice clients
+  // enter through this function directly.
+  const parsed = listenerRequestSchema.safeParse({ text: input.text, name: input.name });
+  if (!parsed.success) {
+    return {
+      accepted: false,
+      statusCode: 400,
+      error: parsed.error.issues[0]?.message || 'Invalid request',
+    };
+  }
   const cfg = (settings.get() as any)?.requests || {};
   if (REQUESTS_DISABLED || cfg.enabled === false) {
     return { accepted: false, statusCode: 503, message: 'Requests are temporarily closed.' };
@@ -860,8 +945,8 @@ export async function submitListenerRequest(input: {
   // req.body is already the parsed shape. Only the cleaned text reaches the
   // session/prompts/air; the raw text is kept on the entry for the operator log.
   // The schema has bounded both the original text and its NFKC expansion.
-  const rawText = input.text;
-  const rawName = input.name || '';
+  const rawText = parsed.data.text;
+  const rawName = parsed.data.name;
   const stripped = stripScriptedOpener(sanitizeRequestText(rawText));
   const text = stripped.text;
   if (!text) {
@@ -944,6 +1029,7 @@ export async function submitListenerRequest(input: {
     const id = randomUUID();
     entry = {
       id, status: 'pending', requester, text, source: input.source,
+      provider: settings.get().search?.provider || 'duckduckgo',
       rawText: sanitizeRequestText(rawText),
       injection: stripped.injection,
       ack: null, track: null, queuePosition: null, message: null,

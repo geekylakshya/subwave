@@ -187,16 +187,15 @@ type EvidenceSearchBudget = {
   search(query: string): Promise<WebSearchResponse>;
 };
 
-function evidenceSearchBudget(limit = 3, signal?: AbortSignal): EvidenceSearchBudget {
-  let used = 0;
-  const seen = new Set<string>();
+function evidenceSearchBudget(state: { limit: number; used: number; seen: Set<string> }, signal?: AbortSignal): EvidenceSearchBudget {
+  const seen = state.seen;
   return {
-    get used() { return used; },
+    get used() { return state.used; },
     async search(query: string) {
       const key = requestName(query);
-      if (!key || seen.has(key) || used >= limit) return { answer: '', results: [] };
+      if (!key || seen.has(key) || state.used >= state.limit) return { answer: '', results: [] };
       seen.add(key);
-      used++;
+      state.used++;
       return searchWeb(query, { signal });
     },
   };
@@ -241,6 +240,11 @@ export default definePickerTool({
   available: ({ scope }) => scope.resolveReferences && searchReady(),
   build: (ctx) => {
     const { collect } = ctx;
+    // Unit callers may exercise the tool builder with only the collector. The
+    // request picker supplies these shared accumulators in production, while a
+    // local fallback keeps the tool's standalone contract intact.
+    const evidenceState = ctx.evidenceSearch || { limit: 3, used: 0, seen: new Set<string>() };
+    const failures = ctx.failures || [];
     return tool({
       description: 'Use when a listener DESCRIBES a track instead of naming it, OR pastes SONG LYRICS — e.g. "the song from the new Dune movie", "the one all over TikTok", or a block of lyrics in any language. Looks the text up on the web, identifies the song, and returns matching tracks FROM THIS LIBRARY. Use this (not searchLibrary) when the request looks like lyrics — repeated phrases, verse structure, non-English text that is not an artist/title; when they name an artist or title outright, use searchLibrary. (searchByLyrics finds songs ABOUT a theme — this identifies the one specific song.) Returns { candidates } from this library; when nothing matched, a note says so and you choose a fitting stand-in from your other results.',
       inputSchema: z.object({
@@ -250,7 +254,7 @@ export default definePickerTool({
       try {
         const signal = options.abortSignal;
         signal?.throwIfAborted();
-        const searchBudget = evidenceSearchBudget(3, signal);
+        const searchBudget = evidenceSearchBudget(evidenceState, signal);
         const web = await lyricWebEvidence(reference, searchBudget); // cached 30 min per provider configuration
         let blob = webBlob(web, 5000);
         if (!blob) return { error: 'no web result for that reference' };
@@ -389,7 +393,7 @@ export default definePickerTool({
         return { candidates };
       } catch (err) {
         if (options.abortSignal?.aborted) throw err;
-        if (isWebSearchProviderError(err)) ctx.failures.push(err);
+        if (isWebSearchProviderError(err)) failures.push(err);
           return { error: (err as Error).message };
         }
       },

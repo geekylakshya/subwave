@@ -486,19 +486,17 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     // a broad instruction ("surprise me"), so a local miss must still reach
     // interpretation instead of being frozen into the wrong identity.
     && literal.title!.trim().split(/\s+/u).length === 1;
+  const explicitNoMatchCue = /\b(?:no\s+such|doesn['’]?t\s+exist|does\s+not\s+exist|not\s+in\s+(?:the\s+)?(?:library|catalog(?:ue)?))\b/iu.test(literal.title || '');
   // A framed, unquoted multi-word name is still an identity claim when no
   // artist/attribute is present. Keep a miss honest instead of letting a model
   // omission turn "play qzxv no such recording" into an unrelated fallback.
   // Quoted title-only requests retain the existing alternative policy.
-  const likelyNamedTitle = !lyricLike
+  const forcedNamedTitle = explicitNoMatchCue
     && literal.kind === 'track'
     && Boolean(literal.title?.trim())
     && !literal.artist && !literal.album
-    && !literal.genre && !literal.language && !literal.mood && !literal.energy
-    && literal.title!.trim().split(/\s+/u).length >= 2
     && /^(?:please\s+)?(?:play|queue|request|put\s+on)\b/iu.test(text)
-    && !/["'“‘]/u.test(text)
-    && !/^(?:something|anything|music|a\s+(?:song|track)|surprise\b)/iu.test(literal.title!.trim());
+    && !/["'“‘]/u.test(text);
 
   // Conversational DJ agent. On any failure fall through to the stateless
   // cascade below, so a request is never dropped.
@@ -508,7 +506,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   // descriptions still use the existing web-aware agent path.
   const needsEvidenceIdentification = lyricLike
     || /\b(?:song|track|music)\s+(?:from|in)\b.{0,60}\b(?:film|movie|show|advert|commercial)\b/iu.test(text);
-  if (!explicitNamedRequest && !likelyShortTitle && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
+  if (!explicitNamedRequest && !likelyShortTitle && !forcedNamedTitle && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
     entry.stages.push('web-evidence');
     entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
     try {
@@ -586,7 +584,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   // classifier has identified it as a short title candidate, keep the title
   // identity intact for the catalogue resolver instead.
   let matched = likelyShortTitle ? { ...literal, literal: false, titleOnly: true } : literal;
-  if (!likelyShortTitle && budget.requestsAllowed()) {
+  if (!likelyShortTitle && !forcedNamedTitle && budget.requestsAllowed()) {
     try {
       const interpreted = await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack }, signal);
       throwIfRequestResolutionAborted(signal);
@@ -605,10 +603,10 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   }
   throwIfRequestResolutionAborted(signal);
   matched = normalizeRequestMatch(matched, { moods: settings.moodVocab() });
-  if (likelyNamedTitle && literal.title?.trim()) {
+  if (forcedNamedTitle && literal.title?.trim()) {
     // Preserve the listener's literal title and do not let an interpreter
     // invent an artist that would widen the lookup.
-    matched = { ...matched, kind: 'track', title: literal.title, artist: null, album: null, scope: 'song', literal: true };
+    matched = { ...matched, kind: 'track', title: literal.title, artist: null, album: null, scope: 'song', literal: false, titleOnly: true };
   }
   const unsupported = directRequestUnsupported(text, matched);
   if (unsupported.length) {
@@ -687,7 +685,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     recentIds: cdMin > 0 ? queue.recentlyPlayedIds(cdMin / 60) : new Set<string>(),
     queuedIds: queue.queuedIds(),
     currentId: queue.current?.track?.id,
-    exactOnly: explicitNamedRequest || likelyShortTitle || likelyNamedTitle,
+    exactOnly: explicitNamedRequest || likelyShortTitle || forcedNamedTitle,
     moodSongs: async mood => { await library.load(); return library.songsByMood(mood); },
     energySongs: async energy => { await library.load(); return library.songsByEnergy(energy); },
     fallbackSongs: async () => {

@@ -516,6 +516,12 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // pasted verse from bypassing lyric search and selecting a random track by a
   // parser-invented artist.
   const explicitNamedRequest = !lyricLike && Boolean(literal.title?.trim() && literal.artist?.trim());
+  // A bare title+artist pair is already a complete identity plan. Keep it on
+  // the local-first path instead of waiting on the optional interpreter; the
+  // interpreter is still useful when the same named request carries an
+  // explicit language, genre, mood, or energy constraint that needs parsing.
+  const bareExplicitNamedRequest = explicitNamedRequest
+    && !literal.album && !literal.genre && !literal.language && !literal.mood && !literal.energy;
   // A short, attribute-free request is more likely to be a title than a
   // conversational instruction. Resolve it against the local catalogue first
   // so a provider stall cannot delay a straightforward named request. It is an
@@ -656,7 +662,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
       // A title-only phrase may still benefit from model repair (for example,
       // an unseparated artist and title), but it must not spend the complete
       // request deadline before the local fuzzy catalogue gets a chance.
-      const interpretationSignal = titleOnlyNamedRequest
+      const interpretationSignal = (titleOnlyNamedRequest || bareExplicitNamedRequest)
         ? signal ? AbortSignal.any([signal, AbortSignal.timeout(8_000)]) : AbortSignal.timeout(8_000)
         : signal;
       const interpreted = await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack }, interpretationSignal);

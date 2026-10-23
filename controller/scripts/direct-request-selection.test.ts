@@ -1,9 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  directRequestUnsupported, explicitRequestAttribute, looksLikeLyricRequest, modelFreeRequest, requestedTitle, repairRequestMatch, requestArtistMatches, requestReleaseRank, requestTitleMatches,
+  classifyListenerRequest, directRequestUnsupported, explicitRequestAttribute, looksLikeLyricRequest, modelFreeRequest, requestedTitle, repairRequestMatch, requestArtistMatches, requestReleaseRank, requestTitleMatches,
   resolveDirectRequest, type RequestCatalog, type RequestMatch, type RequestSong,
 } from '../src/music/request-match.js';
+
+test('listener requests are classified into deterministic resolver lanes', () => {
+  assert.equal(classifyListenerRequest('Bohemian Rhapsody by Queen'), 'named-song-or-artist');
+  assert.equal(classifyListenerRequest('the song from the new Dune movie'), 'lyrics-or-description');
+  assert.equal(classifyListenerRequest('play energetic Punjabi rock'), 'attributes');
+  assert.equal(classifyListenerRequest('surprise me'), 'ambiguous-music');
+  assert.equal(classifyListenerRequest('how are you today?'), 'non-music-chat');
+});
 
 const exact: RequestSong = { id: 'exact', title: 'Bohemian Rhapsody', artist: 'Queen', album: 'A Night at the Opera', genre: 'Rock' };
 const other: RequestSong = { id: 'other', title: 'Another Song', artist: 'Queen', album: 'Other Album', genre: 'Jazz' };

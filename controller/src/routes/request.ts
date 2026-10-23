@@ -28,13 +28,45 @@ import {
 } from '../middleware/ratelimit.js';
 import { validatePublicBody } from '../middleware/validate.js';
 import { listenerRequestSchema } from '../schemas/request.js';
-import { directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
+import { classifyListenerRequest, directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
 import { ARTIST_VARIETY_WINDOW, drawRequestCandidate } from '../broadcast/dj-agent/artist-guard.js';
 import { RequestIdentificationMiss } from '../broadcast/dj-agent/breaker.js';
+import { isWebSearchProviderError } from '../skills/web-search.js';
 
 export const router = express.Router();
+
+export type ListenerRequestSource = 'browser' | 'alexa';
+export type ListenerResolutionOutcome =
+  | 'matched'
+  | 'no-match'
+  | 'already-queued'
+  | 'cooldown'
+  | 'unsupported'
+  | 'provider-error';
+
+export interface ListenerRequestResolution {
+  outcome: ListenerResolutionOutcome;
+  legacyOutcome: string;
+  ack: string | null;
+  message: string | null;
+  track: { title?: string; artist?: string; id?: string } | null;
+  queuePosition: number | null;
+}
+
+export type ListenerRequestSubmission = {
+  accepted: true;
+  requestId: string;
+  status: 'pending';
+  completion: Promise<ListenerRequestResolution>;
+} | {
+  accepted: false;
+  statusCode: number;
+  message?: string;
+  error?: string;
+  retryAfter?: number;
+};
 
 // In-memory request index for fast polling and admission checks. The durable
 const requests = new Map();
@@ -139,6 +171,7 @@ function recordOutcome(entry) {
       t: new Date(entry.createdAt).toISOString(),
       id: String(entry.id).slice(0, 8),
       requester: entry.requester,
+      source: entry.source || 'browser',
       text: entry.text,
       rawText: entry.rawText ?? null,
       injection: entry.injection ?? null,
@@ -162,6 +195,14 @@ function recordOutcome(entry) {
       interpretationFallback: entry.interpretationFallback ?? false,
       unsupported: entry.unsupported ?? [],
       unmetPreferences: entry.unmetPreferences ?? [],
+      provider: entry.provider ?? settings.get().search?.provider ?? null,
+      providerFailure: entry.providerFailure ?? null,
+      classification: entry.classification ?? null,
+      stages: entry.stages ?? [],
+      candidateCount: entry.candidateCount ?? 0,
+      confidence: entry.confidence ?? null,
+      evidenceSource: entry.evidenceSource ?? null,
+      finalReason: entry.finalReason ?? entry.pickSource ?? entry.outcome ?? null,
       track: entry.pick
         ? { title: entry.pick.title, artist: entry.pick.artist, id: entry.pick.id }
         : (entry.track || null),
@@ -395,6 +436,8 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   // requests still use the agent, including its existing web-search tool.
   const literal = modelFreeMatch(text);
   const lyricLike = looksLikeLyricRequest(text);
+  entry.classification = classifyListenerRequest(text, literal);
+  entry.stages = ['classified', 'local-literal'];
   // Long lyric/prose input can contain commas or "by" and look like an
   // artist-title pair to the literal parser. It is not an identity claim: the
   // web-aware request agent must get first chance to identify it. This keeps a
@@ -411,8 +454,12 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     && Boolean(literal.title?.trim())
     && !literal.artist && !literal.album
     && !literal.genre && !literal.language && !literal.mood && !literal.energy
-    && !/^(?:hello|hi|hey)(?:\s+(?:dj|radio|there|subwave|chill\s+zone))?[.!?]*$/iu.test(literal.title!.trim())
-    && literal.title!.trim().split(/\s+/u).length <= 4;
+    && !/^(?:hello|hi|hey|surprise|anything|something|music)(?:\s+(?:me|dj|radio|there|subwave|chill\s+zone))?[.!?]*$/iu.test(literal.title!.trim())
+    // One-word asks are the high-confidence local-first case. Multi-word
+    // text can be an unseparated artist+title ("Queen Bohemian Rhapsody") or
+    // a broad instruction ("surprise me"), so a local miss must still reach
+    // interpretation instead of being frozen into the wrong identity.
+    && literal.title!.trim().split(/\s+/u).length === 1;
 
   // Conversational DJ agent. On any failure fall through to the stateless
   // cascade below, so a request is never dropped.
@@ -421,8 +468,10 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   // resolver so every listener request follows the same deterministic path. Lyric and film
   // descriptions still use the existing web-aware agent path.
   const needsEvidenceIdentification = lyricLike
-    || /\b(?:song|track|music)\s+(?:from|in)\s+(?:the\s+)?(?:film|movie|show|advert|commercial)\b/iu.test(text);
+    || /\b(?:song|track|music)\s+(?:from|in)\b.{0,60}\b(?:film|movie|show|advert|commercial)\b/iu.test(text);
   if (!explicitNamedRequest && !likelyShortTitle && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
+    entry.stages.push('web-evidence');
+    entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
     try {
       const agentRes = await djAgent.runRequest(queue, { requester, text });
       throwIfRequestResolutionAborted(signal);
@@ -467,6 +516,14 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
         entry.pickSource = 'agent:evidence-miss';
         entry.outcome = 'no-match';
         return failed(EVIDENCE_MISS_REFUSAL);
+      }
+      if (isWebSearchProviderError(err)) {
+        entry.path = 'agent';
+        entry.pickSource = 'agent:provider-error';
+        entry.outcome = 'provider-error';
+        entry.provider = err.provider;
+        entry.providerFailure = err.reason;
+        return failed('The configured search provider could not resolve that request. Try again shortly.');
       }
       // Provider, tool, timeout, and malformed-response failures retain the
       // stateless cascade. They are infrastructure failures, not evidence
@@ -604,6 +661,13 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
   throwIfRequestResolutionAborted(signal);
   const pick = selection.track;
   const pickSource = selection.source;
+  entry.stages.push('local-candidate-ranking');
+  entry.candidateCount = new Set([
+    ...searches.flatMap(search => search.hits.map(hit => hit?.id).filter(Boolean)),
+    ...(selection.alternatives || []).map(candidate => candidate.id),
+    ...(selection.track?.id ? [selection.track.id] : []),
+  ]).size;
+  entry.confidence = selection.confidence ?? (selection.track ? 1 : null);
   entry.outcome = selection.outcome;
   entry.lookupErrors = selection.errors;
   entry.unmetPreferences = selection.unmetPreferences || [];
@@ -726,11 +790,33 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
 // a normal terminal closure in resolveRequestCore or is failed here when the
 // bounded wall-clock budget expires. A stalled provider must never leave the
 // durable receipt pending forever.
-async function resolveRequest(entry) {
+function typedResolution(entry): ListenerRequestResolution {
+  const legacyOutcome = String(entry.outcome || 'no-match');
+  const outcome: ListenerResolutionOutcome = legacyOutcome === 'already-queued' || legacyOutcome === 'cooldown'
+    ? legacyOutcome
+    : legacyOutcome === 'unsupported' || legacyOutcome === 'chat'
+      ? 'unsupported'
+      : legacyOutcome === 'provider-error' || legacyOutcome === 'timeout' || legacyOutcome === 'error'
+        ? 'provider-error'
+        : entry.status === 'resolved' && (entry.track || entry.pick)
+          ? 'matched'
+          : 'no-match';
+  const track = entry.pick || entry.track || null;
+  return {
+    outcome,
+    legacyOutcome,
+    ack: entry.ack || null,
+    message: entry.message || null,
+    track: track ? { title: track.title, artist: track.artist, ...(track.id ? { id: track.id } : {}) } : null,
+    queuePosition: typeof entry.queuePosition === 'number' ? entry.queuePosition : null,
+  };
+}
+
+export async function resolveListenerRequest(entry): Promise<ListenerRequestResolution> {
   try {
     await withDeadline(requestResolutionTimeoutMs(), 'request resolution', signal => resolveRequestCore(entry, signal));
   } catch (err) {
-    if (entry.status === 'cancelled' || entry.status === 'resolved' || entry.status === 'failed') return;
+    if (entry.status === 'cancelled' || entry.status === 'resolved' || entry.status === 'failed') return typedResolution(entry);
     const timedOut = err?.name === 'AgentDeadlineError'
       || /request resolution.*deadline|request resolution.*aborted/i.test(String(err?.message || ''));
     entry.outcome = timedOut ? 'timeout' : 'error';
@@ -741,6 +827,7 @@ async function resolveRequest(entry) {
     queue.log('error', `Request resolution ${timedOut ? 'timed out' : 'failed'}: ${err?.message || err}`);
     recordOutcome(entry);
   }
+  return typedResolution(entry);
 }
 
 // Validates + rate-limits synchronously, then resolves in the background.
@@ -749,35 +836,44 @@ async function resolveRequest(entry) {
 // needs server state the schema can't see.
 // validatePublicBody, not validateBody: the one LISTENER-facing form, so the 400
 // carries an unprefixed message plus the success/message keys the native app reads.
-router.post('/request', validatePublicBody(listenerRequestSchema), async (req, res) => {
+export async function submitListenerRequest(input: {
+  text: string;
+  name?: string;
+  ip: string;
+  source: ListenerRequestSource;
+}): Promise<ListenerRequestSubmission> {
   const cfg = (settings.get() as any)?.requests || {};
   if (REQUESTS_DISABLED || cfg.enabled === false) {
-    return res.status(503).json({ success: false, message: 'Requests are temporarily closed.' });
+    return { accepted: false, statusCode: 503, message: 'Requests are temporarily closed.' };
   }
 
   // Zero-listener pause.
   await listeners.refresh();
   if (!listeners.djCallsAllowed()) {
-    return res.status(503).json({
-      success: false,
+    return {
+      accepted: false,
+      statusCode: 503,
       message: "The DJ's on autopilot — requests reopen when someone's tuned in.",
-    });
+    };
   }
 
   // req.body is already the parsed shape. Only the cleaned text reaches the
   // session/prompts/air; the raw text is kept on the entry for the operator log.
   // The schema has bounded both the original text and its NFKC expansion.
-  const { text: rawText, name: rawName } = req.body as { text: string; name: string };
+  const rawText = input.text;
+  const rawName = input.name || '';
   const stripped = stripScriptedOpener(sanitizeRequestText(rawText));
   const text = stripped.text;
   if (!text) {
     // Distinguish "typed nothing" from "it was all staging directions", which an
     // ordinary listener can hit via a false positive. Never echo the text back.
-    return res.status(400).json({
+    return {
+      accepted: false,
+      statusCode: 400,
       error: stripped.injection
         ? "Couldn't read a song request in that — try just the artist, title, or a vibe."
         : 'Empty request',
-    });
+    };
   }
   const s = settings.get() as any;
   const reservedNames = [
@@ -787,7 +883,7 @@ router.post('/request', validatePublicBody(listenerRequestSchema), async (req, r
   ];
   const requester = cleanRequesterName(rawName, reservedNames);
 
-  const ip = clientIp(req);
+  const ip = input.ip;
   let entry: any;
   const releaseAdmission = await acquireAdmissionLock();
   try {
@@ -796,32 +892,32 @@ router.post('/request', validatePublicBody(listenerRequestSchema), async (req, r
     pruneRequests();
     const gate = checkRateLimit(ip);
     if (!gate.ok) {
-      res.setHeader('Retry-After', String(gate.retryAfter));
-      return res.status(429).json({
-        success: false,
+      return {
+        accepted: false,
+        statusCode: 429,
         message: `Easy there — try again in ${gate.retryAfter}s.`,
         retryAfter: gate.retryAfter,
-      });
+      };
     }
     const globalGate = checkGlobalRateLimit();
     if (!globalGate.ok) {
-      res.setHeader('Retry-After', String(globalGate.retryAfter));
-      return res.status(429).json({
-        success: false,
+      return {
+        accepted: false,
+        statusCode: 429,
         message: 'The request line is busy — try again in a few minutes.',
         retryAfter: globalGate.retryAfter,
-      });
+      };
     }
     // Both queue-state refusals carry the COOLDOWN as Retry-After: checkRateLimit
     // already stamped it, so the caller genuinely cannot succeed before it expires.
     const retryAfter = Number(cfg.cooldownSec) > 0 ? Number(cfg.cooldownSec) : 60;
     if (cfg.onePendingPerIp !== false && stillInFlight(lastByIp.get(ip), queue.queuedIds())) {
-      res.setHeader('Retry-After', String(retryAfter));
-      return res.status(429).json({
-        success: false,
+      return {
+        accepted: false,
+        statusCode: 429,
         message: 'Your last request is still queued — it airs first.',
         retryAfter,
-      });
+      };
     }
     // LISTENER requests only — an operator's own studio push carries
     // `requestedBy: 'studio'` for the air-path exemptions and must not consume a
@@ -831,12 +927,12 @@ router.post('/request', validatePublicBody(listenerRequestSchema), async (req, r
     // overlap between a push and its entry settling errs toward refusing.
     const pendingCount = queue.pendingListenerRequests() + resolvingRequestCount();
     if (pendingCount >= (Number(cfg.maxPending) || 6)) {
-      res.setHeader('Retry-After', String(retryAfter));
-      return res.status(429).json({
-        success: false,
+      return {
+        accepted: false,
+        statusCode: 429,
         message: "The request queue's full — try again in a few minutes.",
         retryAfter,
-      });
+      };
     }
 
     // Spend the hourly budgets only after the queue-state gates: those reject
@@ -847,7 +943,7 @@ router.post('/request', validatePublicBody(listenerRequestSchema), async (req, r
 
     const id = randomUUID();
     entry = {
-      id, status: 'pending', requester, text,
+      id, status: 'pending', requester, text, source: input.source,
       rawText: sanitizeRequestText(rawText),
       injection: stripped.injection,
       ack: null, track: null, queuePosition: null, message: null,
@@ -862,18 +958,28 @@ router.post('/request', validatePublicBody(listenerRequestSchema), async (req, r
   }
 
   queue.log('request', `${requester}: "${text}" (id ${entry.id.slice(0, 8)})${stripped.injection ? ` [${stripped.injection} stripped]` : ''}`);
-  webhooks.notify('request.received', { requestedBy: requester, text });
+  webhooks.notify('request.received', { requestedBy: requester, text, source: input.source });
+  const completion = Promise.resolve().then(() => resolveListenerRequest(entry));
+  return { accepted: true, requestId: entry.id, status: 'pending', completion };
+}
 
-  // Hand back a receipt and let go of the connection.
-  res.status(202).json({ success: true, requestId: entry.id, status: 'pending' });
-
-  resolveRequest(entry).catch(err => {
-    queue.log('error', `Request resolution crashed: ${err.message}`);
-    entry.outcome = 'error';
-    entry.status = 'failed';
-    entry.message = 'Something went wrong in the booth — try again.';
-    recordOutcome(entry);
+router.post('/request', validatePublicBody(listenerRequestSchema), async (req, res) => {
+  const { text, name } = req.body as { text: string; name: string };
+  const submission = await submitListenerRequest({
+    text,
+    name,
+    ip: clientIp(req),
+    source: 'browser',
   });
+  if (!submission.accepted) {
+    if (submission.retryAfter) res.setHeader('Retry-After', String(submission.retryAfter));
+    if (submission.error) return res.status(submission.statusCode).json({ error: submission.error });
+    return res.status(submission.statusCode).json({ success: false, message: submission.message });
+  }
+
+  // Hand back a receipt and let go of the connection. The completion promise
+  // is retained by voice clients; browser clients poll the existing endpoint.
+  res.status(202).json({ success: true, requestId: submission.requestId, status: submission.status });
 });
 
 // Poll for the outcome of a submitted request.

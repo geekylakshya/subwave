@@ -14,6 +14,41 @@ const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
 type SearchResult = { title: string; content: string; url?: string };
 type SearchResponse = { answer: string; results: SearchResult[] };
 
+export type WebSearchFailureReason = 'timeout' | 'rate-limit' | 'captcha' | 'malformed' | 'unavailable';
+
+export class WebSearchProviderError extends Error {
+  readonly providerFailure = true;
+
+  constructor(
+    readonly provider: string,
+    readonly reason: WebSearchFailureReason,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'WebSearchProviderError';
+  }
+}
+
+export function isWebSearchProviderError(error: unknown): error is WebSearchProviderError {
+  return error instanceof WebSearchProviderError || (error as { providerFailure?: unknown })?.providerFailure === true;
+}
+
+function typedProviderError(provider: string, error: unknown): WebSearchProviderError {
+  if (isWebSearchProviderError(error)) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  const reason: WebSearchFailureReason = (error as { name?: string })?.name === 'AbortError' || /tim(?:ed? out|eout)|aborted/i.test(message)
+    ? 'timeout'
+    : /\b429\b|rate.?limit|too many requests/i.test(message)
+      ? 'rate-limit'
+      : /captcha|challenge|verify you are human/i.test(message)
+        ? 'captcha'
+        : error instanceof SyntaxError || /invalid json|malformed/i.test(message)
+          ? 'malformed'
+          : 'unavailable';
+  return new WebSearchProviderError(provider, reason, `${provider} search failed: ${message}`, { cause: error });
+}
+
 // 30-min TTL cache keyed by `${provider}:${query}`. BOUNDED: the request path's
 // identifyRequestedTrack searches on a listener's free-text description, so the
 // key space is open-ended. Expired entries go first when the cap is reached, then
@@ -24,6 +59,7 @@ const cache = new BoundedKeyMap<{ val: SearchResponse; at: number }>({
   maxKeys: CACHE_MAX_KEYS,
   isLive: (rec, now) => now - rec.at < CACHE_TTL_MS,
 });
+const inFlight = new Map<string, Promise<SearchResponse>>();
 
 // Test seam.
 export function searchCacheSize(): number {
@@ -37,18 +73,53 @@ async function memo(
 ): Promise<SearchResponse> {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < ttl) return hit.val;
-  const val = await fn();
-  // Empty responses are usually transient provider failures or upstream
-  // timeouts represented as a successful empty JSON response. Caching them
-  // for the full TTL turns one bad search into a 30-minute outage for the
-  // request resolver. Keep useful evidence cached, but let the next request
-  // retry an empty result immediately.
-  if (val.answer.trim() || val.results.length > 0) cache.set(key, { val, at: Date.now() });
-  return val;
+  const pending = inFlight.get(key);
+  if (pending) return pending;
+  const request = (async () => {
+    const val = await fn();
+    // Empty responses are usually transient provider failures or upstream
+    // timeouts represented as a successful empty JSON response. Caching them
+    // for the full TTL turns one bad search into a 30-minute outage for the
+    // request resolver. Keep useful evidence cached, but let the next request
+    // retry an empty result immediately.
+    if (val.answer.trim() || val.results.length > 0) cache.set(key, { val, at: Date.now() });
+    return val;
+  })();
+  inFlight.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (inFlight.get(key) === request) inFlight.delete(key);
+  }
 }
 
-export async function tavilySearch(query: string): Promise<SearchResponse> {
+function normalizedSearchQuery(query: string): string {
+  return query.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en');
+}
+
+/**
+ * Cache identity follows the selected provider configuration. A live settings
+ * change must never reuse evidence fetched from another SearXNG instance or
+ * another engine set.
+ */
+export function searchCacheKey(
+  query: string,
+  opts?: { recency?: 'day' | 'week' | 'month' },
+): string {
+  const search = settings.get().search;
+  const provider = search?.provider || 'duckduckgo';
+  return JSON.stringify({
+    provider,
+    baseUrl: provider === 'searxng' ? String(search?.baseUrl || '').trim().replace(/\/+$/, '') : '',
+    engines: provider === 'searxng' ? String(search?.searxngEngines || '').trim() : '',
+    recency: opts?.recency || '',
+    query: normalizedSearchQuery(query),
+  });
+}
+
+export async function tavilySearch(query: string, signal?: AbortSignal): Promise<SearchResponse> {
   const apiKey = settings.get().search?.apiKey || process.env.SEARCH_API_KEY || config.search.apiKey;
+  if (!apiKey) throw new Error('Tavily API key not configured');
   const res = await fetchWithTimeout(TAVILY_ENDPOINT, {
     method: 'POST',
     headers: {
@@ -62,6 +133,7 @@ export async function tavilySearch(query: string): Promise<SearchResponse> {
       include_answer: true,
       max_results: 5,
     }),
+    signal,
     timeoutMs: 30_000,
   });
   if (!res.ok) throw new Error(`Tavily HTTP ${res.status}`);
@@ -94,7 +166,7 @@ export async function tavilySearch(query: string): Promise<SearchResponse> {
 // undici's ~300s default. memo() only caches AFTER the call resolves, so
 // concurrent duplicate queries each open their own socket rather than sharing
 // one.
-export async function duckduckgoSearch(query: string): Promise<SearchResponse> {
+export async function duckduckgoSearch(query: string, signal?: AbortSignal): Promise<SearchResponse> {
   const url = new URL(DDG_ENDPOINT);
   url.searchParams.set('q', query);
   url.searchParams.set('format', 'json');
@@ -105,6 +177,7 @@ export async function duckduckgoSearch(query: string): Promise<SearchResponse> {
     headers: {
       'User-Agent': 'SUB-WAVE radio controller (https://github.com/perminder-klair/subwave)',
     },
+    signal,
     timeoutMs: 30_000,
   });
   if (!res.ok) throw new Error(`DuckDuckGo HTTP ${res.status}`);
@@ -145,6 +218,7 @@ export async function duckduckgoSearch(query: string): Promise<SearchResponse> {
 export async function searxngSearch(
   query: string,
   recency?: 'day' | 'week' | 'month',
+  signal?: AbortSignal,
 ): Promise<SearchResponse> {
   const baseUrl = (settings.get().search?.baseUrl || '').trim();
   if (!baseUrl) throw new Error('SearXNG baseUrl not configured');
@@ -160,6 +234,7 @@ export async function searxngSearch(
     headers: {
       'User-Agent': 'SUB-WAVE radio controller (https://github.com/perminder-klair/subwave)',
     },
+    signal,
     timeoutMs: 30_000,
   });
   if (!res.ok) throw new Error(`SearXNG HTTP ${res.status}`);
@@ -231,6 +306,7 @@ export function parseSearxngResponse(data: unknown): SearchResponse {
 export async function braveSearch(
   query: string,
   recency?: 'day' | 'week' | 'month',
+  signal?: AbortSignal,
 ): Promise<SearchResponse> {
   const apiKey = settings.get().search?.apiKey || process.env.SEARCH_API_KEY || config.search.apiKey;
   if (!apiKey) throw new Error('Brave Search API key not configured');
@@ -248,6 +324,7 @@ export async function braveSearch(
       Accept: 'application/json',
       'X-Subscription-Token': apiKey,
     },
+    signal,
     timeoutMs: 30_000,
   });
   if (!res.ok) throw new Error(`Brave Search HTTP ${res.status}`);
@@ -319,17 +396,21 @@ export function parseBraveResponse(data: unknown): SearchResponse {
 // recency hints don't share results.
 export async function searchWeb(
   query: string,
-  opts?: { recency?: 'day' | 'week' | 'month' },
+  opts?: { recency?: 'day' | 'week' | 'month'; signal?: AbortSignal },
 ): Promise<SearchResponse> {
   const provider = settings.get().search?.provider || 'duckduckgo';
   const recency = opts?.recency;
-  const key = `${provider}:${recency || ''}:${query.toLowerCase()}`;
-  return memo(key, CACHE_TTL_MS, () => {
-    if (provider === 'searxng') return searxngSearch(query, recency);
-    if (provider === 'tavily') return tavilySearch(query);
-    if (provider === 'brave') return braveSearch(query, recency);
-    return duckduckgoSearch(query);
-  });
+  const key = searchCacheKey(query, opts);
+  try {
+    return await memo(key, CACHE_TTL_MS, () => {
+      if (provider === 'searxng') return searxngSearch(query, recency, opts?.signal);
+      if (provider === 'tavily') return tavilySearch(query, opts?.signal);
+      if (provider === 'brave') return braveSearch(query, recency, opts?.signal);
+      return duckduckgoSearch(query, opts?.signal);
+    });
+  } catch (error) {
+    throw typedProviderError(provider, error);
+  }
 }
 
 // True when the active search provider is usable right now.

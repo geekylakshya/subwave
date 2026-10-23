@@ -1913,6 +1913,8 @@ async function runRequestViaAgent(queue: any, { requester, text }: { requester: 
         idInSessionWindow: !!(object?.id && windowText.includes(object.id)),
       });
       if (extras.seen.size === 0) {
+        const providerFailure = extras.failures?.find((failure: any) => failure?.providerFailure === true);
+        if (providerFailure) throw providerFailure;
         throw new RequestIdentificationMiss(`request agent found no matching track for id ${object?.id ?? 'none'}`);
       }
       throw new Error(`request agent returned unknown id ${object?.id}`);

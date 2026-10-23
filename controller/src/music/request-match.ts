@@ -334,20 +334,47 @@ function artistIdentityKey(value: unknown): string {
   return requestName(key).replace(/^the (?=\S)/, '') || key;
 }
 
+function artistIdentityVariants(value: unknown): string[] {
+  return requestNameVariants(value)
+    .map(key => key.replace(/^the (?=\S)/, '').trim())
+    .filter(Boolean);
+}
+
 export function requestArtistMatches(want: unknown, song: RequestSong): boolean {
-  const artist = artistIdentityKey(want);
-  if (!artist) return true;
+  const artists = artistIdentityVariants(want);
   const credits = [song.artist, ...(Array.isArray(song.artists) ? song.artists.map(a => (a as { name?: string })?.name) : [])];
-  return credits.some(credit => [artistNameKey(credit), ...artistParticipantKeys(String(credit ?? ''))]
-    .some(key => artistIdentityKey(key) === artist));
+  const rawWant = String(want ?? '').trim();
+  if (!rawWant) return true;
+  // requestName intentionally drops punctuation. Punctuation-only recordings
+  // are still real identities, so an unnormalizable request may only match its
+  // exact NFC/case-folded spelling rather than acting as a wildcard.
+  if (!artists.length) {
+    const wantedKey = nameKey(rawWant);
+    return credits.some(credit => nameKey(credit) === wantedKey);
+  }
+  return credits.some((credit) => {
+    const keys = [artistNameKey(credit), ...artistParticipantKeys(String(credit ?? ''))];
+    return keys.some((key) => {
+      const variants = artistIdentityVariants(key);
+      return variants.some((variant) => artists.includes(variant));
+    });
+  });
 }
 
 export function requestArtistSimilarity(want: unknown, song: RequestSong): number {
-  const requested = String(want ?? '').trim();
-  if (!requested) return 1;
+  const requested = artistIdentityVariants(want);
+  if (!requested.length) return 1;
   const credits = [song.artist, ...(Array.isArray(song.artists) ? song.artists.map(a => (a as { name?: string })?.name) : [])]
     .filter(Boolean) as string[];
-  return credits.reduce((best, credit) => Math.max(best, requestTextSimilarity(requested, credit)), 0);
+  return credits.reduce((best, credit) => {
+    const variants = artistIdentityVariants(credit);
+    const score = requested.reduce((inner, value) => {
+      const valueScore = variants.reduce((variantBest, candidate) =>
+        Math.max(variantBest, requestTextSimilarity(value, candidate)), 0);
+      return Math.max(inner, valueScore);
+    }, 0);
+    return Math.max(best, score);
+  }, 0);
 }
 
 export function requestedTitle(match: RequestMatch, text?: string): string | null {
@@ -391,15 +418,51 @@ function undecorated(value: unknown, patterns: RegExp[]): string {
 export function requestTitleMatches(want: unknown, got: unknown): boolean {
   // Names such as "?" and "!!!" are real identities, not two empty keys.
   if (!requestName(want) || !requestName(got)) return nameKey(want) === nameKey(got);
-  if (titleIdentityKey(want) === titleIdentityKey(got)) return true;
+  const wantKeys = requestNameVariants(want).map(titleIdentityKey);
+  const gotKeys = requestNameVariants(got).map(titleIdentityKey);
+  if (wantKeys.some(key => gotKeys.includes(key))) return true;
   const wanted = undecorated(want, FEATURED_CREDIT);
   const edition = undecorated(want, [...FEATURED_CREDIT, EDITION]) !== wanted;
-  return titleIdentityKey(wanted) === titleIdentityKey(undecorated(got, edition ? FEATURED_CREDIT : [...FEATURED_CREDIT, EDITION]));
+  const gotTitle = undecorated(got, edition ? FEATURED_CREDIT : [...FEATURED_CREDIT, EDITION]);
+  return requestNameVariants(wanted).map(titleIdentityKey)
+    .some(key => requestNameVariants(gotTitle).map(titleIdentityKey).includes(key));
 }
 
 export function requestTitleSimilarity(want: unknown, got: unknown): number {
   if (requestTitleMatches(want, got)) return 1;
   return requestTextSimilarity(undecorated(want, FEATURED_CREDIT), undecorated(got, FEATURED_CREDIT));
+}
+
+// Alias verification is intentionally request-local. Web text can nominate a
+// relationship between the listener's name and a real catalogue title, but it
+// cannot manufacture an id; the returned candidate is always one of the
+// caller-supplied Navidrome tracks and must still agree on artist.
+export function rankAliasCandidates(
+  requestedTitle: string,
+  requestedArtist: string,
+  candidates: RequestSong[],
+  evidence: string,
+): RequestSong | null {
+  const blob = requestName(evidence);
+  const wantedTitle = requestNameVariants(requestedTitle);
+  const wantedArtist = requestNameVariants(requestedArtist);
+  const rows = candidates
+    .filter(song => requestArtistMatches(requestedArtist, song))
+    .map(song => {
+      const titleScore = Math.max(...wantedTitle.map(value => requestTitleSimilarity(value, song.title)));
+      const localTitle = requestNameVariants(song.title);
+      const evidenceBacked = !!blob
+        && wantedTitle.some(value => blob.includes(value))
+        && localTitle.some(value => blob.includes(value))
+        && wantedArtist.some(value => blob.includes(value));
+      return { song, score: titleScore + (evidenceBacked ? 0.55 : 0), titleScore, evidenceBacked };
+    })
+    .filter(row => row.evidenceBacked || row.titleScore >= 0.92)
+    .sort((a, b) => b.score - a.score || String(a.song.id).localeCompare(String(b.song.id)));
+  const top = rows[0];
+  if (!top) return null;
+  const tied = rows[1] && Math.abs(rows[1].score - top.score) < 0.08;
+  return tied ? null : top.song;
 }
 
 export function modelFreeRequest(text: string): RequestMatch {

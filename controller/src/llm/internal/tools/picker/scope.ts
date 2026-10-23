@@ -79,6 +79,10 @@ export interface PickerScope {
   // Request path only: registers identifyRequestedTrack. No-op unless a
   // web-search provider is ready. Never set on the per-track picker.
   resolveReferences: boolean;
+  // Request-only evidence budget shared by every identifyRequestedTrack tool
+  // invocation in one agent run. This prevents a model retry from exceeding
+  // the three-search provider budget.
+  evidenceSearch?: { limit: number; used: number; seen: Set<string> };
 }
 
 // Every field defaults to "no constraint". Spread over a partial so there is
@@ -106,6 +110,7 @@ const NO_SCOPE: PickerScope = {
   listenerFavourites: null,
   audioWaypoint: null,
   resolveReferences: false,
+  evidenceSearch: undefined,
 };
 
 export function pickerScope(partial: Partial<PickerScope> = {}): PickerScope {
@@ -130,6 +135,7 @@ export interface PickerContext {
   // Typed dependency failures observed by tools. The request path uses this
   // to distinguish an evidence miss from a configured provider outage.
   failures: unknown[];
+  evidenceSearch: { limit: number; used: number; seen: Set<string> };
   collect(list: any, cap?: number, opts?: CollectOptions): any[];
   // Widen source fetches under strict show locks, before collect's hard filter.
   candidateLimit(limit: number): number;
@@ -158,6 +164,7 @@ export function buildPickerContext(scope: PickerScope): PickerContext {
 
   const seen = new Map<string, any>();
   const failures: unknown[] = [];
+  const evidenceSearch = scope.evidenceSearch || { limit: 3, used: 0, seen: new Set<string>() };
 
   // #1655: only ~7% of the reported library passed instrumental + low energy.
   // A bounded 5x fetch gives the hard filters more neighbours to work with,
@@ -310,5 +317,5 @@ export function buildPickerContext(scope: PickerScope): PickerContext {
     return { tracks: [] as any[], matched: 0, fellBack: false };
   };
 
-  return { scope, seen, failures, collect, candidateLimit, emptyResult, seedSimilarity, knnExclude, stats, hasTextEmbeddings, hasAudioEmbeddings, hasEmbeddingProvider, textIndexDegraded };
+  return { scope, seen, failures, evidenceSearch, collect, candidateLimit, emptyResult, seedSimilarity, knnExclude, stats, hasTextEmbeddings, hasAudioEmbeddings, hasEmbeddingProvider, textIndexDegraded };
 }

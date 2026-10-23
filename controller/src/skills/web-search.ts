@@ -70,13 +70,16 @@ async function memo(
   key: string,
   ttl: number,
   fn: () => Promise<SearchResponse>,
+  signal?: AbortSignal,
 ): Promise<SearchResponse> {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < ttl) return hit.val;
   const pending = inFlight.get(key);
-  if (pending) return pending;
-  const request = (async () => {
-    const val = await fn();
+  if (pending) return awaitWithAbort(pending, signal);
+  // Publish the promise before starting the provider call. Some fetch seams
+  // invoke their mock synchronously; starting `fn()` first leaves a tiny race
+  // where two same-tick callers both miss the in-flight map.
+  const request = Promise.resolve().then(fn).then(val => {
     // Empty responses are usually transient provider failures or upstream
     // timeouts represented as a successful empty JSON response. Caching them
     // for the full TTL turns one bad search into a 30-minute outage for the
@@ -84,13 +87,33 @@ async function memo(
     // retry an empty result immediately.
     if (val.answer.trim() || val.results.length > 0) cache.set(key, { val, at: Date.now() });
     return val;
-  })();
+  });
   inFlight.set(key, request);
-  try {
-    return await request;
-  } finally {
+  const clear = () => {
     if (inFlight.get(key) === request) inFlight.delete(key);
-  }
+  };
+  request.then(clear, clear);
+  return awaitWithAbort(request, signal);
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      value => {
+        cleanup();
+        resolve(value);
+      },
+      error => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 function normalizedSearchQuery(query: string): string {
@@ -135,9 +158,14 @@ export async function tavilySearch(query: string, signal?: AbortSignal): Promise
     }),
     signal,
     timeoutMs: 30_000,
+    bodyDeadline: true,
   });
   if (!res.ok) throw new Error(`Tavily HTTP ${res.status}`);
   const data: any = await res.json();
+  if (!data || typeof data !== 'object' || Array.isArray(data)
+    || (!Array.isArray(data.results) && typeof data.answer !== 'string')) {
+    throw new Error('Tavily returned malformed JSON');
+  }
   return {
     answer: String(data.answer || '').trim(),
     results: Array.isArray(data.results)
@@ -179,9 +207,13 @@ export async function duckduckgoSearch(query: string, signal?: AbortSignal): Pro
     },
     signal,
     timeoutMs: 30_000,
+    bodyDeadline: true,
   });
   if (!res.ok) throw new Error(`DuckDuckGo HTTP ${res.status}`);
   const data: any = await res.json();
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('DuckDuckGo returned malformed JSON');
+  }
   const answer = String(data.AbstractText || data.Abstract || '').trim();
   const topics = Array.isArray(data.RelatedTopics) ? data.RelatedTopics : [];
   const results: SearchResult[] = [];
@@ -236,9 +268,17 @@ export async function searxngSearch(
     },
     signal,
     timeoutMs: 30_000,
+    bodyDeadline: true,
   });
   if (!res.ok) throw new Error(`SearXNG HTTP ${res.status}`);
   const data = await res.json();
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('SearXNG returned malformed JSON');
+  }
+  const shape = data as Record<string, unknown>;
+  if (!('results' in shape) && !('answers' in shape) && !('infoboxes' in shape)) {
+    throw new Error('SearXNG returned malformed JSON');
+  }
   return parseSearxngResponse(data);
 }
 
@@ -326,9 +366,17 @@ export async function braveSearch(
     },
     signal,
     timeoutMs: 30_000,
+    bodyDeadline: true,
   });
   if (!res.ok) throw new Error(`Brave Search HTTP ${res.status}`);
   const data = await res.json();
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('Brave Search returned malformed JSON');
+  }
+  const shape = data as Record<string, unknown>;
+  if (!('web' in shape) && !('news' in shape) && !('infobox' in shape)) {
+    throw new Error('Brave Search returned malformed JSON');
+  }
   return parseBraveResponse(data);
 }
 
@@ -403,12 +451,13 @@ export async function searchWeb(
   const key = searchCacheKey(query, opts);
   try {
     return await memo(key, CACHE_TTL_MS, () => {
-      if (provider === 'searxng') return searxngSearch(query, recency, opts?.signal);
-      if (provider === 'tavily') return tavilySearch(query, opts?.signal);
-      if (provider === 'brave') return braveSearch(query, recency, opts?.signal);
-      return duckduckgoSearch(query, opts?.signal);
-    });
+      if (provider === 'searxng') return searxngSearch(query, recency);
+      if (provider === 'tavily') return tavilySearch(query);
+      if (provider === 'brave') return braveSearch(query, recency);
+      return duckduckgoSearch(query);
+    }, opts?.signal);
   } catch (error) {
+    if (opts?.signal?.aborted) throw error;
     throw typedProviderError(provider, error);
   }
 }

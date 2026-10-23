@@ -333,6 +333,56 @@ test('a canonical lyric result resolves Patient Zero without an LLM guess', asyn
   }
 });
 
+test('a generic first lyric result earns a distinct quoted retry', async () => {
+  const originalLlm = structuredClone(settings.get().llm);
+  const originalSearch = structuredClone(settings.get().search);
+  const realFetch = globalThis.fetch;
+  const searchQueries: string[] = [];
+  const json = (value: unknown) => Response.json(value);
+
+  try {
+    await settings.update({
+      llm: { model: '', provider: 'openai-compatible', fallback: { enabled: false } },
+      search: { provider: 'searxng', baseUrl: 'http://search.lyric-retry.fixture' },
+    } as never);
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.origin === 'http://search.lyric-retry.fixture') {
+        const query = url.searchParams.get('q') || '';
+        searchQueries.push(query);
+        return json({ results: query.toLocaleLowerCase().includes('the older i get')
+          ? [{ title: 'Sasha Alex Sloan - Older Lyrics', content: 'The older I get, the more that I see. Older by Sasha Alex Sloan lyrics.', url: 'https://genius.com/Sasha-alex-sloan-older-lyrics' }]
+          : [{ title: 'Find My Lyrics', content: 'Search song lyrics by any word or phrase.', url: 'https://findmylyrics.example/' }] });
+      }
+      if (url.origin === 'http://navidrome.fixture') {
+        const query = url.searchParams.get('query') || '';
+        const songCount = Number(url.searchParams.get('songCount') || 0);
+        return json({ 'subsonic-response': { status: 'ok', version: '1.16.1', searchResult3: {
+          artist: [],
+          song: query === 'Sasha Alex Sloan Older' && songCount > 0 ? [{ id: 'older', title: 'Older', artist: 'Sasha Alex Sloan', album: 'Only Child', duration: 191 }] : [],
+        } } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const built: any = identifyTool.build({ collect: (songs: any[]) => songs } as any);
+    const result = await built.execute({
+      reference: "The older I get, the more that I see My parents aren't heroes, they're just like me",
+    }, {} as any);
+
+    assert.deepEqual(result, {
+      candidates: [{ id: 'older', title: 'Older', artist: 'Sasha Alex Sloan', album: 'Only Child', duration: 191 }],
+    });
+    assert.equal(searchQueries.length, 2);
+    assert.match(searchQueries[0], /parents/iu);
+    assert.match(searchQueries[1], /the older i get/iu);
+  } finally {
+    globalThis.fetch = realFetch;
+    await settings.update({ llm: originalLlm, search: originalSearch } as never);
+  }
+});
+
 test('a short transliterated lyric uses a quoted companion search and resolves a library alias', async () => {
   const originalLlm = structuredClone(settings.get().llm);
   const originalSearch = structuredClone(settings.get().search);

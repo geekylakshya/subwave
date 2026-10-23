@@ -94,6 +94,8 @@ export function extractLyricTrackHints(web: { results?: WebTrackResult[] }): Lyr
     const cleanedTitle = cleanHint(title);
     const cleanedArtist = cleanHint(artist);
     if (!cleanedTitle || !cleanedArtist || cleanedTitle.length > 100 || cleanedArtist.length > 80) return;
+    if (/^(?:find|search|discover)\b/iu.test(cleanedTitle)
+      || /\b(?:any\s+word|any\s+phrase|song\s+lyrics?)\b/iu.test(cleanedArtist)) return;
     const key = `${requestName(cleanedTitle)}|${requestName(cleanedArtist)}`;
     if (!key || seen.has(key)) return;
     seen.add(key);
@@ -159,13 +161,13 @@ function lyricSearchQuery(
   edge: 'head' | 'tail' = 'tail',
   suffix = 'lyrics song artist',
 ): string {
-  const stop = new Set(['a', 'an', 'and', 'are', 'at', 'be', 'but', 'for', 'i', 'in', 'is', 'it', 'my', 'of', 'on', 'or', 'the', 'there', 'this', 'to', 'was', 'we', 'with', 'you']);
-  const words = String(reference || '').replace(/[“”"']/g, '').toLocaleLowerCase('en').split(/\s+/)
-    .map(word => word.replace(/[^\p{L}\p{N}]/gu, '')).filter(word => word.length >= 4 && !stop.has(word));
-  // A short content-word query is more useful to a web index than the full
-  // lyric. Prefer later words because opening lines are often quoted by many
-  // pages, while a distinctive phrase plus the performer finds the canonical
-  // song page more reliably.
+  const words = String(reference || '').replace(/[“”"]/gu, '').split(/\s+/u)
+    .map(word => word.replace(/^[^\p{L}\p{N}'’]+|[^\p{L}\p{N}'’]+$/gu, ''))
+    .filter(Boolean);
+  // Keep a contiguous lyric fragment, including its stop-words. Dropping
+  // "my", "they're", and similar words turns a distinctive quoted line into
+  // an unnatural bag of keywords that SearXNG often answers with generic
+  // lyric-finder pages instead of the song itself.
   const fragment = (edge === 'head' ? words.slice(0, 8) : words.slice(-8)).join(' ');
   return `${artist ? `${artist} ` : ''}"${fragment || String(reference).slice(0, 120)}" ${suffix}`;
 }
@@ -205,6 +207,15 @@ function hasWebEvidence(web: WebSearchResponse): boolean {
   return !!String(web.answer || '').trim() || !!web.results?.length;
 }
 
+function hasUsableLyricEvidence(reference: string, web: WebSearchResponse): boolean {
+  if (!hasWebEvidence(web)) return false;
+  const requested = requestName(reference).split(' ').filter(word => word.length >= 4);
+  const evidence = requestName(webBlob(web, 5000));
+  const overlap = new Set(requested.filter(word => evidence.includes(word))).size;
+  return extractLyricTrackHints(web).length > 0
+    || overlap >= Math.min(4, Math.max(3, Math.ceil(requested.length * 0.35)));
+}
+
 async function lyricWebEvidence(reference: string, budget: EvidenceSearchBudget): Promise<WebSearchResponse> {
   const normalizedWords = requestName(reference).split(' ').filter(Boolean);
   const wordCount = normalizedWords.length;
@@ -216,14 +227,15 @@ async function lyricWebEvidence(reference: string, budget: EvidenceSearchBudget)
     ? lyricSearchQuery(reference, null, 'tail', hasRepeatedPhraseCue ? 'lyrics song artist' : 'lyrics')
     : wordCount >= 3 ? shortLyricSearchQuery(reference) : boundedRaw;
   const first = await budget.search(firstQuery);
-  if (hasWebEvidence(first)) return first;
+  if (hasUsableLyricEvidence(reference, first)) return first;
 
-  // Only an evidence-less first fragment earns a second, distinct fragment.
+  // Only an unusable first fragment earns a second, distinct fragment.
   // Provider failures throw and stop here; they are not identification misses.
   const secondQuery = wordCount >= 8
     ? lyricSearchQuery(reference, null, 'head', 'song lyrics')
     : `"${boundedRaw}" song lyrics`;
-  return budget.search(secondQuery);
+  const second = await budget.search(secondQuery);
+  return hasWebEvidence(second) ? second : first;
 }
 
 // Request path only, and only when a web-search provider is ready. Resolves a

@@ -236,6 +236,24 @@ test('a missing short title fails without selecting an unrelated fallback', asyn
   assert.equal(bodies.length, 0, 'a named-title miss must not invoke the interpreter or fallback pool');
 });
 
+test('a framed impossible title stays no-match instead of taking an agent vibe fallback', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  catalogueSongs = [filler];
+  searchEmpty = true;
+  agentResult = {
+    object: { id: filler.id, ack: 'Unrelated fallback' },
+    steps: 1,
+    toolCalls: [{ name: 'searchLibrary' }],
+    extras: { seen: new Map([[filler.id, filler]]) },
+  };
+  const result = await submit('play qzxv impossible recording 918273');
+  assert.equal(result.status, 'failed');
+  assert.equal(result.outcome, 'no-match');
+  assert.match(result.message, /couldn.t find|could not find|no match|nothing .* matched/i);
+  assert.equal(queue.upcoming.length, 0);
+  assert.equal(agentCalls, 0, 'a framed title must not enter the evidence agent');
+});
+
 test('a one-word artist remains artist-capable after a title miss', async () => {
   catalogueSongs = [filler];
   artistSongs = [exact];

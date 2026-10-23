@@ -494,7 +494,21 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // requests still use the agent, including its existing web-search tool.
   const literal = modelFreeMatch(text);
   const lyricLike = looksLikeLyricRequest(text);
-  entry.classification = classifyListenerRequest(text, literal);
+  // A framed request with a concrete, attribute-free name is still a named
+  // recording even when the lyric heuristic sees four or more free-form
+  // words. Without this distinction, `play qzxv impossible recording 918273`
+  // was sent to the evidence agent, whose empty search could be replaced by a
+  // generic vibe candidate. Explicit lyric cues retain the evidence lane.
+  const framedTitleOnly = lyricLike
+    && literal.kind === 'track'
+    && Boolean(literal.title?.trim())
+    && !literal.artist && !literal.album
+    && !literal.genre && !literal.language && !literal.mood && !literal.energy
+    && /^(?:please\s+)?(?:play|queue|request|put\s+on)\b/iu.test(text)
+    && !/\b(?:lyrics?|words?|line\s+from|verse|song\s+goes|sung\s+by|gane\s+ke\s+bol|gaane\s+ke\s+bol|geet\s+ke\s+bol)\b/iu.test(text)
+    && !/\b(?:album|artist|genre|language|mood|energy)\b/iu.test(text)
+    && !/^(?:please\s+)?(?:play|queue|request|put\s+on)\s+(?:some|something|anything|music|a\s+song|a\s+track)\b/iu.test(text);
+  entry.classification = framedTitleOnly ? 'named-song-or-artist' : classifyListenerRequest(text, literal);
   entry.stages = ['classified', 'local-literal'];
   // Long lyric/prose input can contain commas or "by" and look like an
   // artist-title pair to the literal parser. It is not an identity claim: the
@@ -522,7 +536,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // literal parser has ruled out attributes and conversational frames. It may
   // use interpretation for repair, but a miss must never become an unrelated
   // fallback track.
-  const titleOnlyNamedRequest = !lyricLike
+  const titleOnlyNamedRequest = (framedTitleOnly || !lyricLike)
     && literal.kind === 'track'
     && Boolean(literal.title?.trim())
     && !literal.artist && !literal.album
@@ -546,9 +560,9 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // energy, genre, and language requests must use the shared deterministic
   // resolver so every listener request follows the same deterministic path. Lyric and film
   // descriptions still use the existing web-aware agent path.
-  const needsEvidenceIdentification = lyricLike
+  const needsEvidenceIdentification = (lyricLike && !framedTitleOnly)
     || /\b(?:song|track|music)\s+(?:from|in)\b.{0,60}\b(?:film|movie|show|advert|commercial)\b/iu.test(text);
-  if (!explicitNamedRequest && !likelyShortTitle && !forcedNamedTitle && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
+  if (!explicitNamedRequest && !likelyShortTitle && !forcedNamedTitle && !titleOnlyNamedRequest && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
     entry.stages.push('web-evidence');
     entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
     try {
@@ -650,12 +664,24 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     // invent an artist that would widen the lookup.
     matched = { ...matched, kind: 'track', title: literal.title, artist: null, album: null, scope: 'song', literal: false, titleOnly: true };
   }
+  if (framedTitleOnly && literal.title?.trim()) {
+    // The listener supplied a title but no artist. Keep that identity literal
+    // and clear any artist the interpreter guessed; the catalogue resolver can
+    // then verify the title without allowing an invented credit to widen or
+    // redirect the request.
+    matched = {
+      ...matched,
+      kind: 'track', title: literal.title, artist: null, album: null,
+      genre: null, language: null, mood: null, energy: null,
+      scope: 'song', literal: false, titleOnly: true,
+    };
+  }
   // The literal wording alone is not enough to harden an ambiguous phrase:
   // the existing interpreter may have verified an artist-led request such as
   // "Queen Bohemian Rhapsody", which intentionally retains the alternative
   // policy. A title-only identity with no artist, however, is a named song
   // and must never enter the unrelated fallback pool.
-  const exactTitleOnlyRequest = titleOnlyNamedRequest && !matched.artist?.trim();
+  const exactTitleOnlyRequest = framedTitleOnly || (titleOnlyNamedRequest && !matched.artist?.trim());
   const unsupported = directRequestUnsupported(text, matched);
   if (unsupported.length) {
     entry.path = 'cascade';

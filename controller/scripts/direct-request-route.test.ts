@@ -215,6 +215,45 @@ test('browser and Alexa submissions share the same typed resolver outcome', asyn
   assert.equal(requestLog.snapshot(1)[0].source, 'alexa');
 });
 
+test('latest release requests keep browser and Alexa on the same local fallback pipeline', async () => {
+  artistSongs = [{ id: 'queen-newest-local', title: 'Newest Local Track', artist: 'Queen', album: 'Sheer Heart Attack' }];
+  const browser = await submit('latest song by Queen');
+  assert.equal(browser.outcome, 'substituted');
+  assert.equal(browser.track.title, 'Newest Local Track');
+  assert.match(browser.ack, /newest available track/i);
+  assert.equal(bodies.length, 0, 'latest-release requests are deterministic and do not wait on the interpreter');
+
+  queue.upcoming = [];
+  const alexa = await submitListenerRequest({
+    text: 'latest song by Queen',
+    name: 'Alexa listener',
+    ip: `alexa:latest-${++ip}`,
+    source: 'alexa',
+  });
+  assert.equal(alexa.accepted, true);
+  if (!alexa.accepted) return;
+  const resolved = await alexa.completion;
+  assert.equal(resolved.outcome, 'matched');
+  assert.equal(resolved.legacyOutcome, browser.outcome);
+  assert.equal(resolved.track?.title, browser.track.title);
+  assert.match(resolved.ack || '', /newest available track/i);
+  assert.equal(requestLog.snapshot(1)[0].source, 'alexa');
+});
+
+test('a latest request without an artist is rejected before admission', async () => {
+  const response = await realFetch(`${base}/request`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': `198.51.100.${++ip}` },
+    body: JSON.stringify({ text: 'latest song', name: 'Listener' }),
+  });
+  assert.equal(response.status, 400);
+  const body = await response.json() as { message?: string };
+  assert.match(body.message || '', /which artist/i);
+  const alexa = await submitListenerRequest({ text: 'latest album', name: 'Alexa listener', ip: `alexa:latest-missing-${++ip}`, source: 'alexa' });
+  assert.equal(alexa.accepted, false);
+  if (!alexa.accepted) assert.match(alexa.message || '', /which artist/i);
+});
+
 test('a short title is resolved locally before the interpreter', async () => {
   catalogueSongs = [filler, titleOnlyExact];
   const result = await submit('daaku');

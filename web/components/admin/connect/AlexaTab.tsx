@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useCopyToClipboard } from 'usehooks-ts';
-import { HelpCircle } from 'lucide-react';
+import { ChevronDown, HelpCircle } from 'lucide-react';
 import { adminJson, useAdminMutation, useAdminQuery, type AdminFetch } from '../../../lib/admin-query';
 import { errorMessage, notify } from '../../../lib/notify';
 import { Input } from '../../ui/input';
@@ -216,9 +216,13 @@ export default function AlexaTab({ adminFetch }: { adminFetch: AdminFetch }) {
   const [directTouched, setDirectTouched] = useState(false);
   const [intentPolicyDraft, setIntentPolicyDraft] = useState<AlexaIntentPolicy>({ version: 1, mode: 'allowlist', allowed: [] });
   const [intentPolicyTouched, setIntentPolicyTouched] = useState(false);
+  const [openIntentGroupIds, setOpenIntentGroupIds] = useState<string[] | null>(null);
 
   useEffect(() => {
     if (!data) return;
+    if (openIntentGroupIds === null) {
+      setOpenIntentGroupIds(data.intentGroups[0]?.id ? [data.intentGroups[0].id] : []);
+    }
     if (!directTouched) {
       setDirectEnabled(data.directSkill.enabled);
       setSkillId(data.directSkill.skillId);
@@ -232,7 +236,7 @@ export default function AlexaTab({ adminFetch }: { adminFetch: AdminFetch }) {
         allowed: [...data.intentPolicy.allowed],
       });
     }
-  }, [data, directTouched, intentPolicyTouched]);
+  }, [data, directTouched, intentPolicyTouched, openIntentGroupIds]);
 
   const directMutation = useAdminMutation<Record<string, unknown>, { enabled: boolean; skillId: string; streamMount: string; tokenTtlHours: number }>({
     adminFetch,
@@ -312,6 +316,14 @@ export default function AlexaTab({ adminFetch }: { adminFetch: AdminFetch }) {
       (next, capability) => setCapability(next, capability, enabled),
       current,
     ));
+  };
+  const toggleIntentGroup = (groupId: string) => {
+    setOpenIntentGroupIds(current => {
+      const open = current || [];
+      return open.includes(groupId)
+        ? open.filter(id => id !== groupId)
+        : [...open, groupId];
+    });
   };
   const capabilityById = new Map(data.intentGroups.flatMap(group => group.capabilities).map(capability => [capability.id, capability]));
 
@@ -426,18 +438,29 @@ export default function AlexaTab({ adminFetch }: { adminFetch: AdminFetch }) {
               The allowlist applies to this station. New capabilities are off until enabled. Required Alexa behavior stays available so listeners can pause, stop, get help, and complete confirmations.
             </div>
             <div className="grid gap-3">
-              {data.intentGroups.map(group => {
+              {data.intentGroups.map((group, index) => {
                 const configurable = group.capabilities.filter(capability => capability.configurable && !capability.required);
                 const enabledCount = group.capabilities.filter(capability => capabilityEnabled(intentPolicyDraft, capability)).length;
                 const allEnabled = configurable.length > 0 && configurable.every(capability => capabilityEnabled(intentPolicyDraft, capability));
+                const groupOpen = openIntentGroupIds === null
+                  ? index === 0
+                  : openIntentGroupIds.includes(group.id);
+                const groupContentId = `alexa-intent-group-${group.id}`;
                 return (
                   <section key={group.id} className="grid gap-3 border border-separator-strong p-3">
                     <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2 text-[13px] font-bold text-ink">
-                          {group.label}
+                      <div className="min-w-0 flex-1">
+                        <button
+                          type="button"
+                          aria-expanded={groupOpen}
+                          aria-controls={groupContentId}
+                          onClick={() => toggleIntentGroup(group.id)}
+                          className="flex w-full cursor-pointer items-center gap-2 text-left text-[13px] font-bold text-ink"
+                        >
+                          <ChevronDown size={16} aria-hidden="true" className={`shrink-0 transition-transform ${groupOpen ? 'rotate-180' : ''}`} />
+                          <span>{group.label}</span>
                           <Pill tone="ink">{enabledCount}/{group.capabilities.length} enabled</Pill>
-                        </div>
+                        </button>
                         <div className="mt-1 text-[11px] leading-[1.5] text-muted">{group.description}</div>
                       </div>
                       {configurable.length > 0 && (
@@ -447,31 +470,33 @@ export default function AlexaTab({ adminFetch }: { adminFetch: AdminFetch }) {
                         </div>
                       )}
                     </div>
-                    <div className="grid gap-2 md:grid-cols-2">
-                      {group.capabilities.map(capability => {
-                        const enabled = capabilityEnabled(intentPolicyDraft, capability);
-                        return (
-                          <div key={capability.id} className="flex min-w-0 items-start justify-between gap-3 border border-separator-strong bg-[var(--ink-softer)] p-3">
-                            <div className="min-w-0">
-                              <div className="flex flex-wrap items-center gap-2 text-[12px] font-bold text-ink">
-                                <span>{capability.label}</span>
-                                {capability.required && <Pill tone="ink">required</Pill>}
+                    {groupOpen && (
+                      <div id={groupContentId} className="grid gap-2 md:grid-cols-2">
+                        {group.capabilities.map(capability => {
+                          const enabled = capabilityEnabled(intentPolicyDraft, capability);
+                          return (
+                            <div key={capability.id} className="flex min-w-0 items-start justify-between gap-3 border border-separator-strong bg-[var(--ink-softer)] p-3">
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2 text-[12px] font-bold text-ink">
+                                  <span>{capability.label}</span>
+                                  {capability.required && <Pill tone="ink">required</Pill>}
+                                </div>
+                                <div className="mt-1 text-[11px] leading-[1.5] text-muted">{capability.description}</div>
+                                <div className="mt-2 flex flex-wrap gap-1">
+                                  {capability.intentNames.map(intentName => <code key={intentName} className="border border-separator-strong px-1 py-0.5 text-[10px] text-muted">{intentName}</code>)}
+                                </div>
                               </div>
-                              <div className="mt-1 text-[11px] leading-[1.5] text-muted">{capability.description}</div>
-                              <div className="mt-2 flex flex-wrap gap-1">
-                                {capability.intentNames.map(intentName => <code key={intentName} className="border border-separator-strong px-1 py-0.5 text-[10px] text-muted">{intentName}</code>)}
-                              </div>
+                              <Toggle
+                                on={enabled}
+                                disabled={capability.required === true}
+                                onClick={() => setIntentCapability(capability, !enabled)}
+                                ariaLabel={`${enabled ? 'Disable' : 'Enable'} ${capability.label}`}
+                              />
                             </div>
-                            <Toggle
-                              on={enabled}
-                              disabled={capability.required === true}
-                              onClick={() => setIntentCapability(capability, !enabled)}
-                              ariaLabel={`${enabled ? 'Disable' : 'Enable'} ${capability.label}`}
-                            />
-                          </div>
-                        );
-                      })}
-                    </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </section>
                 );
               })}

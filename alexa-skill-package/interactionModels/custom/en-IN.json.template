@@ -3,6 +3,27 @@
     "languageModel": {
       "intents": [
         {
+          "name": "StartRadioIntent",
+          "samples": [
+            "start the radio",
+            "start the station",
+            "begin the radio",
+            "start listening",
+            "radio chalu karo",
+            "station chalao",
+            "radio bajao"
+          ]
+        },
+        {
+          "name": "PlayRadioIntent",
+          "samples": [
+            "play the station",
+            "play the radio",
+            "radio play karo",
+            "station play karo"
+          ]
+        },
+        {
           "slots": [
             {
               "name": "requestText",
@@ -242,7 +263,7 @@
           ]
         }
       ],
-      "invocationName": "chill zone controller"
+      "invocationName": "__ALEXA_INVOCATION_NAME__"
     }
   }
 }

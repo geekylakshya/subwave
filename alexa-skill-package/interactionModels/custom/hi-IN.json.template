@@ -3,6 +3,27 @@
     "languageModel": {
       "intents": [
         {
+          "name": "StartRadioIntent",
+          "samples": [
+            "radio शुरू करो",
+            "station शुरू करो",
+            "radio चलाओ",
+            "station play करो",
+            "radio chalu karo",
+            "station chalao",
+            "start listening"
+          ]
+        },
+        {
+          "name": "PlayRadioIntent",
+          "samples": [
+            "radio बजाओ",
+            "station बजाओ",
+            "radio play करो",
+            "play the radio"
+          ]
+        },
+        {
           "slots": [
             {
               "name": "requestText",
@@ -244,7 +265,7 @@
           ]
         }
       ],
-      "invocationName": "chill zone controller"
+      "invocationName": "__ALEXA_INVOCATION_NAME__"
     }
   }
 }

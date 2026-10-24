@@ -4,7 +4,7 @@
       "custom": {
         "endpoint": {
           "sslCertificateType": "Wildcard",
-          "uri": "https://subwave.citadels.studio/api/alexa"
+          "uri": "__ALEXA_ENDPOINT_URL__"
         },
         "interfaces": [
           {
@@ -21,32 +21,32 @@
       "isAvailableWorldwide": true,
       "locales": {
         "en-US": {
-          "description": "Sample Full Description",
+          "description": "__ALEXA_DESCRIPTION__",
           "examplePhrases": [
             "Alexa open hello world",
             "hello",
             "help"
           ],
           "keywords": [],
-          "name": "Subwave Radio",
-          "summary": "Sample Short Description"
+          "name": "__ALEXA_SKILL_NAME__",
+          "summary": "__ALEXA_SUMMARY__"
         },
         "hi-IN": {
-          "name": "Subwave Radio"
+          "name": "__ALEXA_SKILL_NAME__"
         },
         "en-IN": {
-          "description": "Sample Full Description",
+          "description": "__ALEXA_DESCRIPTION__",
           "examplePhrases": [
             "Alexa open hello world",
             "hello",
             "help"
           ],
           "keywords": [],
-          "name": "Subwave Radio",
-          "summary": "Sample Short Description"
+          "name": "__ALEXA_SKILL_NAME__",
+          "summary": "__ALEXA_SUMMARY__"
         }
       },
-      "testingInstructions": "Sample Testing Instructions."
+      "testingInstructions": "__ALEXA_TESTING_INSTRUCTIONS__"
     }
   }
 }

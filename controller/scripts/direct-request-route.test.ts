@@ -12,7 +12,7 @@ process.env.STATE_DIR = createTempDir(join(tmpdir(), 'subwave-direct-route-'));
 process.env.NAVIDROME_URL = 'http://direct-library.invalid';
 const express = (await import('express')).default;
 const settings = await import('../src/settings.js');
-const { router } = await import('../src/routes/request.js');
+const { router, submitListenerRequest } = await import('../src/routes/request.js');
 const { queue } = await import('../src/broadcast/queue.js');
 const { primaryLeg } = await import('../src/llm/internal/provider/legs.js');
 const requestLog = await import('../src/broadcast/request-log.js');
@@ -133,6 +133,21 @@ async function submit(text = 'Queen, Bohemian Rhapsody', maxPolls = 250) {
   throw Error('request did not settle');
 }
 
+async function submitShared(text: string): Promise<any> {
+  const submission: any = await submitListenerRequest({
+    text,
+    name: 'Alexa listener',
+    ip: `198.51.100.${++ip}`,
+  });
+  if (!submission.accepted) return submission;
+  for (let n = 0; n < 250; n++) {
+    const result: any = await (await realFetch(`${base}/request/${submission.requestId}`)).json();
+    if (result.status !== 'pending') return result;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw Error('shared request did not settle');
+}
+
 test('long lyric prose goes through the evidence agent instead of the literal parser', async () => {
   await settings.update({ llm: { requestMatching: 'agentic' } } as never);
   const patientZero = { id: 'patient-zero', title: 'Patient Zero', artist: 'Taylor Swift' };
@@ -217,6 +232,44 @@ test('Direct searches the named recording before genre candidates, with one inte
   assert.ok(recentCalls.some(c => c.kind === 'matchRequest' && ['ai-sdk', 'ai-sdk:tool'].includes(c.via || '')));
 });
 
+test('browser and Alexa submissions share the same typed resolver outcome', async () => {
+  const browser = await submit();
+  assert.equal(browser.outcome, 'matched');
+  queue.upcoming = [];
+
+  const resolved = await submitShared('Queen, Bohemian Rhapsody');
+  assert.equal(resolved.outcome, 'matched');
+  assert.equal(resolved.track?.title, browser.track.title);
+});
+
+test('latest release requests keep browser and Alexa on the same local fallback pipeline', async () => {
+  artistSongs = [{ id: 'queen-newest-local', title: 'Newest Local Track', artist: 'Queen', album: 'Sheer Heart Attack' }];
+  const browser = await submit('latest song by Queen');
+  assert.equal(browser.outcome, 'substituted');
+  assert.equal(browser.track.title, 'Newest Local Track');
+  assert.match(browser.ack, /newest available track/i);
+  assert.equal(bodies.length, 0, 'latest-release requests are deterministic and do not wait on the interpreter');
+
+  queue.upcoming = [];
+  const resolved = await submitShared('latest song by Queen');
+  assert.equal(resolved.outcome, browser.outcome);
+  assert.equal(resolved.track?.title, browser.track.title);
+  assert.match(resolved.ack || '', /newest available track/i);
+});
+
+test('a latest request without an artist is rejected before admission', async () => {
+  const response = await realFetch(`${base}/request`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': `198.51.100.${++ip}` },
+    body: JSON.stringify({ text: 'latest song', name: 'Listener' }),
+  });
+  assert.equal(response.status, 400);
+  const body = await response.json() as { message?: string };
+  assert.match(body.message || '', /which artist/i);
+  const shared = await submitShared('latest album');
+  assert.equal(shared.accepted, false);
+  assert.match(shared.message || '', /which artist/i);
+});
 test('a short title is resolved locally before the interpreter', async () => {
   catalogueSongs = [filler, titleOnlyExact];
   const result = await submit('daaku');

@@ -85,6 +85,7 @@ export interface QueueItem {
   // files written before durable request receipts remain compatible.
   requestId?: string | null;
   requestedBy?: string | null;
+  dedication?: { target: string; locale: 'en-US' | 'en-IN' | 'hi-IN' } | null;
   // This item was queued by the OPERATOR, not by a listener. It exists because
   // `requestedBy` cannot answer that question: the studio queue pushes
   // `requestedBy: 'studio'` precisely so it inherits the four exemptions that

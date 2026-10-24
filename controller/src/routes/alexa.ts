@@ -1,5 +1,5 @@
 import express from 'express';
-import { SkillBuilders, escapeXmlCharacters } from 'ask-sdk-core';
+import { DefaultApiClient, SkillBuilders, escapeXmlCharacters } from 'ask-sdk-core';
 import { ExpressAdapter } from 'ask-sdk-express-adapter';
 import * as settings from '../settings.js';
 import { getStreamStatus } from '../broadcast/listeners.js';
@@ -17,6 +17,7 @@ import {
 import { alexaPatchSchema } from '../schemas/settings.js';
 import { listenerRequestSchema } from '../schemas/request.js';
 import { alexaIdentityKey } from '../broadcast/request-ledger.js';
+import { type RequestReminder } from '../broadcast/request-ledger.js';
 import {
   audioPlayerMetadata,
   etaSpeech,
@@ -37,11 +38,23 @@ import {
 } from '../alexa/listener-features.js';
 import {
   getLatestAlexaRequestStatus,
+  getAlexaRequestStatus,
+  saveAlexaRequestReminder,
+  clearAlexaRequestReminder,
   cancelLatestAlexaRequest,
   replaceLatestAlexaRequest,
   submitListenerRequest,
   type ListenerRequestStatus,
 } from './request.js';
+import { cleanDedicationTarget } from '../util/request-guard.js';
+import { isGenericDedicationSong } from '../alexa/dedications.js';
+import {
+  REMINDER_PERMISSION,
+  reminderClientFor,
+  reminderEtaAllowed,
+  reminderOffsetSeconds,
+  type AlexaReminderClient,
+} from '../alexa/reminders.js';
 
 const router = express.Router();
 const ALEXA_SKILL_ID_RE = /^amzn1\.ask\.skill\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -74,13 +87,18 @@ export interface AlexaRuntime {
   nowPlaying?: () => Promise<AlexaTrack | null> | AlexaTrack | null;
   upcoming?: () => Promise<AlexaTrack[]> | AlexaTrack[];
   previous?: () => Promise<AlexaTrack | null> | AlexaTrack | null;
-  submitRequest?: (
-    text: string,
-    userId: string,
-    verifiedCandidate?: AlexaVerifiedCandidate,
-    personId?: string,
-  ) => Promise<AlexaSubmitResult>;
+  submitRequest?: (input: {
+    text: string;
+    userId: string;
+    verifiedCandidate?: AlexaVerifiedCandidate;
+    personId?: string;
+    dedication?: { target: string; locale: 'en-US' | 'en-IN' | 'hi-IN' };
+  }) => Promise<AlexaSubmitResult>;
   latestRequestStatus?: (identity: string) => Promise<ListenerRequestStatus | null>;
+  requestStatus?: (identity: string, requestId: string) => Promise<ListenerRequestStatus | null>;
+  saveReminder?: (identity: string, requestId: string, reminder: RequestReminder) => Promise<ListenerRequestStatus | null>;
+  clearReminder?: (identity: string, requestId: string) => Promise<boolean>;
+  reminderClient?: AlexaReminderClient;
   cancelRequest?: (identity: string) => Promise<ListenerRequestStatus | null>;
   replaceRequest?: (identity: string, text: string) => Promise<AlexaSubmitResult>;
   previewRequest?: (text: string) => Promise<AlexaRequestCandidate[]>;
@@ -155,7 +173,7 @@ function defaultRuntime(): AlexaRuntime {
       .map(item => toAlexaTrack(item.track))
       .filter((track): track is AlexaTrack => track !== null),
     previous: () => toAlexaTrack(queue.history[0]?.track),
-    submitRequest: (text, userId, verifiedCandidate, personId) => {
+    submitRequest: ({ text, userId, verifiedCandidate, personId, dedication }) => {
       const identity = personId
         ? `person:${personId}`
         : alexaIdentityKey(userId || 'unknown');
@@ -166,11 +184,15 @@ function defaultRuntime(): AlexaRuntime {
         source: 'alexa',
         alexaIdentity: identity,
         verifiedCandidate,
+        dedication,
       }).then(result => result.accepted
         ? { accepted: true, statusCode: 202 as const, requestId: result.requestId, status: 'pending' as const }
         : result);
     },
     latestRequestStatus: identity => getLatestAlexaRequestStatus(identity),
+    requestStatus: (identity, requestId) => getAlexaRequestStatus(identity, requestId),
+    saveReminder: (identity, requestId, reminder) => saveAlexaRequestReminder(identity, requestId, reminder),
+    clearReminder: (identity, requestId) => clearAlexaRequestReminder(identity, requestId),
     cancelRequest: identity => cancelLatestAlexaRequest(identity),
     replaceRequest: (identity, text) => replaceLatestAlexaRequest(identity, text).then(result => result.accepted
       ? { accepted: true, statusCode: 202 as const, requestId: result.requestId, status: 'pending' as const }
@@ -502,12 +524,55 @@ function dynamicSpeech(value: string | null | undefined, fallback: string): stri
   return value ? escapeXmlCharacters(value) : fallback;
 }
 
+type AlexaReminderPending = {
+  requestId: string;
+  identity: string;
+  locale: 'en-US' | 'en-IN' | 'hi-IN';
+  permissionToken?: string;
+};
+
+type ReminderCreationState = {
+  cancelled: boolean;
+  alertToken?: string;
+  deleted: boolean;
+  done: Promise<void>;
+  resolveDone: () => void;
+};
+
+const reminderCreations = new Map<string, ReminderCreationState>();
+
 function sessionAttributes(input: any): Record<string, unknown> {
   return input.attributesManager?.getSessionAttributes?.() || {};
 }
 
 function saveSessionAttributes(input: any, attributes: Record<string, unknown>): void {
   input.attributesManager?.setSessionAttributes?.(attributes);
+}
+
+function pendingReminder(input: any): AlexaReminderPending | null {
+  const value = sessionAttributes(input).alexaReminderPending;
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Partial<AlexaReminderPending>;
+  if (typeof candidate.requestId !== 'string' || typeof candidate.identity !== 'string') return null;
+  if (candidate.locale !== 'en-US' && candidate.locale !== 'en-IN' && candidate.locale !== 'hi-IN') return null;
+  return {
+    requestId: candidate.requestId,
+    identity: candidate.identity,
+    locale: candidate.locale,
+    ...(typeof candidate.permissionToken === 'string' ? { permissionToken: candidate.permissionToken } : {}),
+  };
+}
+
+function savePendingReminder(input: any, pending: AlexaReminderPending): void {
+  const attributes = sessionAttributes(input);
+  attributes.alexaReminderPending = pending;
+  saveSessionAttributes(input, attributes);
+}
+
+function clearPendingReminder(input: any): void {
+  const attributes = sessionAttributes(input);
+  delete attributes.alexaReminderPending;
+  saveSessionAttributes(input, attributes);
 }
 
 function isRequestCandidate(value: unknown): value is AlexaRequestCandidate {
@@ -670,8 +735,8 @@ async function listenerFeatureRequestResponse(
   let submitted: AlexaSubmitResult;
   try {
     submitted = runtime.submitRequest
-      ? await runtime.submitRequest(requestText, userId, verified, personId)
-      : await defaultRuntime().submitRequest!(requestText, userId, verified, personId);
+      ? await runtime.submitRequest({ text: requestText, userId, verifiedCandidate: verified, personId })
+      : await defaultRuntime().submitRequest!({ text: requestText, userId, verifiedCandidate: verified, personId });
   } catch {
     return requestSpeech(input, copy.featureFailed);
   }
@@ -739,6 +804,278 @@ async function currentShowResponse(input: any, runtime: AlexaRuntime) {
   return requestSpeech(input, copy.currentShow(escapeXmlCharacters(show.name), dj, guests));
 }
 
+function dedicationDialogResponse(input: any, copy: ReturnType<typeof messages>) {
+  const dialogState = input.requestEnvelope?.request?.dialogState;
+  const requestText = String(input.requestEnvelope?.request?.intent?.slots?.requestText?.value || '').trim();
+  const hasSong = Boolean(requestText) && !isGenericDedicationSong(requestText);
+  const hasTarget = Boolean(input.requestEnvelope?.request?.intent?.slots?.dedicationTarget?.value);
+  if (isGenericDedicationSong(requestText)) {
+    return input.responseBuilder
+      .speak(copy.dedicationPrompt)
+      .addElicitSlotDirective('requestText')
+      .withShouldEndSession(false)
+      .getResponse();
+  }
+  if (dialogState && dialogState !== 'COMPLETED') {
+    return input.responseBuilder.addDelegateDirective().getResponse();
+  }
+  if (!hasSong) {
+    return input.responseBuilder
+      .speak(copy.dedicationPrompt)
+      .addElicitSlotDirective('requestText')
+      .withShouldEndSession(false)
+      .getResponse();
+  }
+  if (!hasTarget) {
+    return input.responseBuilder
+      .speak(copy.dedicationTargetPrompt)
+      .addElicitSlotDirective('dedicationTarget')
+      .withShouldEndSession(false)
+      .getResponse();
+  }
+  return null;
+}
+
+async function dedicationResponse(input: any, runtime: AlexaRuntime) {
+  const copy = messages(inputLocale(input));
+  const delegated = dedicationDialogResponse(input, copy);
+  if (delegated) return delegated;
+
+  const requestText = String(input.requestEnvelope.request.intent?.slots?.requestText?.value || '').trim();
+  const rawTarget = String(input.requestEnvelope.request.intent?.slots?.dedicationTarget?.value || '').trim();
+  const target = cleanDedicationTarget(rawTarget);
+  const parsed = listenerRequestSchema.safeParse({ text: requestText, name: '' });
+  if (!parsed.success || !target) {
+    return requestSpeech(input, !parsed.success ? copy.dedicationPrompt : copy.dedicationTargetPrompt);
+  }
+  const userId = alexaUserId(input) || 'unknown';
+  const personId = alexaPersonId(input) || undefined;
+  const dedication = { target, locale: inputLocale(input) as 'en-US' | 'en-IN' | 'hi-IN' };
+  const result = runtime.submitRequest
+    ? await runtime.submitRequest({ text: parsed.data.text, userId, personId, dedication })
+    : await defaultRuntime().submitRequest!({ text: parsed.data.text, userId, personId, dedication });
+  return requestSpeech(
+    input,
+    result.accepted ? copy.dedicationAccepted : dynamicSpeech(result.message || result.error, copy.dedicationFailed),
+  );
+}
+
+function reminderStatus(runtime: AlexaRuntime, identity: string, requestId: string) {
+  return runtime.requestStatus
+    ? runtime.requestStatus(identity, requestId)
+    : defaultRuntime().requestStatus!(identity, requestId);
+}
+
+function reminderClient(runtime: AlexaRuntime, input: any): AlexaReminderClient {
+  return runtime.reminderClient || reminderClientFor(input);
+}
+
+async function removeRequestReminder(
+  input: any,
+  runtime: AlexaRuntime,
+  identity: string,
+  status: ListenerRequestStatus | null,
+): Promise<void> {
+  const requestId = status?.requestId;
+  if (!requestId) return;
+  const creation = reminderCreations.get(requestId);
+  if (creation) {
+    creation.cancelled = true;
+    await creation.done;
+  }
+  const alertToken = status?.reminder?.alertToken || creation?.alertToken;
+  if (!alertToken) return;
+  try {
+    if (!creation?.deleted) {
+      await reminderClient(runtime, input).delete(alertToken);
+      if (creation) creation.deleted = true;
+    }
+    const cleared = runtime.clearReminder
+      ? await runtime.clearReminder(identity, requestId)
+      : await defaultRuntime().clearReminder!(identity, requestId);
+    if (!cleared) console.error(`[alexa] reminder ledger cleanup found no record for ${requestId}`);
+  } catch (error) {
+    console.error(`[alexa] reminder cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function createPendingReminder(input: any, runtime: AlexaRuntime, pending: AlexaReminderPending) {
+  const copy = messages(pending.locale);
+  let resolveDone!: () => void;
+  const state: ReminderCreationState = {
+    cancelled: false,
+    deleted: false,
+    done: new Promise(resolve => { resolveDone = resolve; }),
+    resolveDone: () => resolveDone(),
+  };
+  reminderCreations.set(pending.requestId, state);
+  let created: { alertToken: string } | null = null;
+  try {
+    const client = reminderClient(runtime, input);
+    const status = await reminderStatus(runtime, pending.identity, pending.requestId);
+    if (!status || status.phase !== 'queued' || !status.track?.title || !reminderEtaAllowed(status.etaSeconds)) {
+      clearPendingReminder(input);
+      return requestSpeech(input, copy.reminderStale);
+    }
+    if (status.reminder?.alertToken) {
+      clearPendingReminder(input);
+      return requestSpeech(input, copy.reminderAlreadySet);
+    }
+
+    const offsetInSeconds = reminderOffsetSeconds(status.etaSeconds!);
+    const createdAt = Date.now();
+    const triggerAt = createdAt + offsetInSeconds * 1000;
+    const reminderRequest = {
+      requestTime: new Date(createdAt).toISOString(),
+      trigger: { type: 'SCHEDULED_RELATIVE' as const, offsetInSeconds },
+      alertInfo: {
+        spokenInfo: {
+          content: [{
+            locale: pending.locale,
+            text: pending.locale === 'hi-IN'
+              ? `${status.track.title} की request जल्द बजने वाली है।`
+              : `Your requested song ${status.track.title} is expected to play soon.`,
+          }],
+        },
+      },
+      pushNotification: { status: 'DISABLED' as const },
+    };
+
+    created = await client.create(reminderRequest);
+    state.alertToken = created.alertToken;
+
+    // Cancellation can happen while Alexa is creating the external reminder.
+    // Re-read queue state before persisting the token so cancelled requests
+    // cannot acquire a reminder after the cancellation cleanup raced us.
+    const current = await reminderStatus(runtime, pending.identity, pending.requestId);
+    if (state.cancelled || !current || current.phase !== 'queued' || current.reminder?.alertToken) {
+      await client.delete(created.alertToken);
+      state.deleted = true;
+      clearPendingReminder(input);
+      return requestSpeech(input, copy.reminderStale);
+    }
+
+    const reminder: RequestReminder = {
+      alertToken: created.alertToken,
+      createdAt,
+      triggerAt,
+      forecastSeconds: status.etaSeconds!,
+      leadSeconds: 60,
+    };
+    const saved = runtime.saveReminder
+      ? await runtime.saveReminder(pending.identity, pending.requestId, reminder)
+      : await defaultRuntime().saveReminder!(pending.identity, pending.requestId, reminder);
+    if (!saved) throw new Error('request reminder ownership check failed');
+    clearPendingReminder(input);
+    return requestSpeech(input, copy.reminderSet(escapeXmlCharacters(status.track.title)));
+  } catch (error) {
+    if (created && !state.deleted) {
+      try { await reminderClient(runtime, input).delete(created.alertToken); } catch {}
+      state.deleted = true;
+    }
+    console.error(`[alexa] reminder ledger save failed: ${error instanceof Error ? error.message : String(error)}`);
+    clearPendingReminder(input);
+    return requestSpeech(input, copy.reminderFailed);
+  } finally {
+    if (reminderCreations.get(pending.requestId) === state) reminderCreations.delete(pending.requestId);
+    state.resolveDone();
+  }
+}
+
+async function requestReminderResponse(input: any, runtime: AlexaRuntime) {
+  const copy = messages(inputLocale(input));
+  const identity = alexaRequestIdentity(input);
+  const status = runtime.latestRequestStatus
+    ? await runtime.latestRequestStatus(identity)
+    : await defaultRuntime().latestRequestStatus!(identity);
+  if (!status) return requestSpeech(input, copy.reminderEmpty);
+  if (status.phase === 'pending') return requestSpeech(input, copy.reminderPending);
+  if (status.reminder?.alertToken) return requestSpeech(input, copy.reminderAlreadySet);
+  if (status.phase !== 'queued' || !reminderEtaAllowed(status.etaSeconds) || !status.track?.title) {
+    return requestSpeech(input, copy.reminderUnavailable);
+  }
+  const pending = {
+    requestId: status.requestId!,
+    identity,
+    locale: inputLocale(input) as 'en-US' | 'en-IN' | 'hi-IN',
+  };
+  savePendingReminder(input, pending);
+  return input.responseBuilder
+    .speak(copy.reminderConfirm(
+      escapeXmlCharacters(status.track.title),
+      etaSpeech(status.etaSeconds, pending.locale) || 'soon',
+    ))
+    .reprompt(copy.reminderConfirm(escapeXmlCharacters(status.track.title), etaSpeech(status.etaSeconds, pending.locale) || 'soon'))
+    .withShouldEndSession(false)
+    .getResponse();
+}
+
+async function reminderConfirmationResponse(input: any, runtime: AlexaRuntime, confirmed: boolean) {
+  const pending = pendingReminder(input);
+  if (!pending) return null;
+  if (!confirmed) {
+    clearPendingReminder(input);
+    return requestSpeech(input, messages(pending.locale).reminderDenied);
+  }
+  const copy = messages(pending.locale);
+  // Alexa's consentToken is the skill's global reminders permission. A
+  // separate voice-consent response is required for every reminder, even
+  // when that global token is already present.
+  const permissionToken = pending.permissionToken || `request-reminder:${pending.requestId}`;
+  savePendingReminder(input, { ...pending, permissionToken });
+  return input.responseBuilder
+    .speak(copy.reminderPermission)
+    .addDirective({
+      type: 'Connections.SendRequest',
+      name: 'AskFor',
+      payload: {
+        '@type': 'AskForPermissionsConsentRequest',
+        '@version': '2',
+        permissionScopes: [{ permissionScope: REMINDER_PERMISSION, consentLevel: 'ACCOUNT' }],
+      },
+      token: permissionToken,
+    })
+    // Alexa owns the follow-up consent conversation. Ending the skill session
+    // here is required for the Connections.Response workflow to be delivered.
+    .withShouldEndSession(true)
+    .getResponse();
+}
+
+async function reminderPermissionResponse(input: any, runtime: AlexaRuntime) {
+  const pending = pendingReminder(input);
+  if (!pending) return requestSpeech(input, messages(inputLocale(input)).reminderStale);
+  const responseToken = input.requestEnvelope?.request?.token;
+  if (!pending.permissionToken || responseToken !== pending.permissionToken) {
+    console.error('[alexa] ignoring reminder permission response with an unexpected token');
+    clearPendingReminder(input);
+    return requestSpeech(input, messages(pending.locale).reminderStale);
+  }
+  const body = input.requestEnvelope?.request?.payload || input.requestEnvelope?.request?.body || {};
+  const scopes = Array.isArray(body.permissionScopes) ? body.permissionScopes : [body.permissionScopes];
+  const scope = scopes.find((candidate: any) => candidate?.permissionScope === REMINDER_PERMISSION);
+  // Alexa puts the consent result on the payload, alongside permissionScopes.
+  // It is not a field on the individual scope object.
+  const status = body.status;
+  if (!scope) {
+    clearPendingReminder(input);
+    return requestSpeech(input, messages(pending.locale).reminderFailed);
+  }
+  if (status !== 'ACCEPTED') {
+    if (status === 'NOT_ANSWERED') {
+      return input.responseBuilder
+        .speak(messages(pending.locale).reminderPermissionRetry)
+        .reprompt(messages(pending.locale).reminderPermissionRetry)
+        .withShouldEndSession(false)
+        .getResponse();
+    }
+    clearPendingReminder(input);
+    return requestSpeech(input, status === 'DENIED'
+      ? messages(pending.locale).reminderDenied
+      : messages(pending.locale).reminderFailed);
+  }
+  return createPendingReminder(input, runtime, pending);
+}
+
 async function requestSongResponse(input: any, runtime: AlexaRuntime) {
   const rawText = String(input.requestEnvelope.request.intent?.slots?.requestText?.value || '').trim();
   const parsed = listenerRequestSchema.safeParse({ text: rawText, name: '' });
@@ -761,8 +1098,8 @@ async function requestSongResponse(input: any, runtime: AlexaRuntime) {
   const userId = alexaUserId(input) || 'unknown';
   const personId = alexaPersonId(input) || undefined;
   const result = runtime.submitRequest
-    ? await runtime.submitRequest(parsed.data.text, userId, undefined, personId)
-    : await defaultRuntime().submitRequest!(parsed.data.text, userId, undefined, personId);
+    ? await runtime.submitRequest({ text: parsed.data.text, userId, personId })
+    : await defaultRuntime().submitRequest!({ text: parsed.data.text, userId, personId });
   if (result.accepted) {
     return requestSpeech(input, copy.requestAccepted);
   }
@@ -789,8 +1126,8 @@ async function confirmationResponse(input: any, runtime: AlexaRuntime, confirmed
   const personId = alexaPersonId(input) || undefined;
   const text = `play "${selected.title}" by "${selected.artist}"`;
   const result = runtime.submitRequest
-    ? await runtime.submitRequest(text, userId, undefined, personId)
-    : await defaultRuntime().submitRequest!(text, userId, undefined, personId);
+    ? await runtime.submitRequest!({ text, userId, personId })
+    : await defaultRuntime().submitRequest!({ text, userId, personId });
   return requestSpeech(input, result.accepted ? copy.requestAccepted : dynamicSpeech(result.message || result.error, copy.requestFailed));
 }
 
@@ -837,12 +1174,16 @@ async function requestStatusResponse(input: any, runtime: AlexaRuntime) {
 
 async function cancelRequestResponse(input: any, runtime: AlexaRuntime) {
   const identity = alexaRequestIdentity(input);
+  const before = runtime.latestRequestStatus
+    ? await runtime.latestRequestStatus(identity)
+    : await defaultRuntime().latestRequestStatus!(identity);
   const status = runtime.cancelRequest
     ? await runtime.cancelRequest(identity)
     : await defaultRuntime().cancelRequest!(identity);
   const copy = messages(inputLocale(input));
   if (!status) return requestSpeech(input, copy.cancelEmpty);
   if (status.phase === 'cancelled') {
+    await removeRequestReminder(input, runtime, identity, before);
     return requestSpeech(input, copy.cancelSuccess(dynamicSpeech(status.track?.title, 'song')));
   }
   return requestSpeech(input, copy.cancelTooLate);
@@ -854,9 +1195,18 @@ async function replaceRequestResponse(input: any, runtime: AlexaRuntime) {
   const copy = messages(inputLocale(input));
   if (!parsed.success) return requestSpeech(input, copy.replacePrompt);
   const identity = alexaRequestIdentity(input);
+  const before = runtime.latestRequestStatus
+    ? await runtime.latestRequestStatus(identity)
+    : await defaultRuntime().latestRequestStatus!(identity);
   const result = runtime.replaceRequest
     ? await runtime.replaceRequest(identity, parsed.data.text)
     : await defaultRuntime().replaceRequest!(identity, parsed.data.text);
+  if (before?.requestId && before.reminder?.alertToken) {
+    const after = result.accepted ? null : await reminderStatus(runtime, identity, before.requestId);
+    if (result.accepted || after?.phase === 'cancelled') {
+      await removeRequestReminder(input, runtime, identity, before);
+    }
+  }
   return requestSpeech(
     input,
     result.accepted ? copy.replaceAccepted : dynamicSpeech(result.message || result.error, copy.requestFailed),
@@ -868,6 +1218,16 @@ async function stationStatusResponse(input: any, runtime: AlexaRuntime) {
   return requestSpeech(input, runtime.isStreamOnline() ? copy.stationOnline : copy.stationOffline);
 }
 
+async function yesResponse(input: any, runtime: AlexaRuntime) {
+  const reminder = await reminderConfirmationResponse(input, runtime, true);
+  return reminder || confirmationResponse(input, runtime, true);
+}
+
+async function noResponse(input: any, runtime: AlexaRuntime) {
+  const reminder = await reminderConfirmationResponse(input, runtime, false);
+  return reminder || confirmationResponse(input, runtime, false);
+}
+
 /**
  * Build the official Alexa Custom Skill SDK dispatcher.
  *
@@ -877,14 +1237,18 @@ async function stationStatusResponse(input: any, runtime: AlexaRuntime) {
  */
 export function createAlexaSkill(runtime: AlexaRuntime = defaultRuntime()) {
   const configured = runtime.getSettings();
-  const builder = SkillBuilders.custom().withSkillId(configured.skillId || '__disabled__');
+  const builder = SkillBuilders.custom()
+    .withSkillId(configured.skillId || '__disabled__')
+    .withApiClient(new DefaultApiClient());
 
   return builder
     .addRequestHandler('LaunchRequest', (input: any) => playResponse(input, runtime, messages(inputLocale(input)).starting))
     .addRequestHandlers(
       intentHandler(['RequestSongIntent'], input => requestSongResponse(input, runtime)),
-      intentHandler(['AMAZON.YesIntent'], input => confirmationResponse(input, runtime, true)),
-      intentHandler(['AMAZON.NoIntent'], input => confirmationResponse(input, runtime, false)),
+      intentHandler(['DedicationIntent'], input => dedicationResponse(input, runtime)),
+      intentHandler(['RequestReminderIntent'], input => requestReminderResponse(input, runtime)),
+      intentHandler(['AMAZON.YesIntent'], input => yesResponse(input, runtime)),
+      intentHandler(['AMAZON.NoIntent'], input => noResponse(input, runtime)),
       intentHandler(['RequestStatusIntent'], input => requestStatusResponse(input, runtime)),
       intentHandler(['CancelRequestIntent'], input => cancelRequestResponse(input, runtime)),
       intentHandler(['ReplaceRequestIntent'], input => replaceRequestResponse(input, runtime)),
@@ -919,6 +1283,11 @@ export function createAlexaSkill(runtime: AlexaRuntime = defaultRuntime()) {
       },
       intentHandler(['AMAZON.NavigateHomeIntent'], (input: any) =>
         stopResponse(input, messages(inputLocale(input)).stopped)),
+      {
+        canHandle: (input: any) => input.requestEnvelope.request.type === 'Connections.Response'
+          && input.requestEnvelope.request.name === 'AskFor',
+        handle: (input: any) => reminderPermissionResponse(input, runtime),
+      },
       {
         canHandle: (input: any) => input.requestEnvelope.request.type === 'IntentRequest',
         handle: (input: any) => helpResponse(input),

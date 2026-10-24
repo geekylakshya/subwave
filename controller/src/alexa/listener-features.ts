@@ -52,6 +52,10 @@ export interface AlexaListenerFeatureSources {
 
 const DEFAULT_RECENT_LIMIT = 5;
 const MAX_CANDIDATES = 80;
+// Alexa's synchronous endpoint has a much shorter response budget than a
+// catalogue refresh. Local KNN results are available first; remote similarity
+// providers are optional enrichment and must not hold the voice response open.
+const REMOTE_SIMILARITY_TIMEOUT_MS = 2_500;
 
 function text(value: unknown): string {
   return String(value ?? '').trim();
@@ -185,16 +189,32 @@ async function defaultSimilarCandidates(track: AlexaListenerTrack): Promise<unkn
     candidates.push(...library.tracksLikeThisAudio(track.id, MAX_CANDIDATES));
     // These are independent optional sources. Run them together so a slow or
     // unsupported Navidrome similarity endpoint cannot consume Alexa's whole
-    // response window before the local library candidates are considered.
+    // response window after the local library candidates have been considered.
     const remote = await Promise.allSettled([
-      subsonic.getSonicSimilarTracks(track.id, { count: MAX_CANDIDATES }),
-      subsonic.getSimilarSongs(track.id, { count: MAX_CANDIDATES }),
+      optionalWithin(
+        subsonic.getSonicSimilarTracks(track.id, { count: MAX_CANDIDATES }),
+        REMOTE_SIMILARITY_TIMEOUT_MS,
+      ),
+      optionalWithin(
+        subsonic.getSimilarSongs(track.id, { count: MAX_CANDIDATES }),
+        REMOTE_SIMILARITY_TIMEOUT_MS,
+      ),
     ]);
     for (const result of remote) {
-      if (result.status === 'fulfilled') candidates.push(...result.value);
+      if (result.status === 'fulfilled' && result.value) candidates.push(...result.value);
     }
   }
   return candidates;
+}
+
+function optionalWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>(resolve => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  return Promise.race([promise.catch(() => null), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 function sameArtist(candidate: AlexaListenerTrack, artist: string): boolean {

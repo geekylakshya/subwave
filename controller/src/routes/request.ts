@@ -15,11 +15,12 @@ import * as requestLog from '../broadcast/request-log.js';
 import * as listeners from '../broadcast/listeners.js';
 import * as likes from '../broadcast/likes.js';
 import { generateQueuedRequestIntro } from '../broadcast/request-intro.js';
+import { autoVoiceAllowed } from '../broadcast/voice-policy.js';
 import * as webhooks from '../broadcast/webhooks.js';
 import * as settings from '../settings.js';
 import { withDeadline } from '../llm/internal/core/retry.js';
 import {
-  sanitizeRequestText, stripScriptedOpener, cleanRequesterName, cleanMissedArtist, stillInFlight, screenAck,
+  sanitizeRequestText, stripScriptedOpener, cleanRequesterName, cleanDedicationTarget, cleanMissedArtist, stillInFlight, screenAck,
   isNamedRequester, sorryNoMatch,
 } from '../util/request-guard.js';
 import {
@@ -27,7 +28,7 @@ import {
   REQUESTS_DISABLED,
 } from '../middleware/ratelimit.js';
 import { validatePublicBody } from '../middleware/validate.js';
-import { listenerRequestSchema } from '../schemas/request.js';
+import { listenerDedicationSchema, listenerRequestSchema } from '../schemas/request.js';
 import { classifyListenerRequest, directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, rankAliasCandidates, repairRequestMatch, requestArtistMatches, resolveDirectRequest } from '../music/request-match.js';
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
@@ -36,6 +37,7 @@ import { RequestIdentificationMiss } from '../broadcast/dj-agent/breaker.js';
 import { isWebSearchProviderError, searchReady, searchWeb } from '../skills/web-search.js';
 import * as requestLedger from '../broadcast/request-ledger.js';
 import type { AlexaVerifiedCandidate } from '../alexa/listener-features.js';
+import type { RequestDedication, RequestReminder } from '../broadcast/request-ledger.js';
 
 export const router = express.Router();
 
@@ -217,6 +219,7 @@ function recordOutcome(entry) {
         : (entry.track || null),
       ack: entry.ack || null,
       introScript: entry.introScript || null,
+      dedication: entry.dedication || null,
       message: entry.message || null,
       guard: entry.guard ?? null,
       introFailure: entry.introFailure ?? null,
@@ -424,6 +427,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
       track: pick,
       context: ctx,
       requestedBy: requester,
+      dedication: entry.dedication || null,
       recap: queue.getDjRecap(),
       recentTracks: queue.getRecentTracks(),
       recentOpeners: queue.getRecentOpeners(),
@@ -440,7 +444,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     const introScript = generatedIntro.introScript;
     if (entry.status === 'cancelled') return;
     const pos = await queue.push({
-      track: pick, requestId: entry.id, requestedBy: requester, intent: 'more_like_this', introScript,
+      track: pick, requestId: entry.id, requestedBy: requester, dedication: entry.dedication || null, intent: 'more_like_this', introScript,
       introKind: 'dj-speak',
       // Voice it as whoever wrote it: render and air happen later and would
       // otherwise re-resolve the speaker off the wall clock.
@@ -847,6 +851,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     track: pick,
     context: ctx,
     requestedBy: requester,
+    dedication: entry.dedication || null,
     artistMiss: !!entry.artistMiss,
     missedArtist: entry.missedArtist ?? null,
     requestSubstitution: selection.outcome === 'substituted',
@@ -872,6 +877,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
     track: pick,
     requestId: entry.id,
     requestedBy: requester,
+    dedication: entry.dedication || null,
     intent: matched.intent,
     introScript,
     introKind: 'dj-speak',
@@ -981,6 +987,7 @@ export async function submitListenerRequest(input: {
    * it may not turn this exact selection into an unrelated substitution.
    */
   verifiedCandidate?: AlexaVerifiedCandidate;
+  dedication?: { target: string; locale?: 'en-US' | 'en-IN' | 'hi-IN' };
 }): Promise<ListenerRequestSubmission> {
   // Keep every caller behind the same shape/size boundary. The browser
   // middleware already parsed this schema, but Alexa and future voice clients
@@ -992,6 +999,18 @@ export async function submitListenerRequest(input: {
       statusCode: 400,
       error: parsed.error.issues[0]?.message || 'Invalid request',
     };
+  }
+  let dedication: RequestDedication | null = null;
+  if (input.dedication) {
+    const dedicationParsed = listenerDedicationSchema.safeParse(input.dedication);
+    const target = cleanDedicationTarget(dedicationParsed.success ? dedicationParsed.data.target : input.dedication.target);
+    if (!dedicationParsed.success || !target) {
+      return { accepted: false, statusCode: 400, error: 'Tell me who the dedication is for.' };
+    }
+    if (!autoVoiceAllowed()) {
+      return { accepted: false, statusCode: 503, message: 'Dedications are unavailable while station voice is off.' };
+    }
+    dedication = { target, locale: dedicationParsed.data.locale };
   }
   const cfg = (settings.get() as any)?.requests || {};
   if (REQUESTS_DISABLED || cfg.enabled === false) {
@@ -1092,6 +1111,7 @@ export async function submitListenerRequest(input: {
       clientKey: ip,
       alexaIdentity: input.alexaIdentity,
       verifiedCandidate: input.verifiedCandidate,
+      dedication,
       provider: settings.get().search?.provider || 'duckduckgo',
       rawText: sanitizeRequestText(rawText),
       injection: stripped.injection,
@@ -1112,6 +1132,7 @@ export async function submitListenerRequest(input: {
         requester,
         text,
         alexaIdentity: input.alexaIdentity,
+        dedication,
       });
     } catch (error) {
       requests.delete(id);
@@ -1168,6 +1189,27 @@ export interface ListenerRequestStatus {
   etaSeconds?: number | null;
   outcome?: string | null;
   message?: string | null;
+  dedication?: RequestDedication | null;
+  reminder?: RequestReminder | null;
+}
+
+export type PublicListenerRequestStatus = Omit<ListenerRequestStatus, 'reminder'> & {
+  reminder?: Omit<RequestReminder, 'alertToken'> | null;
+};
+
+export function publicListenerRequestStatus(status: ListenerRequestStatus): PublicListenerRequestStatus {
+  const { reminder, ...withoutReminder } = status;
+  return {
+    ...withoutReminder,
+    reminder: reminder
+      ? {
+          createdAt: reminder.createdAt,
+          triggerAt: reminder.triggerAt,
+          forecastSeconds: reminder.forecastSeconds,
+          leadSeconds: reminder.leadSeconds,
+        }
+      : reminder,
+  };
 }
 
 function queueStatusFor(id: string): { phase: RequestPhase; queuePosition?: number; etaSeconds?: number | null } | null {
@@ -1199,6 +1241,8 @@ function statusFromRecord(record: requestLedger.RequestLedgerRecord): ListenerRe
     etaSeconds: queueState?.etaSeconds ?? null,
     outcome: record.outcome ?? null,
     message: record.message ?? null,
+    dedication: record.dedication ?? null,
+    reminder: record.reminder ?? null,
   };
 }
 
@@ -1217,6 +1261,8 @@ export function getListenerRequestStatus(id: string): ListenerRequestStatus {
       etaSeconds: queueState?.etaSeconds ?? null,
       outcome: entry.outcome,
       message: entry.message,
+      dedication: entry.dedication ?? null,
+      reminder: entry.reminder ?? null,
     };
   }
   const record = requestLedger.get(id);
@@ -1226,6 +1272,46 @@ export function getListenerRequestStatus(id: string): ListenerRequestStatus {
 export async function getLatestAlexaRequestStatus(identity: string): Promise<ListenerRequestStatus | null> {
   const record = requestLedger.latestForAlexa(identity);
   return record ? getListenerRequestStatus(record.id) : null;
+}
+
+export async function getAlexaRequestStatus(identity: string, id: string): Promise<ListenerRequestStatus | null> {
+  const record = requestLedger.get(id);
+  if (!record || record.source !== 'alexa' || record.alexaIdentity !== identity) return null;
+  return getListenerRequestStatus(id);
+}
+
+export async function saveAlexaRequestReminder(
+  identity: string,
+  id: string,
+  reminder: RequestReminder,
+): Promise<ListenerRequestStatus | null> {
+  const record = requestLedger.get(id);
+  if (!record || record.source !== 'alexa' || record.alexaIdentity !== identity) return null;
+  const before = getListenerRequestStatus(id);
+  if (before.phase !== 'queued' || before.reminder?.alertToken) return null;
+  const updated = await requestLedger.setReminder(id, reminder);
+  if (!updated) return null;
+  const entry = requests.get(id);
+  if (entry) entry.reminder = reminder;
+  const after = getListenerRequestStatus(id);
+  if (after.phase !== 'queued') {
+    await requestLedger.clearReminder(id);
+    if (entry) entry.reminder = null;
+    return null;
+  }
+  return after;
+}
+
+export async function clearAlexaRequestReminder(identity: string, id: string): Promise<boolean> {
+  const record = requestLedger.get(id);
+  if (!record || record.source !== 'alexa' || record.alexaIdentity !== identity || !record.reminder?.alertToken) {
+    return false;
+  }
+  const updated = await requestLedger.clearReminder(id);
+  if (!updated) return false;
+  const entry = requests.get(id);
+  if (entry) entry.reminder = null;
+  return true;
 }
 
 type RequestCancellationDecision = 'cancelled' | 'cancelable' | 'too-late' | 'unknown';
@@ -1239,15 +1325,24 @@ function requestCancellationDecision(status: ListenerRequestStatus): RequestCanc
 
 async function cancelRequestById(id: string): Promise<ListenerRequestStatus | null> {
   const entry = requests.get(id);
-  if (entry?.status === 'cancelled') return getListenerRequestStatus(id);
+  if (entry?.status === 'cancelled') {
+    entry.reminder = null;
+    return getListenerRequestStatus(id);
+  }
 
   if (entry?.status === 'pending') {
     entry.status = 'cancelled';
     entry.outcome = 'cancelled';
     entry.message = 'Cancelled by listener.';
+    entry.reminder = null;
     if (lastByIp.get(entry.clientKey) === entry) lastByIp.delete(entry.clientKey);
     recordOutcome(entry);
-    await requestLedger.update(id, { status: 'cancelled', outcome: entry.outcome, message: entry.message });
+    await requestLedger.update(id, {
+      status: 'cancelled',
+      outcome: entry.outcome,
+      message: entry.message,
+      reminder: null,
+    });
     return getListenerRequestStatus(id);
   }
 
@@ -1262,9 +1357,15 @@ async function cancelRequestById(id: string): Promise<ListenerRequestStatus | nu
     entry.status = 'cancelled';
     entry.outcome = 'cancelled';
     entry.message = 'Cancelled by listener.';
+    entry.reminder = null;
     recordOutcome(entry);
   }
-  await requestLedger.update(id, { status: 'cancelled', outcome: 'cancelled', message: 'Cancelled by listener.' });
+  await requestLedger.update(id, {
+    status: 'cancelled',
+    outcome: 'cancelled',
+    message: 'Cancelled by listener.',
+    reminder: null,
+  });
   return getListenerRequestStatus(id);
 }
 
@@ -1314,5 +1415,5 @@ router.get('/request/:id', (req, res) => {
     // Never existed, or pruned / lost to a restart; the UI stops polling.
     return res.status(404).json({ status: 'unknown' });
   }
-  return res.json(status);
+  return res.json(publicListenerRequestStatus(status));
 });

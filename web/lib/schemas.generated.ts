@@ -1961,6 +1961,7 @@ export function normalizeRecipeRow(raw: unknown): {
 // is an alias of this.
 export const REQUEST_TEXT_MAX = 280;
 export const REQUEST_NAME_MAX = 40;
+export const DEDICATION_TARGET_MAX = 60;
 
 // Explicit null reads as absent. (Named per-module: the mirror is one flat file.)
 const requestNullToUndefined = (v: unknown) => (v == null ? undefined : v);
@@ -1989,6 +1990,17 @@ export const listenerRequestSchema = z.object({
       .default(''),
   ),
 });
+
+export const listenerDedicationSchema = z.object({
+  target: z
+    .string({ error: 'Tell me who the dedication is for.' })
+    .trim()
+    .min(1, 'Tell me who the dedication is for.')
+    .max(DEDICATION_TARGET_MAX, `Keep the dedication under ${DEDICATION_TARGET_MAX} characters.`),
+  locale: z.enum(['en-US', 'en-IN', 'hi-IN']).default('en-IN'),
+});
+
+export type ListenerDedication = z.infer<typeof listenerDedicationSchema>;
 
 // ─── from controller/src/schemas/schedule.ts ─────────────────────────────
 

@@ -187,6 +187,36 @@
           ]
         },
         {
+          "slots": [
+            {
+              "name": "requestText",
+              "type": "AMAZON.SearchQuery"
+            },
+            {
+              "name": "dedicationTarget",
+              "type": "AMAZON.SearchQuery"
+            }
+          ],
+          "name": "DedicationIntent",
+          "samples": [
+            "dedicate {requestText}",
+            "request a dedication for {dedicationTarget}",
+            "dedicate a song",
+            "make a dedication",
+            "dedicate this song",
+            "play a song for someone"
+          ]
+        },
+        {
+          "name": "RequestReminderIntent",
+          "samples": [
+            "remind me before my request plays",
+            "set a reminder for my song request",
+            "remind me when my requested song is coming up",
+            "remind me before my song plays"
+          ]
+        },
+        {
           "name": "AMAZON.HelpIntent"
         },
         {
@@ -228,6 +258,46 @@
         }
       ],
       "invocationName": "__ALEXA_INVOCATION_NAME__"
-    }
+    },
+    "dialog": {
+      "delegationStrategy": "ALWAYS",
+      "intents": [
+        {
+          "name": "DedicationIntent",
+          "confirmationRequired": false,
+          "prompts": {},
+          "slots": [
+            {
+              "name": "requestText",
+              "type": "AMAZON.SearchQuery",
+              "elicitationRequired": true,
+              "confirmationRequired": false,
+              "prompts": { "elicitation": "DedicationSongPrompt" }
+            },
+            {
+              "name": "dedicationTarget",
+              "type": "AMAZON.SearchQuery",
+              "elicitationRequired": true,
+              "confirmationRequired": false,
+              "prompts": { "elicitation": "DedicationTargetPrompt" }
+            }
+          ]
+        }
+      ]
+    },
+    "prompts": [
+      {
+        "id": "DedicationSongPrompt",
+        "variations": [
+          { "type": "PlainText", "value": "Tell me the song you want to dedicate." }
+        ]
+      },
+      {
+        "id": "DedicationTargetPrompt",
+        "variations": [
+          { "type": "PlainText", "value": "Who should I dedicate it to?" }
+        ]
+      }
+    ]
   }
 }

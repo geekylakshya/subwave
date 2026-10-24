@@ -54,6 +54,12 @@ The user must configure the matching Alexa Skill ID in their own radio backend.
 The endpoint in `ALEXA_ENDPOINT_URL` must be publicly reachable over HTTPS and
 must point to that user's radio deployment.
 
+The model includes listener dedications and request reminders. A dedication
+collects the requested song and recipient in separate turns. A reminder is
+offered only when the backend has a reliable queue estimate and requires both
+confirmation and Alexa reminder permission. These flows use the same request
+ledger as ordinary song requests.
+
 The skill can then be tested with the Alexa Developer Console or ASK CLI
 simulation tools. No publishing or certification step is required.
 

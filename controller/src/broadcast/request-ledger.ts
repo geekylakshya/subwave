@@ -12,6 +12,19 @@ import { writeFileAtomic } from '../util/atomic-file.js';
 
 export type LedgerStatus = 'pending' | 'resolved' | 'failed' | 'interrupted' | 'cancelled';
 
+export interface RequestDedication {
+  target: string;
+  locale: 'en-US' | 'en-IN' | 'hi-IN';
+}
+
+export interface RequestReminder {
+  alertToken: string;
+  createdAt: number;
+  triggerAt: number;
+  forecastSeconds: number;
+  leadSeconds: number;
+}
+
 export interface RequestLedgerRecord {
   id: string;
   createdAt: number;
@@ -26,6 +39,8 @@ export interface RequestLedgerRecord {
   message?: string | null;
   queuePosition?: number | null;
   alexaIdentity?: string;
+  dedication?: RequestDedication | null;
+  reminder?: RequestReminder | null;
 }
 
 interface StoredLedger {
@@ -138,6 +153,14 @@ export async function update(id: string, patch: Partial<Omit<RequestLedgerRecord
   updateLatestAlexa(row);
   await persist();
   return row;
+}
+
+export async function setReminder(id: string, reminder: RequestReminder): Promise<RequestLedgerRecord | null> {
+  return update(id, { reminder });
+}
+
+export async function clearReminder(id: string): Promise<RequestLedgerRecord | null> {
+  return update(id, { reminder: null });
 }
 
 export function get(id: string): RequestLedgerRecord | null {

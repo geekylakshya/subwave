@@ -251,6 +251,20 @@ Alexa, ask <your invocation name> what is playing
 Alexa, ask <your invocation name> what show is on now
 ```
 
+For the guided listener flows, use:
+
+```text
+Alexa, ask <your invocation name> to dedicate a song
+Alexa, ask <your invocation name> to remind me about my request
+```
+
+The dedication flow asks for the song and then the recipient. The recipient can
+be a person, group, family member, friend, or the listener themselves. A request
+reminder is offered only when the backend has a reliable queue estimate. After
+you agree to the skill's reminder question, Alexa asks for reminder permission;
+answer with **“I approve”** to grant it. The skill creates the reminder only
+after Alexa sends the permission response.
+
 After the skill has started, audio controls can normally be used directly:
 
 ```text
@@ -280,6 +294,8 @@ shared.
 | `StartRadioIntent` | “start the radio” |
 | `PlayRadioIntent` | “play the station” |
 | `RequestSongIntent` | “request a song by title or artist” |
+| `DedicationIntent` | “dedicate [song] to [person or group]” |
+| `RequestReminderIntent` | “remind me about my request” |
 | `RequestStatusIntent` | “what is the status of my request” |
 | `CancelRequestIntent` | “cancel my request” |
 | `ReplaceRequestIntent` | “replace my request with another song” |
@@ -315,6 +331,17 @@ intents for those request types.
 
 If a track does not contain album, year, genre, or language metadata, the skill
 reports that the value is unavailable; it does not invent metadata.
+
+`DedicationIntent` collects the song and recipient separately. It accepts
+ordinary recipient descriptions such as “for [recipient]”, “for my friends”,
+“for the family”, or “for myself”; the recipient is not treated as the song
+title.
+
+`RequestReminderIntent` has a two-stage confirmation flow. First answer the
+skill's question about setting a reminder. Alexa then asks whether the skill
+may update reminders; answer “I approve” or “no”. A reminder is not created
+when the permission is denied, unanswered, or the queue estimate is not
+reliable.
 
 ### Amazon built-in intents
 

@@ -183,7 +183,7 @@ test('Alexa acknowledges a song request immediately through the shared request p
   const submitted: Array<{ text: string; userId: string }> = [];
   const response = await createAlexaSkill({
     ...runtime,
-    submitRequest: async (text, userId) => {
+    submitRequest: async ({ text, userId }) => {
       submitted.push({ text, userId });
       return { accepted: true, statusCode: 202, requestId: 'request-1', status: 'pending' };
     },
@@ -206,7 +206,7 @@ test('Alexa asks for confirmation only when a named request has several catalogu
   const skill = createAlexaSkill({
     ...runtime,
     previewRequest: async () => candidates,
-    submitRequest: async text => {
+    submitRequest: async ({ text }) => {
       submitted.push(text);
       return { accepted: true, statusCode: 202, requestId: 'request-confirmed', status: 'pending' };
     },
@@ -331,8 +331,8 @@ test('Alexa listener features submit a verified candidate through the shared req
       recentTracks: () => [],
       similarCandidates: () => [{ id: 'similar-1', title: 'Similar Song', artist: 'Other Artist', similarity: 0.9 }],
     }),
-    submitRequest: async (text: string, _userId: string, candidate?: { id: string }) => {
-      submitted.push({ text, candidate });
+    submitRequest: async input => {
+      submitted.push({ text: input.text, candidate: input.verifiedCandidate });
       return { accepted: true as const, statusCode: 202 as const, requestId: 'feature-request', status: 'pending' as const };
     },
   };

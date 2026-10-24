@@ -33,6 +33,10 @@ Before changing anything, the agent should:
 7. Treat `CancelRequestIntent` and `ReplaceRequestIntent` as state-changing
    tests. Ask for confirmation before running them against a real pending
    request.
+8. Treat reminder consent as a two-stage Alexa workflow. After the user agrees
+   to the skill's reminder question, Alexa asks for permission to update
+   reminders; the successful test response is “I approve”, not a second generic
+   “yes”.
 
 If a command requests AWS or Lambda credentials even though the user is using
 the external HTTPS endpoint in this package, stop and ask the user. Do not
@@ -312,7 +316,9 @@ shared.
 | --- | --- | --- |
 | `StartRadioIntent` | “start the radio” | Starts playback using the configured radio endpoint. |
 | `PlayRadioIntent` | “play the station” | Starts playback using the configured radio endpoint. |
-| `RequestSongIntent` | “request Bohemian Rhapsody by Queen” | The general song request intent. Keep title, artist, album, lyrics, language, genre, mood, and energy requests here; do not create duplicate matching intents. Uses `requestText`. |
+| `RequestSongIntent` | “request [song] by [artist]” | The general song request intent. Keep title, artist, album, lyrics, language, genre, mood, and energy requests here; do not create duplicate matching intents. Uses `requestText`. |
+| `DedicationIntent` | “dedicate [song] to [person or group]” | Collects the song and recipient in separate dialog turns, accepts people, groups, family, friends, and “myself”, then sends the dedication through the normal request pipeline. |
+| `RequestReminderIntent` | “remind me about my request” | Offers a reminder only for a queued request with a reliable two-to-thirty-minute estimate; the skill confirmation is followed by Alexa's explicit permission workflow. |
 | `RequestStatusIntent` | “what is the status of my request” | Reads the current listener request and its queue status. |
 | `CancelRequestIntent` | “cancel my request” | Cancels the listener's waiting request. State-changing; test carefully. |
 | `ReplaceRequestIntent` | “replace my request with [song]” | Replaces the waiting request. Uses `requestText`; state-changing. |
@@ -473,6 +479,38 @@ Verify that:
 
 Do not use a real listener's pending request for destructive tests without
 confirmation.
+
+### Dedicated-request and reminder flows
+
+Exercise the two-turn dedication flow with both a person and a group:
+
+```text
+dedicate a song
+<provide a known song>
+<provide a person or group>
+```
+
+Verify that the recipient is stored as dedication data, is not sent as part of
+the song-search prompt, and that the queue item and request ledger carry the
+dedication. The backend rejects unsafe or overlong recipient text and refuses
+dedications when station voice is disabled.
+
+For reminders, first create a disposable request and wait until it has a
+reliable queue estimate. Then test:
+
+```text
+remind me about my request
+yes
+i approve
+```
+
+The first `yes` accepts the skill's offer. Alexa then owns the standard
+permission prompt; `i approve` grants permission and returns a
+`Connections.Response` to the skill. Verify the spoken confirmation, the
+one-minute lead time, and the reminder token in the request ledger. Also test
+`no` at both prompts, an estimate shorter than two minutes, an estimate longer
+than thirty minutes, a still-pending request, and a cancelled/replaced
+request. The latter must not leave an active reminder behind.
 
 ## 9. Verification checklist
 

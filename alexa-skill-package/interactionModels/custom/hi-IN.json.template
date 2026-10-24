@@ -225,6 +225,36 @@
           ]
         },
         {
+          "slots": [
+            {
+              "name": "requestText",
+              "type": "AMAZON.SearchQuery"
+            },
+            {
+              "name": "dedicationTarget",
+              "type": "AMAZON.SearchQuery"
+            }
+          ],
+          "name": "DedicationIntent",
+          "samples": [
+            "dedicate करो {requestText}",
+            "{dedicationTarget} के लिए dedication करो",
+            "एक गाना dedicate करना है",
+            "ek dedication karni hai",
+            "इस गाने को dedicate करो",
+            "किसी के लिए गाना बजाओ"
+          ]
+        },
+        {
+          "name": "RequestReminderIntent",
+          "samples": [
+            "मेरी request बजने से पहले याद दिलाओ",
+            "मेरे गाने के लिए reminder लगाओ",
+            "meri request se pehle reminder lagao",
+            "requested song bajne se pehle yaad dilao"
+          ]
+        },
+        {
           "name": "AMAZON.HelpIntent"
         },
         {
@@ -266,6 +296,46 @@
         }
       ],
       "invocationName": "__ALEXA_INVOCATION_NAME__"
-    }
+    },
+    "dialog": {
+      "delegationStrategy": "ALWAYS",
+      "intents": [
+        {
+          "name": "DedicationIntent",
+          "confirmationRequired": false,
+          "prompts": {},
+          "slots": [
+            {
+              "name": "requestText",
+              "type": "AMAZON.SearchQuery",
+              "elicitationRequired": true,
+              "confirmationRequired": false,
+              "prompts": { "elicitation": "DedicationSongPrompt" }
+            },
+            {
+              "name": "dedicationTarget",
+              "type": "AMAZON.SearchQuery",
+              "elicitationRequired": true,
+              "confirmationRequired": false,
+              "prompts": { "elicitation": "DedicationTargetPrompt" }
+            }
+          ]
+        }
+      ]
+    },
+    "prompts": [
+      {
+        "id": "DedicationSongPrompt",
+        "variations": [
+          { "type": "PlainText", "value": "जिस गाने को dedicate करना है, उसका नाम बताइए।" }
+        ]
+      },
+      {
+        "id": "DedicationTargetPrompt",
+        "variations": [
+          { "type": "PlainText", "value": "यह dedication किसके लिए है?" }
+        ]
+      }
+    ]
   }
 }

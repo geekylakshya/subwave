@@ -61,6 +61,21 @@ const MESSAGES: Record<AlexaLocale, {
   details: (title: string, detailType: string, fields: string) => string;
   currentShow: (name: string, dj: string, guests: string) => string;
   noShow: (dj: string | null) => string;
+  dedicationPrompt: string;
+  dedicationTargetPrompt: string;
+  dedicationAccepted: string;
+  dedicationFailed: string;
+  reminderEmpty: string;
+  reminderPending: string;
+  reminderUnavailable: string;
+  reminderConfirm: (title: string, eta: string) => string;
+  reminderPermission: string;
+  reminderPermissionRetry: string;
+  reminderSet: (title: string) => string;
+  reminderAlreadySet: string;
+  reminderDenied: string;
+  reminderFailed: string;
+  reminderStale: string;
 }> = {
   'en-US': {
     offline: 'The station is currently offline.',
@@ -73,7 +88,7 @@ const MESSAGES: Record<AlexaLocale, {
     noNext: 'There is no song queued next.',
     noPrevious: 'There is no recently played song available.',
     statusEmpty: 'You have no recent song request.',
-    help: 'You can say start or stop the radio, request a song, ask for request status, ask what is playing, or ask what plays next.',
+    help: 'You can start or stop the radio, request or dedicate a song, ask for a request reminder, ask what is playing, or ask what plays next.',
     requestPrompt: 'Please tell me the song, artist, album, or mood you want to request.',
     requestAccepted: 'Your request was sent to the booth. It will play when available.',
     requestFailed: 'I could not submit that request right now.',
@@ -108,6 +123,21 @@ const MESSAGES: Record<AlexaLocale, {
     details: (title, detailType, fields) => `For ${title}, ${detailType}: ${fields}.`,
     currentShow: (name, dj, guests) => guests ? `${name} is on now with ${dj} and ${guests}.` : `${name} is on now with ${dj}.`,
     noShow: dj => dj ? `There is no scheduled show right now. ${dj} is on air.` : 'There is no scheduled show right now.',
+    dedicationPrompt: 'Tell me the song you want to dedicate.',
+    dedicationTargetPrompt: 'Who should I dedicate it to?',
+    dedicationAccepted: 'Your dedication was sent to the booth. It will play when available.',
+    dedicationFailed: 'I could not send that dedication right now.',
+    reminderEmpty: 'You have no recent queued song request to remind you about.',
+    reminderPending: 'Your latest request is still being matched. Ask me for a reminder once it is queued.',
+    reminderUnavailable: 'I do not have a reliable queue estimate for that request yet. Please try again when it is closer.',
+    reminderConfirm: (title, eta) => `Your request for ${title} should play ${eta}. Should I remind you one minute before it plays?`,
+    reminderPermission: 'I need permission to update your Alexa reminders. I will ask for that permission now.',
+    reminderPermissionRetry: 'I did not catch that. Alexa will ask again whether I can update your reminders.',
+    reminderSet: title => `Okay, I will remind you one minute before ${title} is expected to play.`,
+    reminderAlreadySet: 'A reminder is already set for your latest request.',
+    reminderDenied: 'Okay, I will not set a reminder.',
+    reminderFailed: 'I could not create that reminder right now. Please try again later.',
+    reminderStale: 'The queue changed before I could set that reminder. Please ask again for a fresh estimate.',
   },
   'en-IN': {
     offline: 'The station is currently offline.',
@@ -120,7 +150,7 @@ const MESSAGES: Record<AlexaLocale, {
     noNext: 'There is no song queued next.',
     noPrevious: 'There is no recently played song available.',
     statusEmpty: 'You have no recent song request.',
-    help: 'You can say start or stop the radio, request a song, ask for request status, ask what is playing, or ask what plays next.',
+    help: 'You can start or stop the radio, request or dedicate a song, ask for a request reminder, ask what is playing, or ask what plays next.',
     requestPrompt: 'Please tell me the song, artist, album, or mood you want to request.',
     requestAccepted: 'Your request was sent to the booth. It will play when available.',
     requestFailed: 'I could not submit that request right now.',
@@ -155,6 +185,21 @@ const MESSAGES: Record<AlexaLocale, {
     details: (title, detailType, fields) => `For ${title}, ${detailType}: ${fields}.`,
     currentShow: (name, dj, guests) => guests ? `${name} is on now with ${dj} and ${guests}.` : `${name} is on now with ${dj}.`,
     noShow: dj => dj ? `There is no scheduled show right now. ${dj} is on air.` : 'There is no scheduled show right now.',
+    dedicationPrompt: 'Tell me the song you want to dedicate.',
+    dedicationTargetPrompt: 'Who should I dedicate it to?',
+    dedicationAccepted: 'Your dedication was sent to the booth. It will play when available.',
+    dedicationFailed: 'I could not send that dedication right now.',
+    reminderEmpty: 'You have no recent queued song request to remind you about.',
+    reminderPending: 'Your latest request is still being matched. Ask me for a reminder once it is queued.',
+    reminderUnavailable: 'I do not have a reliable queue estimate for that request yet. Please try again when it is closer.',
+    reminderConfirm: (title, eta) => `Your request for ${title} should play ${eta}. Should I remind you one minute before it plays?`,
+    reminderPermission: 'I need permission to update your Alexa reminders. I will ask for that permission now.',
+    reminderPermissionRetry: 'I did not catch that. Alexa will ask again whether I can update your reminders.',
+    reminderSet: title => `Okay, I will remind you one minute before ${title} is expected to play.`,
+    reminderAlreadySet: 'A reminder is already set for your latest request.',
+    reminderDenied: 'Okay, I will not set a reminder.',
+    reminderFailed: 'I could not create that reminder right now. Please try again later.',
+    reminderStale: 'The queue changed before I could set that reminder. Please ask again for a fresh estimate.',
   },
   'hi-IN': {
     offline: 'स्टेशन अभी offline है।',
@@ -167,7 +212,7 @@ const MESSAGES: Record<AlexaLocale, {
     noNext: 'अगला कोई गाना queue में नहीं है।',
     noPrevious: 'हाल में बजा हुआ कोई गाना उपलब्ध नहीं है।',
     statusEmpty: 'आपकी कोई हाल की song request नहीं है।',
-    help: 'आप radio शुरू या बंद कर सकते हैं, song request कर सकते हैं, request status पूछ सकते हैं, या अभी और अगला गाना पूछ सकते हैं।',
+    help: 'आप radio शुरू या बंद कर सकते हैं, song request या dedication कर सकते हैं, reminder मांग सकते हैं, या अभी और अगला गाना पूछ सकते हैं।',
     requestPrompt: 'जिस song, artist, album या mood की request करनी है, वह बताइए।',
     requestAccepted: 'आपकी request booth को भेज दी गई है। उपलब्ध होने पर यह बजेगी।',
     requestFailed: 'अभी यह request भेजी नहीं जा सकी।',
@@ -202,6 +247,21 @@ const MESSAGES: Record<AlexaLocale, {
     details: (title, detailType, fields) => `${title} के लिए ${detailType}: ${fields}।`,
     currentShow: (name, dj, guests) => guests ? `${name} अभी ${dj} और ${guests} के साथ on air है।` : `${name} अभी ${dj} के साथ on air है।`,
     noShow: dj => dj ? 'अभी कोई scheduled show नहीं है। ' + `${dj} on air हैं।` : 'अभी कोई scheduled show नहीं है।',
+    dedicationPrompt: 'जिस गाने को dedicate करना है, उसका नाम बताइए।',
+    dedicationTargetPrompt: 'यह dedication किसके लिए है?',
+    dedicationAccepted: 'आपकी dedication booth को भेज दी गई है। उपलब्ध होने पर यह बजेगी।',
+    dedicationFailed: 'अभी dedication भेजी नहीं जा सकी।',
+    reminderEmpty: 'आपकी कोई हाल की queued song request नहीं है जिसके लिए reminder लगाया जा सके।',
+    reminderPending: 'आपकी latest request अभी match हो रही है। Queue में आने के बाद reminder मांगिए।',
+    reminderUnavailable: 'इस request के लिए अभी queue का भरोसेमंद अनुमान उपलब्ध नहीं है। थोड़ी देर बाद फिर पूछिए।',
+    reminderConfirm: (title, eta) => `${title} की request ${eta} बजने की उम्मीद है। क्या इसके एक मिनट पहले reminder लगाऊँ?`,
+    reminderPermission: 'Alexa reminder update करने के लिए आपकी permission चाहिए। अब permission मांगी जाएगी।',
+    reminderPermissionRetry: 'आवाज़ साफ़ नहीं आई। Alexa फिर से reminder permission पूछेगी।',
+    reminderSet: title => `ठीक है, ${title} के बजने से एक मिनट पहले reminder लगा दिया जाएगा।`,
+    reminderAlreadySet: 'आपकी latest request के लिए reminder पहले से लगा हुआ है।',
+    reminderDenied: 'ठीक है, reminder नहीं लगाया जाएगा।',
+    reminderFailed: 'अभी reminder नहीं लगाया जा सका। बाद में फिर कोशिश कीजिए।',
+    reminderStale: 'Reminder लगाने से पहले queue बदल गई। नए अनुमान के लिए फिर पूछिए।',
   },
 };
 

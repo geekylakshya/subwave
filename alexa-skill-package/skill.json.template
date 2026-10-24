@@ -6,6 +6,26 @@
           "sslCertificateType": "Wildcard",
           "uri": "__ALEXA_ENDPOINT_URL__"
         },
+        "regions": {
+          "NA": {
+            "endpoint": {
+              "sslCertificateType": "Wildcard",
+              "uri": "__ALEXA_ENDPOINT_URL__"
+            }
+          },
+          "EU": {
+            "endpoint": {
+              "sslCertificateType": "Wildcard",
+              "uri": "__ALEXA_ENDPOINT_URL__"
+            }
+          },
+          "FE": {
+            "endpoint": {
+              "sslCertificateType": "Wildcard",
+              "uri": "__ALEXA_ENDPOINT_URL__"
+            }
+          }
+        },
         "interfaces": [
           {
             "type": "AUDIO_PLAYER"
@@ -15,6 +35,11 @@
       }
     },
     "manifestVersion": "1.0",
+    "permissions": [
+      {
+        "name": "alexa::alerts:reminders:skill:readwrite"
+      }
+    ],
     "publishingInformation": {
       "category": "KNOWLEDGE_AND_TRIVIA",
       "distributionCountries": [],
@@ -23,9 +48,9 @@
         "en-US": {
           "description": "__ALEXA_DESCRIPTION__",
           "examplePhrases": [
-            "Alexa open hello world",
-            "hello",
-            "help"
+            "Alexa open __ALEXA_INVOCATION_NAME__",
+            "ask __ALEXA_INVOCATION_NAME__ what is playing",
+            "ask __ALEXA_INVOCATION_NAME__ for help"
           ],
           "keywords": [],
           "name": "__ALEXA_SKILL_NAME__",
@@ -37,9 +62,9 @@
         "en-IN": {
           "description": "__ALEXA_DESCRIPTION__",
           "examplePhrases": [
-            "Alexa open hello world",
-            "hello",
-            "help"
+            "Alexa open __ALEXA_INVOCATION_NAME__",
+            "ask __ALEXA_INVOCATION_NAME__ what is playing",
+            "ask __ALEXA_INVOCATION_NAME__ for help"
           ],
           "keywords": [],
           "name": "__ALEXA_SKILL_NAME__",

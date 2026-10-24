@@ -923,10 +923,11 @@ class Queue {
   // the line if the real seam lands too far from it — the forecast is made from
   // the on-air track's remaining play and goes badly wrong when the pick misses
   // that seam and auto.m3u fills the slot.
-  async push({ track, requestId = null, requestedBy = null, operator = false, block = null, intent = null, introScript = null, introLabelChecked = false, introKind = 'dj-speak', introPersona = null, introHostSpeech = null, aiPicked = false, allowDuplicate = false, linkPrev = null, linkClockAt = null, selectionShowAt = null }: {
+  async push({ track, requestId = null, requestedBy = null, dedication = null, operator = false, block = null, intent = null, introScript = null, introLabelChecked = false, introKind = 'dj-speak', introPersona = null, introHostSpeech = null, aiPicked = false, allowDuplicate = false, linkPrev = null, linkClockAt = null, selectionShowAt = null }: {
     track: Track;
     requestId?: string | null;
     requestedBy?: string | null;
+    dedication?: QueueItem['dedication'];
     operator?: boolean;
     block?: QueueItem['block'] | null;
     intent?: string | null;
@@ -991,7 +992,7 @@ class Queue {
       introScript = normalizeForDisplay(stripSpeakerLabel(introScript, speaker?.name ? [speaker.name] : []));
     }
     const item = {
-      track, requestId, requestedBy, operator, intent, introScript, introLabelChecked: true, introKind, introPersona, introHostSpeech,
+      track, requestId, requestedBy, dedication, operator, intent, introScript, introLabelChecked: true, introKind, introPersona, introHostSpeech,
       // Links are editorially scoped to the session that wrote them. Preserve
       // the key alongside the persona: persona alone cannot distinguish two
       // adjacent shows hosted by the same DJ.

@@ -383,7 +383,7 @@ async function resolveRequestCore(entry, signal?: AbortSignal) {
         + (cur ? ` (currently playing "${cur.title}" by ${cur.artist}${cur.id ? ` [id: ${cur.id}]` : ''})` : ''),
       // The bare text, so the echo guards can check every request still in the
       // agents' window without the line's own framing words (not public meta).
-      meta: { requestText: text },
+      meta: { requestText: text, source: entry.source || 'browser' },
     });
   } catch (err) {
     queue.log('error', `Session update for request failed: ${err.message}`);

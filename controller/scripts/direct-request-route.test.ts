@@ -14,6 +14,7 @@ const express = (await import('express')).default;
 const settings = await import('../src/settings.js');
 const { router, submitListenerRequest } = await import('../src/routes/request.js');
 const { queue } = await import('../src/broadcast/queue.js');
+const session = await import('../src/broadcast/session.js');
 const { primaryLeg } = await import('../src/llm/internal/provider/legs.js');
 const requestLog = await import('../src/broadcast/request-log.js');
 const { addDailyUsage } = await import('../src/llm/internal/telemetry/budget.js');
@@ -213,6 +214,8 @@ test('browser and Alexa submissions share the same typed resolver outcome', asyn
   assert.equal(resolved.legacyOutcome, browser.outcome);
   assert.equal(resolved.track?.title, browser.track.title);
   assert.equal(requestLog.snapshot(1)[0].source, 'alexa');
+  const requestTurn = [...(session.getSession()?.messages || [])].reverse().find(turn => turn.role === 'event' && turn.kind === 'request');
+  assert.equal(requestTurn?.meta.source, 'alexa', 'Alexa request source reaches the booth session metadata');
 });
 
 test('a short title is resolved locally before the interpreter', async () => {

@@ -25,6 +25,13 @@ export interface RequestReminder {
   leadSeconds: number;
 }
 
+export interface RequestReminderConsent {
+  permissionToken: string;
+  locale: 'en-US' | 'en-IN' | 'hi-IN';
+  createdAt: number;
+  expiresAt: number;
+}
+
 export interface RequestLedgerRecord {
   id: string;
   createdAt: number;
@@ -41,6 +48,7 @@ export interface RequestLedgerRecord {
   alexaIdentity?: string;
   dedication?: RequestDedication | null;
   reminder?: RequestReminder | null;
+  reminderConsent?: RequestReminderConsent | null;
 }
 
 interface StoredLedger {
@@ -161,6 +169,45 @@ export async function setReminder(id: string, reminder: RequestReminder): Promis
 
 export async function clearReminder(id: string): Promise<RequestLedgerRecord | null> {
   return update(id, { reminder: null });
+}
+
+export async function setReminderConsent(
+  id: string,
+  reminderConsent: RequestReminderConsent,
+): Promise<RequestLedgerRecord | null> {
+  return update(id, { reminderConsent });
+}
+
+export async function clearReminderConsent(id: string): Promise<RequestLedgerRecord | null> {
+  return update(id, { reminderConsent: null });
+}
+
+export async function findReminderConsent(
+  identity: string,
+  permissionToken: string,
+): Promise<{
+  requestId: string;
+  identity: string;
+  locale: RequestReminderConsent['locale'];
+  permissionToken: string;
+} | null> {
+  const record = store.records.find(row =>
+    row.source === 'alexa'
+      && row.alexaIdentity === identity
+      && row.reminderConsent?.permissionToken === permissionToken,
+  );
+  const consent = record?.reminderConsent;
+  if (!record || !consent) return null;
+  if (consent.expiresAt <= Date.now()) {
+    await clearReminderConsent(record.id);
+    return null;
+  }
+  return {
+    requestId: record.id,
+    identity,
+    locale: consent.locale,
+    permissionToken: consent.permissionToken,
+  };
 }
 
 export function get(id: string): RequestLedgerRecord | null {

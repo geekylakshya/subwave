@@ -17,7 +17,7 @@ import {
 import { alexaPatchSchema } from '../schemas/settings.js';
 import { listenerRequestSchema } from '../schemas/request.js';
 import { alexaIdentityKey } from '../broadcast/request-ledger.js';
-import { type RequestReminder } from '../broadcast/request-ledger.js';
+import { type RequestReminder, type RequestReminderConsent } from '../broadcast/request-ledger.js';
 import {
   audioPlayerMetadata,
   etaSpeech,
@@ -41,6 +41,9 @@ import {
   getAlexaRequestStatus,
   saveAlexaRequestReminder,
   clearAlexaRequestReminder,
+  saveAlexaReminderConsent,
+  getAlexaReminderConsent,
+  clearAlexaReminderConsent,
   cancelLatestAlexaRequest,
   replaceLatestAlexaRequest,
   submitListenerRequest,
@@ -98,6 +101,9 @@ export interface AlexaRuntime {
   requestStatus?: (identity: string, requestId: string) => Promise<ListenerRequestStatus | null>;
   saveReminder?: (identity: string, requestId: string, reminder: RequestReminder) => Promise<ListenerRequestStatus | null>;
   clearReminder?: (identity: string, requestId: string) => Promise<boolean>;
+  saveReminderConsent?: (identity: string, requestId: string, consent: RequestReminderConsent) => Promise<boolean>;
+  findReminderConsent?: (identity: string, permissionToken: string) => Promise<AlexaReminderPending | null>;
+  clearReminderConsent?: (identity: string, requestId: string) => Promise<boolean>;
   reminderClient?: AlexaReminderClient;
   cancelRequest?: (identity: string) => Promise<ListenerRequestStatus | null>;
   replaceRequest?: (identity: string, text: string) => Promise<AlexaSubmitResult>;
@@ -193,6 +199,9 @@ function defaultRuntime(): AlexaRuntime {
     requestStatus: (identity, requestId) => getAlexaRequestStatus(identity, requestId),
     saveReminder: (identity, requestId, reminder) => saveAlexaRequestReminder(identity, requestId, reminder),
     clearReminder: (identity, requestId) => clearAlexaRequestReminder(identity, requestId),
+    saveReminderConsent: (identity, requestId, consent) => saveAlexaReminderConsent(identity, requestId, consent),
+    findReminderConsent: (identity, permissionToken) => getAlexaReminderConsent(identity, permissionToken),
+    clearReminderConsent: (identity, requestId) => clearAlexaReminderConsent(identity, requestId),
     cancelRequest: identity => cancelLatestAlexaRequest(identity),
     replaceRequest: (identity, text) => replaceLatestAlexaRequest(identity, text).then(result => result.accepted
       ? { accepted: true, statusCode: 202 as const, requestId: result.requestId, status: 'pending' as const }
@@ -540,6 +549,7 @@ type ReminderCreationState = {
 };
 
 const reminderCreations = new Map<string, ReminderCreationState>();
+const REMINDER_CONSENT_TTL_MS = 15 * 60 * 1000;
 
 function sessionAttributes(input: any): Record<string, unknown> {
   return input.attributesManager?.getSessionAttributes?.() || {};
@@ -573,6 +583,38 @@ function clearPendingReminder(input: any): void {
   const attributes = sessionAttributes(input);
   delete attributes.alexaReminderPending;
   saveSessionAttributes(input, attributes);
+}
+
+async function clearReminderConsentState(runtime: AlexaRuntime, pending: AlexaReminderPending): Promise<void> {
+  if (!runtime.clearReminderConsent) return;
+  try {
+    await runtime.clearReminderConsent(pending.identity, pending.requestId);
+  } catch (error) {
+    console.error(`[alexa] reminder consent cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function pendingReminderForResponse(
+  input: any,
+  runtime: AlexaRuntime,
+  permissionToken: string | undefined,
+): Promise<AlexaReminderPending | null> {
+  const sessionPending = pendingReminder(input);
+  if (sessionPending?.permissionToken === permissionToken) return sessionPending;
+  if (!permissionToken || !runtime.findReminderConsent) return sessionPending;
+  const durable = await runtime.findReminderConsent(alexaRequestIdentity(input), permissionToken);
+  if (!durable) return sessionPending;
+  const restored: AlexaReminderPending = {
+    requestId: durable.requestId,
+    identity: durable.identity,
+    locale: durable.locale,
+    permissionToken: durable.permissionToken,
+  };
+  // Keep a retry in the current session (for example NOT_ANSWERED) working,
+  // while the durable record remains the source of truth across the Alexa
+  // Connections handoff that ended the original session.
+  savePendingReminder(input, restored);
+  return restored;
 }
 
 function isRequestCandidate(value: unknown): value is AlexaRequestCandidate {
@@ -884,23 +926,26 @@ async function removeRequestReminder(
     await creation.done;
   }
   const alertToken = status?.reminder?.alertToken || creation?.alertToken;
-  if (!alertToken) return;
-  try {
-    if (!creation?.deleted) {
-      await reminderClient(runtime, input).delete(alertToken);
-      if (creation) creation.deleted = true;
+  if (alertToken) {
+    try {
+      if (!creation?.deleted) {
+        await reminderClient(runtime, input).delete(alertToken);
+        if (creation) creation.deleted = true;
+      }
+      const cleared = runtime.clearReminder
+        ? await runtime.clearReminder(identity, requestId)
+        : await defaultRuntime().clearReminder!(identity, requestId);
+      if (!cleared) console.error(`[alexa] reminder ledger cleanup found no record for ${requestId}`);
+    } catch (error) {
+      console.error(`[alexa] reminder cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    const cleared = runtime.clearReminder
-      ? await runtime.clearReminder(identity, requestId)
-      : await defaultRuntime().clearReminder!(identity, requestId);
-    if (!cleared) console.error(`[alexa] reminder ledger cleanup found no record for ${requestId}`);
-  } catch (error) {
-    console.error(`[alexa] reminder cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+  await clearReminderConsentState(runtime, { requestId, identity, locale: inputLocale(input) as AlexaReminderPending['locale'] });
 }
 
 async function createPendingReminder(input: any, runtime: AlexaRuntime, pending: AlexaReminderPending) {
   const copy = messages(pending.locale);
+  if (reminderCreations.has(pending.requestId)) return requestSpeech(input, copy.reminderAlreadySet);
   let resolveDone!: () => void;
   const state: ReminderCreationState = {
     cancelled: false,
@@ -914,10 +959,12 @@ async function createPendingReminder(input: any, runtime: AlexaRuntime, pending:
     const client = reminderClient(runtime, input);
     const status = await reminderStatus(runtime, pending.identity, pending.requestId);
     if (!status || status.phase !== 'queued' || !status.track?.title || !reminderEtaAllowed(status.etaSeconds)) {
+      await clearReminderConsentState(runtime, pending);
       clearPendingReminder(input);
       return requestSpeech(input, copy.reminderStale);
     }
     if (status.reminder?.alertToken) {
+      await clearReminderConsentState(runtime, pending);
       clearPendingReminder(input);
       return requestSpeech(input, copy.reminderAlreadySet);
     }
@@ -948,9 +995,10 @@ async function createPendingReminder(input: any, runtime: AlexaRuntime, pending:
     // Re-read queue state before persisting the token so cancelled requests
     // cannot acquire a reminder after the cancellation cleanup raced us.
     const current = await reminderStatus(runtime, pending.identity, pending.requestId);
-    if (state.cancelled || !current || current.phase !== 'queued' || current.reminder?.alertToken) {
+    if (state.cancelled || !current || current.phase !== 'queued' || !reminderEtaAllowed(current.etaSeconds) || current.reminder?.alertToken) {
       await client.delete(created.alertToken);
       state.deleted = true;
+      await clearReminderConsentState(runtime, pending);
       clearPendingReminder(input);
       return requestSpeech(input, copy.reminderStale);
     }
@@ -966,6 +1014,7 @@ async function createPendingReminder(input: any, runtime: AlexaRuntime, pending:
       ? await runtime.saveReminder(pending.identity, pending.requestId, reminder)
       : await defaultRuntime().saveReminder!(pending.identity, pending.requestId, reminder);
     if (!saved) throw new Error('request reminder ownership check failed');
+    await clearReminderConsentState(runtime, pending);
     clearPendingReminder(input);
     return requestSpeech(input, copy.reminderSet(escapeXmlCharacters(status.track.title)));
   } catch (error) {
@@ -974,6 +1023,7 @@ async function createPendingReminder(input: any, runtime: AlexaRuntime, pending:
       state.deleted = true;
     }
     console.error(`[alexa] reminder ledger save failed: ${error instanceof Error ? error.message : String(error)}`);
+    await clearReminderConsentState(runtime, pending);
     clearPendingReminder(input);
     return requestSpeech(input, copy.reminderFailed);
   } finally {
@@ -1022,6 +1072,19 @@ async function reminderConfirmationResponse(input: any, runtime: AlexaRuntime, c
   // separate voice-consent response is required for every reminder, even
   // when that global token is already present.
   const permissionToken = pending.permissionToken || `request-reminder:${pending.requestId}`;
+  const createdAt = Date.now();
+  const consentSaved = runtime.saveReminderConsent
+    ? await runtime.saveReminderConsent(pending.identity, pending.requestId, {
+      permissionToken,
+      locale: pending.locale,
+      createdAt,
+      expiresAt: createdAt + REMINDER_CONSENT_TTL_MS,
+    })
+    : true;
+  if (!consentSaved) {
+    clearPendingReminder(input);
+    return requestSpeech(input, copy.reminderStale);
+  }
   savePendingReminder(input, { ...pending, permissionToken });
   return input.responseBuilder
     .speak(copy.reminderPermission)
@@ -1042,12 +1105,11 @@ async function reminderConfirmationResponse(input: any, runtime: AlexaRuntime, c
 }
 
 async function reminderPermissionResponse(input: any, runtime: AlexaRuntime) {
-  const pending = pendingReminder(input);
-  if (!pending) return requestSpeech(input, messages(inputLocale(input)).reminderStale);
   const responseToken = input.requestEnvelope?.request?.token;
+  const pending = await pendingReminderForResponse(input, runtime, responseToken);
+  if (!pending) return requestSpeech(input, messages(inputLocale(input)).reminderStale);
   if (!pending.permissionToken || responseToken !== pending.permissionToken) {
     console.error('[alexa] ignoring reminder permission response with an unexpected token');
-    clearPendingReminder(input);
     return requestSpeech(input, messages(pending.locale).reminderStale);
   }
   const body = input.requestEnvelope?.request?.payload || input.requestEnvelope?.request?.body || {};
@@ -1057,6 +1119,7 @@ async function reminderPermissionResponse(input: any, runtime: AlexaRuntime) {
   // It is not a field on the individual scope object.
   const status = body.status;
   if (!scope) {
+    await clearReminderConsentState(runtime, pending);
     clearPendingReminder(input);
     return requestSpeech(input, messages(pending.locale).reminderFailed);
   }
@@ -1068,6 +1131,7 @@ async function reminderPermissionResponse(input: any, runtime: AlexaRuntime) {
         .withShouldEndSession(false)
         .getResponse();
     }
+    await clearReminderConsentState(runtime, pending);
     clearPendingReminder(input);
     return requestSpeech(input, status === 'DENIED'
       ? messages(pending.locale).reminderDenied
@@ -1201,7 +1265,7 @@ async function replaceRequestResponse(input: any, runtime: AlexaRuntime) {
   const result = runtime.replaceRequest
     ? await runtime.replaceRequest(identity, parsed.data.text)
     : await defaultRuntime().replaceRequest!(identity, parsed.data.text);
-  if (before?.requestId && before.reminder?.alertToken) {
+  if (before?.requestId) {
     const after = result.accepted ? null : await reminderStatus(runtime, identity, before.requestId);
     if (result.accepted || after?.phase === 'cancelled') {
       await removeRequestReminder(input, runtime, identity, before);

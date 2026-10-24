@@ -37,7 +37,7 @@ import { RequestIdentificationMiss } from '../broadcast/dj-agent/breaker.js';
 import { isWebSearchProviderError, searchReady, searchWeb } from '../skills/web-search.js';
 import * as requestLedger from '../broadcast/request-ledger.js';
 import type { AlexaVerifiedCandidate } from '../alexa/listener-features.js';
-import type { RequestDedication, RequestReminder } from '../broadcast/request-ledger.js';
+import type { RequestDedication, RequestReminder, RequestReminderConsent } from '../broadcast/request-ledger.js';
 
 export const router = express.Router();
 
@@ -1312,6 +1312,36 @@ export async function clearAlexaRequestReminder(identity: string, id: string): P
   const entry = requests.get(id);
   if (entry) entry.reminder = null;
   return true;
+}
+
+export async function saveAlexaReminderConsent(
+  identity: string,
+  id: string,
+  consent: RequestReminderConsent,
+): Promise<boolean> {
+  const record = requestLedger.get(id);
+  if (!record || record.source !== 'alexa' || record.alexaIdentity !== identity) return false;
+  const before = getListenerRequestStatus(id);
+  if (before.phase !== 'queued' || before.reminder?.alertToken) return false;
+  return Boolean(await requestLedger.setReminderConsent(id, consent));
+}
+
+export async function getAlexaReminderConsent(
+  identity: string,
+  permissionToken: string,
+): Promise<{
+  requestId: string;
+  identity: string;
+  locale: RequestReminderConsent['locale'];
+  permissionToken: string;
+} | null> {
+  return requestLedger.findReminderConsent(identity, permissionToken);
+}
+
+export async function clearAlexaReminderConsent(identity: string, id: string): Promise<boolean> {
+  const record = requestLedger.get(id);
+  if (!record || record.source !== 'alexa' || record.alexaIdentity !== identity) return false;
+  return Boolean(await requestLedger.clearReminderConsent(id));
 }
 
 type RequestCancellationDecision = 'cancelled' | 'cancelable' | 'too-late' | 'unknown';

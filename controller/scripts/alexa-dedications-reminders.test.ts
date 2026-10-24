@@ -301,6 +301,79 @@ test('RequestReminderIntent starts the Alexa permission workflow without a conse
   assert.equal((response.response as any).shouldEndSession, true);
 });
 
+test('reminder permission response restores durable consent after Alexa ends the session', async () => {
+  const created: any[] = [];
+  const pendingConsent = new Map<string, any>();
+  const status = {
+    status: 'resolved' as const,
+    success: true,
+    requestId: 'request-session-ended',
+    phase: 'queued' as const,
+    track: { title: 'Patient Zero', artist: 'Fixture Artist' },
+    etaSeconds: 300,
+  };
+  const skill = createAlexaSkill({
+    ...runtime,
+    latestRequestStatus: async () => status,
+    requestStatus: async () => status,
+    reminderClient: {
+      create: async () => {
+        created.push(true);
+        return { alertToken: 'alert-token-session-ended' };
+      },
+      get: async () => ({ alertToken: 'alert-token-session-ended' }),
+      delete: async () => undefined,
+    },
+    saveReminderConsent: async (identity, requestId, consent) => {
+      pendingConsent.set(consent.permissionToken, {
+        requestId,
+        identity,
+        locale: consent.locale,
+        permissionToken: consent.permissionToken,
+      });
+      return true;
+    },
+    findReminderConsent: async (identity, permissionToken) => {
+      const consent = pendingConsent.get(permissionToken);
+      return consent?.identity === identity ? consent : null;
+    },
+    clearReminderConsent: async (identity, requestId) => {
+      for (const [token, consent] of pendingConsent) {
+        if (consent.identity === identity && consent.requestId === requestId) pendingConsent.delete(token);
+      }
+      return true;
+    },
+    saveReminder: async (_identity, requestId, reminder) => ({ ...status, requestId, reminder }),
+  });
+
+  const question = await skill.invoke(intent('RequestReminderIntent'));
+  const yes = await skill.invoke(intent('AMAZON.YesIntent', {}, question.sessionAttributes, 'en-US'));
+  const accepted = await skill.invoke(intent(
+    'Connections.Response',
+    {},
+    {},
+    'en-US',
+    undefined,
+    {
+      type: 'Connections.Response',
+      name: 'AskFor',
+      token: 'request-reminder:request-session-ended',
+      payload: {
+        permissionScopes: [{
+          permissionScope: 'alexa::alerts:reminders:skill:readwrite',
+          consentLevel: 'ACCOUNT',
+        }],
+        status: 'ACCEPTED',
+      },
+    },
+  ));
+
+  assert.equal((yes.response as any).shouldEndSession, true);
+  assert.equal(created.length, 1);
+  assert.match((accepted.response as any).outputSpeech.ssml, /remind you one minute before/);
+  assert.equal(pendingConsent.size, 0);
+});
+
 test('reminder permission responses are correlated and can survive a not-answered retry', async () => {
   const created: any[] = [];
   const status = {

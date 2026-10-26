@@ -746,6 +746,19 @@ function isAttributeOnlyRequest(
   return inputTokens.every(token => allowed.has(token) || knownAttributeToken(token) || !/^[a-z]+$/iu.test(token));
 }
 
+export function isLyricOrFilmDescription(text: string): boolean {
+  return looksLikeLyricRequest(text)
+    // A listener may name the film without saying "movie" or "film":
+    // "a song from The Devil Wears Prada 2". Keep that relation on the
+    // evidence path so the configured identification tool can resolve it
+    // against the local library instead of letting the interpreter mark it
+    // unsupported and short-circuiting before web evidence is available.
+    // Do not include the generic "in" form here: "play pop music in Punjabi"
+    // is a structured language-plus-genre request and must stay on the
+    // deterministic language resolver. Explicit movie wording still remains
+    // evidence-oriented through the lyric/film cues above.
+    || /\b(?:song|track|music)\s+from\s+\S/iu.test(text);
+}
 export function isFramedTitleOnlyRequest(text: string, literal: RequestMatch): boolean {
   const lyricLike = looksLikeLyricRequest(text);
   return lyricLike

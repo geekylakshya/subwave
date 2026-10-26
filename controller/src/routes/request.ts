@@ -17,7 +17,7 @@ import * as likes from '../broadcast/likes.js';
 import { generateQueuedRequestIntro } from '../broadcast/request-intro.js';
 import * as webhooks from '../broadcast/webhooks.js';
 import * as settings from '../settings.js';
-import { withDeadline } from '../llm/internal/core/retry.js';
+import { withDeadline } from '../llm/sdk.js';
 import {
   sanitizeRequestText, stripScriptedOpener, cleanRequesterName, cleanMissedArtist, stillInFlight, screenAck,
   isNamedRequester, sorryNoMatch,
@@ -28,8 +28,8 @@ import {
 } from '../middleware/ratelimit.js';
 import { validatePublicBody } from '../middleware/validate.js';
 import { listenerRequestSchema } from '../schemas/request.js';
-import { classifyListenerRequest, directRequestUnsupported, isRefusedOutcome, looksLikeLyricRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, requestTitleSimilarity, resolveDirectRequest } from '../music/request-match.js';
-import { resolveNamedAlias } from '../music/request-alias.js';
+import { classifyListenerRequest, directRequestUnsupported, isFramedTitleOnlyRequest, isRefusedOutcome, isLyricOrFilmDescription, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, requestName, requestTitleSimilarity, resolveDirectRequest } from '../music/request-match.js';
+import { canonicalLanguage } from '../music/request-normalize.js';
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
 import { ARTIST_VARIETY_WINDOW, drawRequestCandidate } from '../broadcast/dj-agent/artist-guard.js';
@@ -38,14 +38,15 @@ import { isWebSearchProviderError } from '../skills/web-search.js';
 
 export const router = express.Router();
 
-export type ListenerRequestSource = 'browser' | 'alexa';
 export type ListenerResolutionOutcome =
   | 'matched'
+  | 'partial'
   | 'no-match'
   | 'already-queued'
   | 'cooldown'
   | 'unsupported'
-  | 'provider-error';
+  | 'provider-error'
+  | 'timeout';
 
 export interface ListenerRequestResolution {
   outcome: ListenerResolutionOutcome;
@@ -60,7 +61,6 @@ export type ListenerRequestSubmission = {
   accepted: true;
   requestId: string;
   status: 'pending';
-  completion: Promise<ListenerRequestResolution>;
 } | {
   accepted: false;
   statusCode: number;
@@ -69,7 +69,7 @@ export type ListenerRequestSubmission = {
   retryAfter?: number;
 };
 
-type ListenerRequestEntryStatus = 'pending' | 'resolved' | 'failed' | 'cancelled';
+type ListenerRequestEntryStatus = 'pending' | 'resolved' | 'failed';
 type ListenerRequestTrack = { id?: string; title?: string; artist?: string; [key: string]: unknown };
 
 export interface ListenerRequestEntry {
@@ -77,7 +77,6 @@ export interface ListenerRequestEntry {
   status: ListenerRequestEntryStatus;
   requester: string;
   text: string;
-  source: ListenerRequestSource;
   createdAt: number;
   startedAt?: number;
   provider?: string;
@@ -121,11 +120,8 @@ export interface ListenerRequestEntry {
   introScript?: string | null;
 }
 
-function requestEntryCancelled(entry: ListenerRequestEntry): boolean {
-  return entry.status === 'cancelled';
-}
-
 // In-memory request index for fast polling and admission checks. The durable
+// request log is appended only at terminal state.
 const requests = new Map<string, ListenerRequestEntry>();
 const REQUEST_TTL_MS = 10 * 60 * 1000;
 // A listener request is accepted asynchronously, but it must still reach a
@@ -134,12 +130,19 @@ const REQUEST_TTL_MS = 10 * 60 * 1000;
 // listener receipt pending for minutes when a model accepts a request and then
 // stops answering. Keep this route's wall-clock bound independent and shorter.
 const REQUEST_RESOLUTION_MAX_MS = 60_000;
+const REQUEST_QUEUE_RESERVE_MS = 2_000;
+const REQUEST_INTERPRETATION_MAX_MS = 30_000;
 
 function requestResolutionTimeoutMs(): number {
   const providerTimeout = Number((settings.get() as any)?.llm?.requestTimeoutMs);
   return Number.isFinite(providerTimeout) && providerTimeout > 0
     ? Math.min(REQUEST_RESOLUTION_MAX_MS, providerTimeout)
     : REQUEST_RESOLUTION_MAX_MS;
+}
+
+function requestIntroTimeoutMs(entry: ListenerRequestEntry): number {
+  const elapsed = entry.startedAt ? Date.now() - entry.startedAt : 0;
+  return Math.max(0, requestResolutionTimeoutMs() - elapsed - REQUEST_QUEUE_RESERVE_MS);
 }
 
 function throwIfRequestResolutionAborted(signal?: AbortSignal): void {
@@ -153,20 +156,6 @@ function throwIfRequestResolutionAborted(signal?: AbortSignal): void {
 // air has already left the waiting line and does not block the next request.
 // pruneRequests() janitors.
 const lastByIp = new Map<string, any>();
-
-// Admission checks and their durable receipt/budget commit must be serialized.
-// The ledger write is asynchronous, so without this short mutex concurrent
-// callers could all observe the same global and pending-request counts before
-// any of them committed its reservation.
-let admissionTail = Promise.resolve();
-
-async function acquireAdmissionLock(): Promise<() => void> {
-  const previous = admissionTail;
-  let release!: () => void;
-  admissionTail = new Promise<void>(resolve => { release = resolve; });
-  await previous;
-  return release;
-}
 
 function pruneRequests() {
   const cutoff = Date.now() - REQUEST_TTL_MS;
@@ -190,7 +179,7 @@ async function pickMoreByArtist(artistName: string, recentIds: Set<string>, seed
     },
     moodSongs: async () => [], fallbackSongs: async () => [],
   });
-  return result.outcome === 'matched' ? result.track : null;
+  return result.outcome === 'matched' || result.outcome === 'partial' ? result.track : null;
 }
 
 // "more like this" fallback when the playing artist has nothing else in the
@@ -228,7 +217,6 @@ function recordOutcome(entry) {
       t: new Date(entry.createdAt).toISOString(),
       id: String(entry.id).slice(0, 8),
       requester: entry.requester,
-      source: entry.source || 'browser',
       text: entry.text,
       rawText: entry.rawText ?? null,
       injection: entry.injection ?? null,
@@ -343,7 +331,6 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   entry.startedAt = Date.now();
 
   const resolved = ({ ack, track, queuePosition }) => {
-    if (requestEntryCancelled(entry)) return;
     entry.outcome ||= entry.refused ? 'already-queued' : track ? 'matched' : 'chat';
     entry.status = 'resolved';
     entry.ack = ack || null;
@@ -352,14 +339,11 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     recordOutcome(entry);
   };
   const failed = (message) => {
-    if (requestEntryCancelled(entry)) return;
     entry.outcome ||= 'no-match';
     entry.status = 'failed';
     entry.message = message;
     recordOutcome(entry);
   };
-
-  if (requestEntryCancelled(entry)) return;
 
   let ctx;
   try {
@@ -431,8 +415,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
       recap: queue.getDjRecap(),
       recentTracks: queue.getRecentTracks(),
       recentOpeners: queue.getRecentOpeners(),
-    }, text);
-    throwIfRequestResolutionAborted(signal);
+    }, text, undefined, { timeoutMs: requestIntroTimeoutMs(entry), signal });
     if (generatedIntro.failure) {
       entry.introFailure = generatedIntro.failure;
       queue.log('error', 'more-like-this optional intro failed — queueing without speech');
@@ -442,7 +425,6 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
       queue.log('request-guard', `more-like-this intro echoed request text — ${generatedIntro.guard}`);
     }
     const introScript = generatedIntro.introScript;
-    if (requestEntryCancelled(entry)) return;
     const pos = await queue.push({
       track: pick, requestedBy: requester, intent: 'more_like_this', introScript,
       introKind: 'dj-speak',
@@ -451,11 +433,6 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
       introPersona: generatedIntro.introPersona,
       introHostSpeech: generatedIntro.introHostSpeech,
     });
-    if (requestEntryCancelled(entry) || signal?.aborted) {
-      if (pos >= 0) await queue.removeUpcoming(pick.id).catch(() => undefined);
-      throwIfRequestResolutionAborted(signal);
-      return;
-    }
     entry.pick = pick;
     if (pos === -2) {
       // Blocklist refused the pick; decline with the standard not-found copy so
@@ -493,21 +470,13 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // into a popular song by that artist. Vague, mood, similarity and lyric
   // requests still use the agent, including its existing web-search tool.
   const literal = modelFreeMatch(text);
-  const lyricLike = looksLikeLyricRequest(text);
+  const lyricLike = isLyricOrFilmDescription(text);
   // A framed request with a concrete, attribute-free name is still a named
   // recording even when the lyric heuristic sees four or more free-form
   // words. Without this distinction, `play qzxv impossible recording 918273`
   // was sent to the evidence agent, whose empty search could be replaced by a
   // generic vibe candidate. Explicit lyric cues retain the evidence lane.
-  const framedTitleOnly = lyricLike
-    && literal.kind === 'track'
-    && Boolean(literal.title?.trim())
-    && !literal.artist && !literal.album
-    && !literal.genre && !literal.language && !literal.mood && !literal.energy
-    && /^(?:please\s+)?(?:play|queue|request|put\s+on)\b/iu.test(text)
-    && !/\b(?:lyrics?|words?|line\s+from|verse|song\s+goes|sung\s+by|gane\s+ke\s+bol|gaane\s+ke\s+bol|geet\s+ke\s+bol)\b/iu.test(text)
-    && !/\b(?:album|artist|genre|language|mood|energy)\b/iu.test(text)
-    && !/^(?:please\s+)?(?:play|queue|request|put\s+on)\s+(?:some|something|anything|music|a\s+song|a\s+track)\b/iu.test(text);
+  const framedTitleOnly = isFramedTitleOnlyRequest(text, literal);
   entry.classification = framedTitleOnly ? 'named-song-or-artist' : classifyListenerRequest(text, literal);
   entry.stages = ['classified', 'local-literal'];
   // Long lyric/prose input can contain commas or "by" and look like an
@@ -516,6 +485,12 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // pasted verse from bypassing lyric search and selecting a random track by a
   // parser-invented artist.
   const explicitNamedRequest = !lyricLike && Boolean(literal.title?.trim() && literal.artist?.trim());
+  // An explicit artist-only request is an identity claim too. It may choose
+  // any eligible recording from that artist, but it must not fall through to
+  // an unrelated mood, search, or starred-track substitute when the artist is
+  // absent from the library.
+  const explicitArtistOnlyRequest = Boolean(literal.artist?.trim() && !literal.title?.trim() && !literal.album?.trim()
+    && /\b(?:by|from)\b/iu.test(text));
   // A bare title+artist pair is already a complete identity plan. Keep it on
   // the local-first path instead of waiting on the optional interpreter; the
   // interpreter is still useful when the same named request carries an
@@ -563,13 +538,15 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // A framed, unquoted multi-word name is still an identity claim when no
   // artist/attribute is present. Keep a miss honest instead of letting a model
   // omission turn "play qzxv no such recording" into an unrelated fallback.
-  // Quoted title-only requests retain the existing alternative policy.
+  // Quoted title-only requests are recording identities too. Quotes strengthen
+  // the no-substitution rule and must not open the alternative pool.
   const forcedNamedTitle = explicitNoMatchCue
     && literal.kind === 'track'
     && Boolean(literal.title?.trim())
     && !literal.artist && !literal.album
     && /^(?:please\s+)?(?:play|queue|request|put\s+on)\b/iu.test(text)
     && !/["'“‘]/u.test(text);
+  const literalIdentityFrame = !/^\s*(?:please\s+)?(?:play|queue|request|put\s+on)\s+(?:anything|something|some|music|songs?|tracks?|a\s+song|a\s+track)\b/iu.test(text);
 
   // Conversational DJ agent. On any failure fall through to the stateless
   // cascade below, so a request is never dropped.
@@ -577,8 +554,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // energy, genre, and language requests must use the shared deterministic
   // resolver so every listener request follows the same deterministic path. Lyric and film
   // descriptions still use the existing web-aware agent path.
-  const needsEvidenceIdentification = (lyricLike && !framedTitleOnly)
-    || /\b(?:song|track|music)\s+(?:from|in)\b.{0,60}\b(?:film|movie|show|advert|commercial)\b/iu.test(text);
+  const needsEvidenceIdentification = isLyricOrFilmDescription(text) && !framedTitleOnly;
   if (!explicitNamedRequest && !likelyShortTitle && !forcedNamedTitle && !titleOnlyNamedRequest && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
     entry.stages.push('web-evidence');
     entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
@@ -619,7 +595,6 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
         entry.candidateCount = agentRes.candidateCount || 1;
         entry.confidence = agentRes.confidence ?? 1;
         entry.introScript = agentRes.introScript || null;
-        if (requestEntryCancelled(entry)) return;
         return resolved({
           ack: withWaitNotice(agentRes.ack, agentRes.track.id),
           track: agentRes.track,
@@ -657,13 +632,15 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // classifier has identified it as a short title candidate, keep the title
   // identity intact for the catalogue resolver instead.
   let matched = likelyShortTitle ? { ...literal, literal: false, titleOnly: true } : literal;
-  if (!likelyShortTitle && !forcedNamedTitle && !deterministicLiteralRequest && budget.requestsAllowed()) {
+  const deicticSimilarityRequest = literal.intent === 'Wants more like the current track.';
+  if (!likelyShortTitle && !forcedNamedTitle && !literal.similarTo && !deicticSimilarityRequest
+    && !deterministicLiteralRequest && budget.requestsAllowed()) {
     try {
       // A title-only phrase may still benefit from model repair (for example,
       // an unseparated artist and title), but it must not spend the complete
       // request deadline before the local fuzzy catalogue gets a chance.
       const interpretationSignal = (titleOnlyNamedRequest || bareExplicitNamedRequest)
-        ? signal ? AbortSignal.any([signal, AbortSignal.timeout(8_000)]) : AbortSignal.timeout(8_000)
+        ? signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_INTERPRETATION_MAX_MS)]) : AbortSignal.timeout(REQUEST_INTERPRETATION_MAX_MS)
         : signal;
       const interpreted = await dj.matchRequest(text, { listenerName: requester, nowPlaying: currentTrack }, interpretationSignal);
       throwIfRequestResolutionAborted(signal);
@@ -680,12 +657,28 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
       queue.log('error', `request interpretation failed: ${err.message} — trying library search`);
     }
   }
-  throwIfRequestResolutionAborted(signal);
+  // Once a concrete track has been selected, the optional intro must not be
+  // allowed to turn a successful request into a timeout. The intro helper has
+  // its own bounded budget; queue admission below is the terminal handoff.
   matched = normalizeRequestMatch(matched, { moods: settings.moodVocab() });
+  if (literal.releaseContext && literal.title?.trim()) {
+    // Preserve the complete literal wording. The resolver will try the whole
+    // title first, then the bounded title-plus-release-context hypothesis.
+    matched = {
+      ...matched,
+      kind: 'track', title: literal.title, artist: literal.artist || null,
+      album: null, releaseContext: literal.releaseContext, scope: 'song',
+      literal: false, titleOnly: true,
+      unsupported: literalIdentityFrame ? literal.unsupported || [] : matched.unsupported || literal.unsupported || [],
+    };
+  }
   if (forcedNamedTitle && literal.title?.trim()) {
     // Preserve the listener's literal title and do not let an interpreter
     // invent an artist that would widen the lookup.
-    matched = { ...matched, kind: 'track', title: literal.title, artist: null, album: null, scope: 'song', literal: false, titleOnly: true };
+    matched = {
+      ...matched, kind: 'track', title: literal.title, artist: null, album: null,
+      scope: 'song', literal: false, titleOnly: true,
+    };
   }
   if (framedTitleOnly && literal.title?.trim()) {
     // The listener supplied a title but no artist. Keep that identity literal
@@ -699,12 +692,11 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
       scope: 'song', literal: false, titleOnly: true,
     };
   }
-  // The literal wording alone is not enough to harden an ambiguous phrase:
-  // the existing interpreter may have verified an artist-led request such as
-  // "Queen Bohemian Rhapsody", which intentionally retains the alternative
-  // policy. A title-only identity with no artist, however, is a named song
-  // and must never enter the unrelated fallback pool.
-  const exactTitleOnlyRequest = framedTitleOnly || (titleOnlyNamedRequest && !matched.artist?.trim());
+  // The literal wording is the identity claim. If the interpreter repairs a
+  // title-only request by adding an artist (for example, "Queen Bohemian
+  // Rhapsody"), that artist must not reopen the unrelated alternative pool.
+  // Named and unquoted title-only misses remain no-match even after repair.
+  const exactTitleOnlyRequest = framedTitleOnly || titleOnlyNamedRequest;
   const unsupported = directRequestUnsupported(text, matched);
   if (unsupported.length) {
     entry.path = 'cascade';
@@ -752,19 +744,52 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // Preserve upstream stand-in spacing after the resolver applies identity,
   // hard constraints and cooldowns. Named matches remain exempt, and the
   // resolver says which search terms are names.
-  const named = matched.literal ? [] : [matched.artist, matched.title, ...nameSearchTerms(matched)];
+  const named = matched.similarTo
+    ? [matched.similarTo.raw]
+    : matched.literal ? [] : [
+      matched.artist,
+      matched.title,
+      ...nameSearchTerms(matched),
+    ];
   const searches: Array<{ term: string; hits: any[] }> = [];
   const varietyWindow = settings.get().llm?.artistVarietyWindow ?? ARTIST_VARIETY_WINDOW;
   const cdMin = Number(settings.get().requests.repeatCooldownMin ?? 120);
-  let selection = await resolveDirectRequest(matched, {
+  if (matched.language) {
+    // Language-constrained requests use the local language projection. Older
+    // databases without that optional migration return an empty pool and keep
+    // the pre-existing no-match behaviour.
+    try { await library.load(); } catch { /* the resolver reports no rows */ }
+  }
+  const decorateLanguages = (songs: any[]) => {
+    const tags = library.languagesByIds(songs.map(song => String(song?.id || '')).filter(Boolean));
+    return songs.map(song => {
+      const tag = tags.get(String(song?.id || ''));
+      return tag ? { ...song, language: tag.language || undefined, languages: tag.languages } : song;
+    });
+  };
+  const requestSongs = (songs: any[]) => songs.map(song => ({
+    ...song,
+    title: song.title ?? undefined,
+    artist: song.artist ?? undefined,
+    album: song.album ?? undefined,
+    year: song.year ?? undefined,
+    genre: song.genre ?? undefined,
+    language: song.language ?? undefined,
+    languages: Array.isArray(song.languages) ? song.languages : undefined,
+  }));
+  const selection = await resolveDirectRequest(matched, {
     text,
     catalog: {
       ...subsonic,
       searchPage: async (term, options) => {
         const page = await subsonic.searchPage(term, options);
-        searches.push({ term, hits: page.songs });
-        return page;
+        const songs = decorateLanguages(page.songs);
+        searches.push({ term, hits: songs });
+        return { ...page, songs };
       },
+      getAlbum: async id => decorateLanguages(await subsonic.getAlbum(id)),
+      getTopSongs: async (name, options) => decorateLanguages(await subsonic.getTopSongs(name, options)),
+      getSongsByGenreSampled: async (genre, options) => decorateLanguages(await subsonic.getSongsByGenreSampled(genre, options)),
       fuzzySearch: async (term, options = {}) => {
         await library.load();
         throwIfRequestResolutionAborted(options.signal);
@@ -809,10 +834,15 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     recentIds: cdMin > 0 ? queue.recentlyPlayedIds(cdMin / 60) : new Set<string>(),
     queuedIds: queue.queuedIds(),
     currentId: queue.current?.track?.id,
-    exactOnly: explicitNamedRequest || likelyShortTitle || exactTitleOnlyRequest || forcedNamedTitle,
+    exactOnly: explicitNamedRequest || explicitArtistOnlyRequest || likelyShortTitle || exactTitleOnlyRequest || forcedNamedTitle
+      || Boolean(matched.releaseContext) || Boolean(matched.similarTo),
     signal,
     moodSongs: async mood => { await library.load(); return library.songsByMood(mood); },
     energySongs: async energy => { await library.load(); return library.songsByEnergy(energy); },
+    languageSongs: async language => {
+      await library.load();
+      return requestSongs(library.songsByLanguage(canonicalLanguage(language) || language));
+    },
     fallbackSongs: async () => {
       let moodSongs: any[] = [];
       if (ctx.dominantMood) {
@@ -830,10 +860,58 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     },
     ...(currentTrack?.id && ON_AIR_REFERENCE.test(text)
       ? { similarSongs: () => subsonic.getSimilarSongs(currentTrack.id, { count: 20 }) } : {}),
+    ...(matched.similarTo
+      ? {
+        similarSeedSongs: async (seedId: string) => {
+          await library.load();
+          const excluded = new Set([...queue.queuedIds(), ...queue.recentlyPlayedIds(cdMin / 60), seedId]);
+          const merged: any[] = [];
+          const seen = new Set<string>();
+          const add = (songs: any[], fallbackSimilarity: number) => {
+            for (const [index, song] of (songs || []).entries()) {
+              if (!song?.id || excluded.has(song.id) || seen.has(song.id)) continue;
+              seen.add(song.id);
+              merged.push({ ...song, _similarity: typeof song._similarity === 'number'
+                ? song._similarity : Math.max(0, fallbackSimilarity - index / 100) });
+            }
+          };
+          try { add(library.tracksLikeThisAudio(seedId, 60, { excludeIds: excluded }), 0.92); } catch (err) {
+            queue.log('error', `named similarity audio lookup failed: ${err.message}`);
+          }
+          try {
+            if (await subsonic.supportsSonicSimilarity()) {
+              add(await subsonic.getSonicSimilarTracks(seedId, { count: 40 }), 0.78);
+            }
+          } catch (err) { queue.log('error', `named similarity sonic lookup failed: ${err.message}`); }
+          try { add(await subsonic.getSimilarSongs(seedId, { count: 40 }), 0.62); } catch (err) {
+            queue.log('error', `named similarity catalogue lookup failed: ${err.message}`);
+          }
+          // Metadata is a bounded last resort when the seed has no available
+          // vector or Navidrome similarity extension. It never outranks a
+          // real similarity source.
+          if (!merged.length) {
+            const seed = library.get(seedId);
+            if (seed) {
+              const seedGenres = new Set((seed.genres || []).map((value: string) => requestName(value)));
+              const seedMoods = new Set((seed.moods || []).map((value: string) => requestName(value)));
+              add(library.candidateFilterTracks()
+                .filter(row => !excluded.has(row.id))
+                .filter(row => row.genres.some(value => seedGenres.has(requestName(value)))
+                  || row.moods.some(value => seedMoods.has(requestName(value)))
+                  || (() => {
+                    const candidate = library.get(row.id);
+                    return !!(seed.bpm && candidate?.bpm && Math.abs(seed.bpm - candidate.bpm) <= 12);
+                  })()), 0.35);
+            }
+          }
+          return merged;
+        },
+      }
+      : {}),
   });
   throwIfRequestResolutionAborted(signal);
-  let pick = selection.track;
-  let pickSource = selection.source;
+  const pick = selection.track;
+  const pickSource = selection.source;
   entry.stages.push('local-candidate-ranking');
   entry.candidateCount = new Set([
     ...searches.flatMap(search => search.hits.map(hit => hit?.id).filter(Boolean)),
@@ -841,48 +919,6 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     ...(selection.track?.id ? [selection.track.id] : []),
   ]).size;
   entry.confidence = selection.confidence ?? (selection.track ? 1 : null);
-  if (!selection.track && explicitNamedRequest && literal.title && literal.artist && selection.outcome !== 'unsupported') {
-    entry.stages.push('web-alias-verification');
-    try {
-      const alias = await resolveNamedAlias(literal.title, literal.artist, signal);
-      if (alias) {
-        selection = {
-          ...selection,
-          track: alias.track,
-          source: 'web-alias',
-          outcome: 'matched',
-          confidence: 0.95,
-          alternatives: [],
-        };
-        pick = selection.track;
-        pickSource = selection.source;
-        entry.evidenceSource = alias.provider;
-        entry.candidateCount = Math.max(entry.candidateCount, 1);
-        entry.confidence = selection.confidence;
-      }
-    } catch (err) {
-      if (isWebSearchProviderError(err)) {
-        entry.provider = err.provider;
-        entry.providerFailure = err.reason;
-        // DuckDuckGo is the keyless built-in and an unreachable default
-        // endpoint is intentionally optional: it must not turn every otherwise
-        // deterministic named request into an infrastructure error. Its
-        // structured failures (rate limits, CAPTCHAs, malformed responses and
-        // timeouts) still remain typed provider failures, as do all keyed or
-        // self-hosted providers.
-        if (err.provider === 'duckduckgo' && err.reason === 'unavailable') {
-          entry.finalReason = `web-alias-${err.reason}`;
-          entry.pickSource = 'no-match';
-          entry.outcome = 'no-match';
-          return failed(EVIDENCE_MISS_REFUSAL);
-        }
-        entry.outcome = 'provider-error';
-        return failed('The configured search provider could not verify that alternate title. Try again shortly.');
-      }
-      if (signal?.aborted) throw err;
-      queue.log('error', `request alias verification failed: ${err.message}`);
-    }
-  }
   entry.outcome = selection.outcome;
   entry.lookupErrors = selection.errors;
   entry.unmetPreferences = selection.unmetPreferences || [];
@@ -906,10 +942,15 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   }
   // A search in the listener's own spelling answers in the library's ("Tupac"
   // finds 2Pac). That may be the same act, so the intro is not told it is not.
-  if (selection.outcome === 'substituted' && matched.artist && !requestArtistMatches(matched.artist, pick)
+  const requestedArtist = matched.artist || (
+    selection.source === 'similar-to-current' && matched.similarTo && !matched.similarTo.releaseContext
+      ? matched.similarTo.artist || matched.similarTo.title
+      : null
+  );
+  if (selection.outcome === 'substituted' && requestedArtist && !requestArtistMatches(requestedArtist, pick)
     && !matchedRequestLookups(searches, text).some(credit => requestArtistMatches(credit, pick))) {
-    entry.artistMiss = matched.artist;
-    entry.missedArtist = cleanMissedArtist(matched.artist);
+    entry.artistMiss = requestedArtist;
+    entry.missedArtist = cleanMissedArtist(requestedArtist);
   }
   if (isRefusedOutcome(selection.outcome)) {
     entry.pick = pick;
@@ -923,10 +964,13 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // Substitutions need honest fixed copy. A real match keeps the screened
   // persona-language acknowledgement; optional preference misses stay private.
   let ack = `Couldn't match that request exactly — here's an alternative from the library.`;
-  if (selection.outcome === 'matched') {
+  if (selection.outcome === 'matched' || selection.outcome === 'partial') {
     const screened = screenAck(matched.ack, text, 'Found a match — your track is on the way.');
     if (screened.guard) flagGuard(entry, screened.guard);
     ack = screened.ack;
+    if (selection.outcome === 'partial' && selection.unmetPreferences?.length) {
+      ack += ` I matched the song, but not every preference was available.`;
+    }
   }
 
   // 3. DJ intro. On a miss, flag it (and pass the cleaned name, when one
@@ -942,8 +986,10 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     recap: queue.getDjRecap(),
     recentTracks: queue.getRecentTracks(),
     recentOpeners: queue.getRecentOpeners(),
-  }, text);
-  throwIfRequestResolutionAborted(signal);
+  }, text, undefined, { timeoutMs: requestIntroTimeoutMs(entry), signal });
+  // Once a concrete track has been selected, the optional intro must not be
+  // allowed to turn a successful request into a timeout. The intro helper has
+  // its own bounded budget; queue admission below is the terminal handoff.
   if (generatedIntro.failure) {
     entry.introFailure = generatedIntro.failure;
     queue.log('error', 'request optional intro failed — queueing without speech');
@@ -955,8 +1001,6 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   const introScript = generatedIntro.introScript;
 
   // 4. Enqueue. push() dedups a track a concurrent request already queued (#619).
-  if (requestEntryCancelled(entry)) return;
-  throwIfRequestResolutionAborted(signal);
   const pos = await queue.push({
     track: pick,
     requestedBy: requester,
@@ -966,11 +1010,6 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     introPersona: generatedIntro.introPersona,
     introHostSpeech: generatedIntro.introHostSpeech,
   });
-  if (requestEntryCancelled(entry) || signal?.aborted) {
-    if (pos >= 0) await queue.removeUpcoming(pick.id).catch(() => undefined);
-    throwIfRequestResolutionAborted(signal);
-    return;
-  }
   entry.pick = pick;
   if (pos === -2) {
     // Blocklist refused the pick; standard not-found copy so it doesn't leak.
@@ -1010,13 +1049,17 @@ function typedResolution(entry: ListenerRequestEntry): ListenerRequestResolution
   const legacyOutcome = String(entry.outcome || 'no-match');
   const outcome: ListenerResolutionOutcome = legacyOutcome === 'already-queued' || legacyOutcome === 'cooldown'
     ? legacyOutcome
-    : legacyOutcome === 'unsupported' || legacyOutcome === 'chat'
-      ? 'unsupported'
-      : legacyOutcome === 'provider-error' || legacyOutcome === 'timeout' || legacyOutcome === 'error'
-        ? 'provider-error'
-        : entry.status === 'resolved' && (entry.track || entry.pick)
-          ? 'matched'
-          : 'no-match';
+    : legacyOutcome === 'partial'
+      ? 'partial'
+      : legacyOutcome === 'unsupported' || legacyOutcome === 'chat'
+        ? 'unsupported'
+        : legacyOutcome === 'timeout'
+          ? 'timeout'
+          : legacyOutcome === 'provider-error' || legacyOutcome === 'error'
+            ? 'provider-error'
+            : entry.status === 'resolved' && (entry.track || entry.pick)
+              ? 'matched'
+              : 'no-match';
   const track = entry.pick || entry.track || null;
   return {
     outcome,
@@ -1032,7 +1075,7 @@ export async function resolveListenerRequest(entry: ListenerRequestEntry): Promi
   try {
     await withDeadline(requestResolutionTimeoutMs(), 'request resolution', signal => resolveRequestCore(entry, signal));
   } catch (err) {
-    if (requestEntryCancelled(entry) || entry.status === 'resolved' || entry.status === 'failed') return typedResolution(entry);
+    if (entry.status === 'resolved' || entry.status === 'failed') return typedResolution(entry);
     const timedOut = err?.name === 'AgentDeadlineError'
       || /request resolution.*deadline|request resolution.*aborted/i.test(String(err?.message || ''));
     entry.outcome = timedOut ? 'timeout' : 'error';
@@ -1056,11 +1099,10 @@ export async function submitListenerRequest(input: {
   text: string;
   name?: string;
   ip: string;
-  source: ListenerRequestSource;
 }): Promise<ListenerRequestSubmission> {
   // Keep every caller behind the same shape/size boundary. The browser
-  // middleware already parsed this schema, but Alexa and future voice clients
-  // enter through this function directly.
+  // middleware already parsed this schema, but callers entering through this
+  // shared function still need the same shape and size boundary.
   const parsed = listenerRequestSchema.safeParse({ text: input.text, name: input.name });
   if (!parsed.success) {
     return {
@@ -1112,8 +1154,7 @@ export async function submitListenerRequest(input: {
 
   const ip = input.ip;
   let entry: ListenerRequestEntry;
-  const releaseAdmission = await acquireAdmissionLock();
-  try {
+  {
     // Janitor runs BEFORE the gates: the one-pending hold returns 429 without
     // reaching the rest of the handler, so pruning later held an IP past the TTL.
     pruneRequests();
@@ -1170,7 +1211,7 @@ export async function submitListenerRequest(input: {
 
     const id = randomUUID();
     entry = {
-      id, status: 'pending', requester, text, source: input.source,
+      id, status: 'pending', requester, text,
       provider: settings.get().search?.provider || 'duckduckgo',
       rawText: sanitizeRequestText(rawText),
       injection: stripped.injection,
@@ -1179,16 +1220,12 @@ export async function submitListenerRequest(input: {
     };
     requests.set(id, entry);
     lastByIp.set(ip, entry);
-  } finally {
-    // Resolution can spend tens of seconds in the model and web search. It must
-    // never hold the admission mutex while doing that slow work.
-    releaseAdmission();
   }
 
   queue.log('request', `${requester}: "${text}" (id ${entry.id.slice(0, 8)})${stripped.injection ? ` [${stripped.injection} stripped]` : ''}`);
-  webhooks.notify('request.received', { requestedBy: requester, text, source: input.source });
-  const completion = Promise.resolve().then(() => resolveListenerRequest(entry));
-  return { accepted: true, requestId: entry.id, status: 'pending', completion };
+  webhooks.notify('request.received', { requestedBy: requester, text });
+  void resolveListenerRequest(entry);
+  return { accepted: true, requestId: entry.id, status: 'pending' };
 }
 
 router.post('/request', validatePublicBody(listenerRequestSchema), async (req, res) => {
@@ -1197,7 +1234,6 @@ router.post('/request', validatePublicBody(listenerRequestSchema), async (req, r
     text,
     name,
     ip: clientIp(req),
-    source: 'browser',
   });
   if (!submission.accepted) {
     if (submission.retryAfter) res.setHeader('Retry-After', String(submission.retryAfter));
@@ -1205,8 +1241,7 @@ router.post('/request', validatePublicBody(listenerRequestSchema), async (req, r
     return res.status(submission.statusCode).json({ success: false, message: submission.message });
   }
 
-  // Hand back a receipt and let go of the connection. The completion promise
-  // is retained by voice clients; browser clients poll the existing endpoint.
+  // Hand back a receipt and let the browser poll the existing endpoint.
   res.status(202).json({ success: true, requestId: submission.requestId, status: submission.status });
 });
 

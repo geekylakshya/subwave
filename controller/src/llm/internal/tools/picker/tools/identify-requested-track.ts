@@ -336,11 +336,11 @@ export default definePickerTool({
             lyricsById,
           });
           if (lyricRanked.length) return [lyricRanked[0]!.song];
-          // A translated or transliterated title is still safe when the
-          // verified artist has exactly one local track. This preserves the
-          // existing controlled alias fallback without allowing a multi-track
-          // artist catalogue to become a lottery.
-          return sameArtist.length === 1 ? sameArtist : [];
+          // An artist-only hit is not title evidence. Even a one-track local
+          // catalogue can be incomplete, and accepting it turns a lyric or
+          // web miss into an arbitrary same-artist recording. A title alias,
+          // lyric overlap, or explicit web title pair must verify the track.
+          return [];
         };
         const resolveHint = async (hint: LyricTrackHint) => {
           const hintedSongs = await resolveGuess({ title: hint.title, artist: hint.artist, keyword: hint.title }, blob);

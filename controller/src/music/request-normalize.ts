@@ -73,6 +73,10 @@ const GENRE_ALIASES: Record<string, string> = {
   kpop: 'k-pop', 'k pop': 'k-pop', jpop: 'j-pop', 'j pop': 'j-pop', punjabi: 'punjabi',
 };
 
+// Keep lyric-cue ownership in the normalizer. The request matcher imports this
+// same expression when deciding whether a framed request needs evidence.
+export const LYRIC_CUE = /\b(?:lyrics?|words?|line\s+from|verse|song\s+goes|sung\s+by|gane\s+ke\s+bol|gaane\s+ke\s+bol|gane\s+ke\s+lyrics|gaane\s+ke\s+lyrics|geet\s+ke\s+bol)\b/iu;
+
 function compact(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
@@ -182,6 +186,40 @@ export function languageDisplayName(value: unknown): string | null {
   return displayNames.of(code) || null;
 }
 
+// The library tagger stores ISO 639-3 values, while speech recognition and
+// Intl.DisplayNames usually produce ISO 639-1 values. Keep this conversion at
+// the boundary so every supported language, including regional languages, can
+// use the same request and library indexes.
+const ISO6393: Record<string, string> = {
+  aa: 'aar', ab: 'abk', af: 'afr', am: 'amh', ar: 'ara', as: 'asm', az: 'aze', ba: 'bak',
+  be: 'bel', bg: 'bul', bn: 'ben', bo: 'bod', br: 'bre', bs: 'bos', ca: 'cat', cs: 'ces',
+  cy: 'cym', da: 'dan', de: 'deu', el: 'ell', en: 'eng', es: 'spa', et: 'est', eu: 'eus',
+  fa: 'fas', fi: 'fin', fil: 'fil', fj: 'fij', fo: 'fao', fr: 'fra', fy: 'fry', ga: 'gle',
+  gd: 'gla', gl: 'glg', gu: 'guj', ha: 'hau', he: 'heb', hi: 'hin', hr: 'hrv', hu: 'hun',
+  hy: 'hye', id: 'ind', is: 'isl', it: 'ita', ja: 'jpn', jv: 'jav', ka: 'kat', kk: 'kaz',
+  km: 'khm', kn: 'kan', ko: 'kor', ku: 'kur', ky: 'kir', la: 'lat', lb: 'ltz', lo: 'lao',
+  lt: 'lit', lv: 'lav', mg: 'mlg', mi: 'mri', mk: 'mkd', ml: 'mal', mn: 'mon', mr: 'mar',
+  ms: 'msa', mt: 'mlt', my: 'mya', ne: 'nep', nl: 'nld', no: 'nor', oc: 'oci', om: 'orm',
+  or: 'ori', pa: 'pan', pl: 'pol', ps: 'pus', pt: 'por', ro: 'ron', ru: 'rus', rw: 'kin',
+  sa: 'san', sd: 'snd', si: 'sin', sk: 'slk', sl: 'slv', so: 'som', sq: 'sqi', sr: 'srp',
+  su: 'sun', sv: 'swe', sw: 'swa', ta: 'tam', te: 'tel', tg: 'tgk', th: 'tha', tk: 'tuk',
+  tl: 'tgl', tr: 'tur', tt: 'tat', ug: 'uig', uk: 'ukr', ur: 'urd', uz: 'uzb', vi: 'vie',
+  wo: 'wol', xh: 'xho', yi: 'yid', yo: 'yor', zh: 'zho', zu: 'zul', yue: 'yue',
+  bgc: 'bgc', bho: 'bho', mai: 'mai', kok: 'kok', hne: 'hne',
+};
+const ISO6393_CODES = new Set(Object.values(ISO6393));
+
+export function canonicalLanguage(value: unknown): string | undefined {
+  const raw = requestName(value);
+  if (!raw) return undefined;
+  if (raw === 'und' || raw === 'xxx' || raw === 'zxx') return raw;
+  if (ISO6393[raw]) return ISO6393[raw];
+  if (ISO6393_CODES.has(raw)) return raw;
+  if (/^[a-z]{3}$/u.test(raw) && ISO6393_CODES.has(raw)) return raw;
+  const two = resolveLanguageCode(raw);
+  return two ? ISO6393[two] ?? two : undefined;
+}
+
 function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
   if (!a) return b.length;
@@ -230,14 +268,25 @@ export function looksLikeLyricRequest(text: string): boolean {
     .trim();
   const normalized = requestName(content);
   const words = normalized.split(' ').filter(Boolean);
-  if (lines.length >= 2 || words.length >= 18) return true;
+  let segmentedWords = words.length;
+  // CJK and some native-script inputs commonly arrive without spaces. ICU's
+  // word segmenter gives those requests the same lyric threshold without
+  // weakening the title path for a single unspaced Latin token.
+  try {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
+    segmentedWords = Math.max(segmentedWords, [...segmenter.segment(normalized)]
+      .filter(segment => segment.isWordLike).length);
+  } catch {
+    // Older runtimes may lack Segmenter; the whitespace heuristic remains safe.
+  }
+  if (lines.length >= 2 || words.length >= 18 || segmentedWords >= 18) return true;
 
   // A listener may paste a short verse in transliterated Hindi or Punjabi.
   // English-only cues and an eighteen-word floor missed inputs such as
   // "chite suit te daag pai gaye gali teri vich gara". Keep explicit names
   // and attribute requests on the deterministic path, but treat a longer
   // free-form phrase as lyric evidence so the web resolver gets a chance.
-  if (/\b(?:lyrics?|words?|line from|verse|song goes|sung by|gane ke bol|gaane ke bol|gane ke lyrics|gaane ke lyrics|geet ke bol)\b/i.test(normalized)) return true;
+  if (LYRIC_CUE.test(normalized)) return true;
   // Short comma and dash forms are commonly "title, artist" or "title -
   // artist" requests. Preserve those as named identities instead of sending
   // them through lyric search. Long pasted verses still qualify above.
@@ -254,5 +303,16 @@ export function looksLikeLyricRequest(text: string): boolean {
   // such as "gali teri vich gara". Generic attributes and identity forms are
   // excluded first, so this does not turn mood, genre, or title-by-artist
   // requests into web searches.
-  return words.length >= 4 && !hasIdentityDelimiter && !hasAttribute;
+  return (words.length >= 4 || segmentedWords >= 4) && !hasIdentityDelimiter && !hasAttribute;
+}
+
+// Native-script lyrics are often transcribed without spaces. They should use
+// the evidence resolver when framed as a play request; treating them as a
+// literal multi-word title makes the local miss look like a valid identity.
+export function hasUnspacedNativeScript(text: string): boolean {
+  const content = text
+    .replace(/^\s*(?:please\s+)?(?:play|request|queue|find|search\s+for|listen\s+to)\s+/iu, '')
+    .trim();
+  return /[\p{Script=Arabic}\p{Script=Bengali}\p{Script=Devanagari}\p{Script=Gujarati}\p{Script=Gurmukhi}\p{Script=Han}\p{Script=Hangul}\p{Script=Kannada}\p{Script=Malayalam}\p{Script=Tamil}\p{Script=Telugu}\p{Script=Thai}]/u.test(content)
+    && !/\s/u.test(content);
 }

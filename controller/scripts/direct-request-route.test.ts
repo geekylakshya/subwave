@@ -12,7 +12,7 @@ process.env.STATE_DIR = createTempDir(join(tmpdir(), 'subwave-direct-route-'));
 process.env.NAVIDROME_URL = 'http://direct-library.invalid';
 const express = (await import('express')).default;
 const settings = await import('../src/settings.js');
-const { router, submitListenerRequest } = await import('../src/routes/request.js');
+const { router } = await import('../src/routes/request.js');
 const { queue } = await import('../src/broadcast/queue.js');
 const { primaryLeg } = await import('../src/llm/internal/provider/legs.js');
 const requestLog = await import('../src/broadcast/request-log.js');
@@ -39,6 +39,7 @@ let modelOutput: Record<string, unknown>;
 let modelError = false;
 let modelStalls = false;
 let introError = false;
+let introStalls = false;
 let searchEmpty = false;
 let catalogueSongs: RequestSong[];
 // The artist catalogue and genre pool the issue's lottery drew from; empty
@@ -70,6 +71,7 @@ beforeEach(async context => {
   modelError = false;
   modelStalls = false;
   introError = false;
+  introStalls = false;
   searchEmpty = false;
   catalogueSongs = [filler, exact];
   artistSongs = [];
@@ -90,6 +92,7 @@ beforeEach(async context => {
     if (modelStalls) return new Promise(() => {});
     if (modelError) throw Error('synthetic interpreter failure');
     const intro = JSON.stringify(options.prompt).includes('Write an intro for this track');
+    if (intro && introStalls) return new Promise(() => {});
     if (intro && introError) throw Error('synthetic intro failure');
     return { content: options.tools?.length
       ? [{ type: 'tool-call', toolCallId: 'emit-answer', toolName: 'emit', input: JSON.stringify(modelOutput) }]
@@ -162,6 +165,25 @@ test('short transliterated lyric prose also goes through the evidence agent', as
   assert.equal(agentCalls, 1);
 });
 
+test('a song request naming only a film goes through evidence identification', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  const shapeOfWoman = { id: 'shape-of-woman', title: 'Shape of Woman', artist: 'Fixture Artist', album: 'The Devil Wears Prada 2' };
+  agentResult = {
+    object: { id: shapeOfWoman.id, ack: 'Found a track from that film.' },
+    steps: 1,
+    toolCalls: [{ name: 'identifyRequestedTrack' }],
+    extras: { seen: new Map([[shapeOfWoman.id, shapeOfWoman]]) },
+  };
+  for (const text of ['a song from The Devil Wears Prada 2', 'a song from The Devil Wears Prada2']) {
+    const result = await submit(text);
+    assert.equal(result.outcome, 'matched');
+    assert.equal(result.track.title, shapeOfWoman.title);
+    assert.equal(result.track.artist, shapeOfWoman.artist);
+    queue.upcoming = [];
+  }
+  assert.equal(agentCalls, 2);
+});
+
 test('an evidence-agent miss does not enter the unsupported direct-request path', async () => {
   await settings.update({ llm: { requestMatching: 'agentic' } } as never);
   agentResult = { object: {}, steps: 1, toolCalls: [], extras: { seen: new Map() } };
@@ -193,26 +215,6 @@ test('Direct searches the named recording before genre candidates, with one inte
   assert.equal(queue.upcoming[0].track.id, exact.id);
   assert.equal(bodies.length, 1);
   assert.ok(recentCalls.some(c => c.kind === 'matchRequest' && ['ai-sdk', 'ai-sdk:tool'].includes(c.via || '')));
-});
-
-test('browser and Alexa submissions share the same typed resolver outcome', async () => {
-  const browser = await submit();
-  assert.equal(browser.outcome, 'matched');
-  queue.upcoming = [];
-
-  const alexa = await submitListenerRequest({
-    text: 'Queen, Bohemian Rhapsody',
-    name: 'Alexa listener',
-    ip: `alexa:test-${++ip}`,
-    source: 'alexa',
-  });
-  assert.equal(alexa.accepted, true);
-  if (!alexa.accepted) return;
-  const resolved = await alexa.completion;
-  assert.equal(resolved.outcome, 'matched');
-  assert.equal(resolved.legacyOutcome, browser.outcome);
-  assert.equal(resolved.track?.title, browser.track.title);
-  assert.equal(requestLog.snapshot(1)[0].source, 'alexa');
 });
 
 test('a short title is resolved locally before the interpreter', async () => {
@@ -325,6 +327,16 @@ test('a failed intro preserves the requested music and reports success', async (
   assert.ok(!queue.djLog.some((line: any) => /intro echoed request text/.test(line.message)));
 });
 
+test('a late intro cannot discard an already selected track', async () => {
+  await settings.update({ tts: { enabled: true }, llm: { requestTimeoutMs: 3000 } } as never);
+  introStalls = true;
+  const result = await submit();
+  assert.equal(result.outcome, 'matched');
+  assert.equal(queue.upcoming[0].track.id, exact.id);
+  assert.equal(queue.upcoming[0].introScript, null);
+  assert.equal(requestLog.snapshot(1)[0].introFailure, 'intro-failed');
+});
+
 test('the player receives an explicit cooldown refusal rather than a queued success', async () => {
   queue._recentPlays = [{ ...exact, endedAt: new Date().toISOString() }];
   const result = await submit();
@@ -392,7 +404,7 @@ test('a named song in an unavailable language does not queue the wrong language'
 test('unmet mood stays diagnostic when the requested artist is matched', async () => {
   modelOutput = { artist: 'Queen', mood: 'calm', search_terms: ['Queen'] };
   const result = await submit('Play something calm by Queen');
-  assert.equal(result.outcome, 'matched');
+  assert.equal(result.outcome, 'partial');
   assert.equal(result.track.artist, 'Queen');
   assert.doesNotMatch(result.ack, /alternative|verify the requested mood/);
   assert.equal(queue.upcoming.length, 1);
@@ -409,7 +421,7 @@ test('an artist mood description is not restored as a literal song title', async
 test('failed interpretation can preserve an artist and treat mood as a preference', async () => {
   modelError = true;
   const result = await submit('Play something calm by Queen');
-  assert.equal(result.outcome, 'matched');
+  assert.equal(result.outcome, 'partial');
   assert.equal(result.track.artist, 'Queen');
 });
 
@@ -530,7 +542,7 @@ for (const metadata of [{ genre: undefined }, { language: undefined }, { genre: 
     catalogueSongs = [{ ...exact, ...metadata }, filler];
     modelOutput = { artist: 'Queen', search_terms: ['Bohemian Rhapsody', 'Queen'], genre: 'rock', mood: 'celebratory', language: 'English' };
     const result = await submit();
-    assert.equal(result.outcome, 'matched');
+    assert.equal(result.outcome, 'partial');
     assert.equal(queue.upcoming[0].track.id, exact.id);
     assert.doesNotMatch(result.ack, /alternative|verify the requested mood/);
     assert.ok(requestLog.snapshot(1)[0].unmetPreferences.includes('mood'));
@@ -540,7 +552,7 @@ for (const metadata of [{ genre: undefined }, { language: undefined }, { genre: 
 test('review: condition words inside a named title do not make a guessed genre explicit', async () => {
   catalogueSongs = [{ ...exact, title: 'Jazz Song', genre: undefined }];
   modelOutput = { artist: 'Queen', title: 'Jazz Song', genre: 'Jazz' };
-  assert.equal((await submit('Queen, Jazz Song')).outcome, 'matched');
+  assert.equal((await submit('Queen, Jazz Song')).outcome, 'partial');
 });
 
 test('review: explicit language still constrains fallback after interpreter failure', async () => {
@@ -749,28 +761,20 @@ for (const text of issuePhrasings) {
     artistSongs = [killerQueen];
     genreSongs = [filler];
     const result = await submit(text);
-    assert.equal(result.outcome, 'matched');
+    assert.equal(result.outcome, 'partial');
     assert.equal(queue.upcoming[0].track.id, exact.id);
   });
 
-  test(`#1961: a title-only request may use the existing alternative policy: ${text}`, async () => {
+  test(`#1961: a named title-only miss never uses an unrelated alternative: ${text}`, async () => {
     modelOutput = issueReply;
     catalogueSongs = [filler];
     artistSongs = [killerQueen];
     genreSongs = [filler];
     const result = await submit(text);
-    const explicitPair = /\s(?:by|from)\s|,/.test(text);
-    if (explicitPair) {
-      assert.equal(result.outcome, 'no-match');
-      assert.equal(result.track, null);
-      assert.equal(queue.upcoming.length, 0);
-      assert.doesNotMatch(result.ack || '', /Freddie|stage is set|alternative/);
-    } else {
-      assert.equal(result.outcome, 'substituted');
-      assert.notEqual(queue.upcoming[0].track.id, exact.id);
-      assert.match(result.ack, /alternative/);
-      assert.doesNotMatch(result.ack, /Freddie|stage is set/);
-    }
+    assert.equal(result.outcome, 'no-match');
+    assert.equal(result.track, null);
+    assert.equal(queue.upcoming.length, 0);
+    assert.doesNotMatch(result.ack || '', /Freddie|stage is set|alternative/);
   });
 }
 
@@ -778,7 +782,7 @@ test('#1961: a reply that names no artist still keeps a song the listener named'
   modelOutput = { ...issueReply, artist: null, search_terms: ['Bohemian Rhapsody'] };
   genreSongs = [filler];
   const result = await submit('play Bohemian Rhapsody');
-  assert.equal(result.outcome, 'matched');
+  assert.equal(result.outcome, 'partial');
   assert.equal(queue.upcoming[0].track.id, exact.id);
 });
 
@@ -789,7 +793,7 @@ for (const text of ['Queen, Bohemian Rhapsody', 'Bohemian Rhapsody by Queen', 'Q
     modelOutput = { ...issueReply, artist: null };
     genreSongs = [filler];
     const result = await submit(text);
-    assert.equal(result.outcome, 'matched');
+    assert.equal(result.outcome, 'partial');
     assert.equal(queue.upcoming[0].track.id, exact.id);
   });
 
@@ -810,7 +814,7 @@ for (const text of ['Play Bohemian Rhapsody by Queen, it is my birthday', 'Bohem
     modelOutput = issueReply;
     artistSongs = [killerQueen];
     const result = await submit(text);
-    assert.equal(result.outcome, 'matched');
+    assert.equal(result.outcome, 'partial');
     assert.equal(queue.upcoming[0].track.id, exact.id);
   });
 
@@ -839,7 +843,7 @@ test('a model that respells a name with "The" cannot turn a word in it into a ha
   catalogueSongs = [filler, heyYou];
   modelOutput = { kind: 'track', title: 'Hey You', artist: 'The Rock Steady Crew', genre: 'rock', search_terms: ['Hey You'] };
   const result = await submit('Hey You by Rock Steady Crew');
-  assert.equal(result.outcome, 'matched');
+  assert.equal(result.outcome, 'partial');
   assert.equal(queue.upcoming[0].track.id, heyYou.id);
 });
 
@@ -911,18 +915,19 @@ for (const [open, close] of [['"', '"'], ['“', '”'], ["'", "'"], ['‘', '�
     artistSongs = [wrong];
     modelOutput = { title: null, artist: 'Queen', genre: 'rock', mood: 'celebratory', search_terms: [wrong.title] };
     const result = await submit(`Play ${open}Bohemian Rhapsody${close}`);
-    assert.equal(result.outcome, 'matched');
+    assert.equal(result.outcome, 'partial');
     assert.equal(queue.upcoming[0].track.id, exact.id);
   });
 }
 
-test('a missing quoted title produces an honest alternative', async () => {
+test('a missing quoted title refuses substitution', async () => {
   catalogueSongs = [killerQueen];
   artistSongs = [killerQueen];
   modelOutput = { title: null, artist: 'Queen', genre: 'rock', search_terms: ['Killer Queen'] };
   const result = await submit('Play "Unavailable Example Recording"');
-  assert.equal(result.outcome, 'substituted');
-  assert.match(result.ack, /alternative/);
+  assert.equal(result.outcome, 'no-match');
+  assert.equal(result.track, null);
+  assert.doesNotMatch(result.ack || '', /alternative/);
 });
 
 // Words after the closing quote are not part of the name. Reading everything

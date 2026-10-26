@@ -105,6 +105,7 @@ test('identified lyrics resolve a single artist track stored under an English al
                 artist: 'Geeta Zaildar',
                 album: 'The Hits',
                 duration: 240,
+                alternateTitles: ['Chitte Suit Te', 'Chite Suit Te (Kannian)'],
               }] : [],
             },
           },
@@ -126,9 +127,52 @@ test('identified lyrics resolve a single artist track stored under an English al
         artist: 'Geeta Zaildar',
         album: 'The Hits',
         duration: 240,
+        alternateTitles: ['Chitte Suit Te', 'Chite Suit Te (Kannian)'],
       }],
     });
     assert.ok(musicQueries.includes('Geeta Zaildar|25'));
+  } finally {
+    globalThis.fetch = realFetch;
+    await settings.update({ llm: originalLlm, search: originalSearch } as never);
+  }
+});
+
+test('an artist-only lyric hit does not choose the only local track without title evidence', async () => {
+  const originalLlm = structuredClone(settings.get().llm);
+  const originalSearch = structuredClone(settings.get().search);
+  const realFetch = globalThis.fetch;
+  const json = (value: unknown) => Response.json(value);
+
+  try {
+    await settings.update({
+      llm: { provider: 'openai-compatible', model: 'fixture-model', compatibleMode: 'local', baseUrl: 'http://llm.single.fixture/v1', fallback: { enabled: false } },
+      search: { provider: 'searxng', baseUrl: 'http://search.single.fixture' },
+    } as never);
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.origin === 'http://search.single.fixture') {
+        return json({ results: [{ title: 'Unrelated lyric page', content: 'lyrics and song details by Geeta Zaildar' }] });
+      }
+      if (url.origin === 'http://llm.single.fixture') {
+        const body = JSON.parse(String(init?.body || '{}'));
+        const toolName = body?.tools?.[0]?.function?.name || 'emit';
+        return json({ id: 'single', object: 'chat.completion', created: 1, model: 'fixture-model', choices: [{
+          index: 0, message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_single', type: 'function', function: { name: toolName, arguments: JSON.stringify({ title: 'Unknown Web Title', artist: 'Geeta Zaildar', keyword: 'Unknown' }) } }] }, finish_reason: 'tool_calls',
+        }], usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 } });
+      }
+      if (url.origin === 'http://navidrome.fixture') {
+        const query = url.searchParams.get('query') || '';
+        const artistOnly = query === 'Geeta Zaildar' && Number(url.searchParams.get('songCount') || 0) > 0;
+        return json({ 'subsonic-response': { status: 'ok', version: '1.16.1', searchResult3: {
+          artist: [], song: artistOnly ? [{ id: 'only-track', title: 'A Different Song', artist: 'Geeta Zaildar', album: 'The Hits' }] : [],
+        } } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const built: any = identifyTool.build({ collect: (songs: any[]) => songs } as any);
+    const result = await built.execute({ reference: 'a lyric fragment with no matching title evidence' }, {} as any);
+    assert.deepEqual(result, { error: 'could not verify a specific song from the available search evidence' });
   } finally {
     globalThis.fetch = realFetch;
     await settings.update({ llm: originalLlm, search: originalSearch } as never);
@@ -443,6 +487,7 @@ test('a short transliterated lyric uses a quoted companion search and resolves a
                 artist: 'Geeta Zaildar',
                 album: 'The Hits',
                 duration: 240,
+                alternateTitles: ['Chitte Suit Te', 'Chite Suit Te (Kannian)'],
               }] : [],
             },
           },
@@ -462,6 +507,7 @@ test('a short transliterated lyric uses a quoted companion search and resolves a
         artist: 'Geeta Zaildar',
         album: 'The Hits',
         duration: 240,
+        alternateTitles: ['Chitte Suit Te', 'Chite Suit Te (Kannian)'],
       }],
     });
     assert.ok(searchQueries.some(query => query.startsWith('"chite suit te daag pe gaye"')));
@@ -511,6 +557,7 @@ test('an empty first lyric search gets bounded fallback queries before failing',
               artist: [],
               song: query === 'Geeta Zaildar' && songCount > 0 ? [{
                 id: 'white-suit', title: 'White Suit', artist: 'Geeta Zaildar', album: 'The Hits', duration: 240,
+                alternateTitles: ['Chitte Suit Te', 'Chite Suit Te (Kannian)'],
               }] : [],
             },
           },
@@ -676,7 +723,7 @@ test('lyric identification verifies Preet Re edition metadata and composite arti
               artist: [],
               song: matched ? [
                 { id: 'preet-wrong', title: 'Preet Re', artist: 'Other Artist', album: 'Collision', duration: 180 },
-                { id: 'preet-good', title: 'Preet Re (From "Dhadak 2")', artist: 'Darshan Raval / Rochak Kohli / Jonita Gandhi / Gurpreet Saini', album: 'Dhadak 2', duration: 210 },
+                { id: 'preet-good', title: 'Preet Re (From "Dhadak 2")', artist: 'Darshan Raval / Rochak Kohli / Jonita Gandhi / Gurpreet Saini', artists: [{ name: 'Darshan Raval' }, { name: 'Rochak Kohli' }, { name: 'Jonita Gandhi' }, { name: 'Gurpreet Saini' }], album: 'Dhadak 2', duration: 210 },
               ] : [],
             },
           },
@@ -695,6 +742,7 @@ test('lyric identification verifies Preet Re edition metadata and composite arti
         id: 'preet-good',
         title: 'Preet Re (From "Dhadak 2")',
         artist: 'Darshan Raval / Rochak Kohli / Jonita Gandhi / Gurpreet Saini',
+        artists: [{ name: 'Darshan Raval' }, { name: 'Rochak Kohli' }, { name: 'Jonita Gandhi' }, { name: 'Gurpreet Saini' }],
         album: 'Dhadak 2',
         duration: 210,
       }],

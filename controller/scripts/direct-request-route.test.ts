@@ -56,7 +56,7 @@ beforeEach(async context => {
   await settings.load();
   await settings.update({
     tts: { enabled: false },
-    llm: { requestMatching: 'direct', provider: 'openai-compatible', compatibleMode: 'local',
+    llm: { requestMatching: 'direct', requestWebResolve: false, provider: 'openai-compatible', compatibleMode: 'local',
       baseUrl: 'http://direct-model.invalid/v1', model: 'no-tools', fallback: { enabled: false }, dailyTokenCap: 0, requestTimeoutMs: 300000 },
     requests: { enabled: true, onePendingPerIp: false, maxPending: 50, globalHourlyCap: 1000, repeatCooldownMin: 120 },
   } as never);

@@ -35,6 +35,7 @@ import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-cl
 import { ARTIST_VARIETY_WINDOW, drawRequestCandidate } from '../broadcast/dj-agent/artist-guard.js';
 import { RequestIdentificationMiss } from '../broadcast/dj-agent/breaker.js';
 import { isWebSearchProviderError } from '../skills/web-search.js';
+import { resolveSoundtrackCandidates } from '../music/request-soundtrack.js';
 
 export const router = express.Router();
 
@@ -556,7 +557,14 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // local catalogue request. Sending it to the broad agent first lets a
   // stand-in tool queue an unrelated track before the album resolver can
   // verify the requested release.
-  const needsEvidenceIdentification = isLyricOrFilmDescription(text) && !framedTitleOnly && !literal.album;
+  const soundtrackOnlineEnabled = settings.get().llm?.requestWebResolve === true;
+  const needsEvidenceIdentification = isLyricOrFilmDescription(text)
+    && !framedTitleOnly
+    && !literal.album
+    // If structured soundtrack lookup is disabled, retain the existing
+    // evidence-only agent fallback for agent-assisted stations. Direct mode
+    // still ends safely as unsupported rather than selecting a substitute.
+    && (!literal.soundtrackContext || !soundtrackOnlineEnabled);
   if (!explicitNamedRequest && !likelyShortTitle && !forcedNamedTitle && !titleOnlyNamedRequest && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
     entry.stages.push('web-evidence');
     entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
@@ -642,7 +650,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   let matched = likelyShortTitle ? { ...literal, literal: false, titleOnly: true } : literal;
   const deicticSimilarityRequest = literal.intent === 'Wants more like the current track.';
   if (!likelyShortTitle && !forcedNamedTitle && !literal.similarTo && !deicticSimilarityRequest
-    && !deterministicLiteralRequest && budget.requestsAllowed()) {
+    && !deterministicLiteralRequest && !literal.soundtrackContext && budget.requestsAllowed()) {
     try {
       // A title-only phrase may still benefit from model repair (for example,
       // an unseparated artist and title), but it must not spend the complete
@@ -825,6 +833,24 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
           }));
       },
     },
+    soundtrackCandidates: async context => {
+      await library.load();
+      throwIfRequestResolutionAborted(signal);
+      const local = library.candidateFilterTracks()
+        .filter(row => row.title && !library.isBlockedId(row.id))
+        .map(row => ({
+          id: row.id,
+          title: row.title,
+          artist: row.artist,
+          genres: row.genres,
+          genre: row.genre,
+          year: row.year,
+        }));
+      return resolveSoundtrackCandidates(context, local, {
+        enabled: settings.get().llm?.requestWebResolve === true,
+        signal,
+      });
+    },
     choose: pool => {
       const isStandIn = matchedRequestStandIn(named, {
         requestText: text, lookups: matchedRequestLookups(searches, text), onAir: currentTrack,
@@ -933,7 +959,16 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     entry.pickSource = pickSource;
     if (selection.outcome === 'unsupported') {
       entry.unsupported = selection.unsupported || [];
+      if (selection.unsupported?.includes('soundtrack identification')) {
+        return failed('I need online soundtrack lookup enabled to identify a song from that movie or soundtrack.');
+      }
       return failed(UNSUPPORTED_REFUSAL);
+    }
+    if (selection.outcome === 'provider-error') {
+      return failed('The soundtrack lookup provider could not resolve that request. Please try again shortly.');
+    }
+    if (selection.outcome === 'timeout') {
+      return failed('The soundtrack lookup took too long. Please try again shortly.');
     }
     if (selection.required?.length) {
       return failed('Could not verify a track meeting the requested language or genre requirements. Try simplifying the request.');

@@ -525,7 +525,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // deterministic resolver needs. Calling the interpreter first only adds a
   // failure point (and used to leave album/mood requests waiting on a slow
   // model even though the local parser had a complete plan).
-  const deterministicLiteralRequest = !lyricLike
+  const deterministicLiteralRequest = (!lyricLike || Boolean(literal.album))
     && !explicitNamedRequest
     && (Boolean(literal.album?.trim())
       || Boolean(literal.genre?.trim())
@@ -551,12 +551,23 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // genre and language requests must use the shared deterministic
   // resolver so every listener request follows the same deterministic path. Lyric and film
   // descriptions still use the existing web-aware agent path.
-  const needsEvidenceIdentification = isLyricOrFilmDescription(text) && !framedTitleOnly;
+  // A generic "song from ..." remains eligible for web-backed film/lyric
+  // identification, but an album/record relation is already a deterministic
+  // local catalogue request. Sending it to the broad agent first lets a
+  // stand-in tool queue an unrelated track before the album resolver can
+  // verify the requested release.
+  const needsEvidenceIdentification = isLyricOrFilmDescription(text) && !framedTitleOnly && !literal.album;
   if (!explicitNamedRequest && !likelyShortTitle && !forcedNamedTitle && !titleOnlyNamedRequest && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
     entry.stages.push('web-evidence');
     entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
     try {
-      const agentRes = await djAgent.runRequest(queue, { requester, text, signal, introBudgetMs: () => requestIntroTimeoutMs(entry) });
+      const agentRes = await djAgent.runRequest(queue, {
+        requester,
+        text,
+        signal,
+        evidenceOnly: true,
+        introBudgetMs: () => requestIntroTimeoutMs(entry),
+      });
       throwIfRequestResolutionAborted(signal);
       if (agentRes) {
         // Thread the agent's own echo-guard verdict into the durable log; the
@@ -831,7 +842,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     queuedIds: queue.queuedIds(),
     currentId: queue.current?.track?.id,
     exactOnly: explicitNamedRequest || explicitArtistOnlyRequest || likelyShortTitle || exactTitleOnlyRequest || forcedNamedTitle
-      || Boolean(matched.releaseContext) || Boolean(matched.similarTo),
+      || Boolean(matched.album) || Boolean(matched.releaseContext) || Boolean(matched.similarTo),
     signal,
     moodSongs: async mood => { await library.load(); return library.songsByMood(mood); },
     languageSongs: async language => {

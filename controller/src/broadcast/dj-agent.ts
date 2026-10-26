@@ -1755,7 +1755,7 @@ export function requestMatchingEnabled(): boolean {
   return settings.get().llm?.requestMatching === 'agentic';
 }
 
-export async function runRequest(queue: any, { requester, text, signal, introBudgetMs }: { requester: string; text: string; signal?: AbortSignal; introBudgetMs?: () => number }) {
+export async function runRequest(queue: any, { requester, text, signal, introBudgetMs, evidenceOnly }: { requester: string; text: string; signal?: AbortSignal; introBudgetMs?: () => number; evidenceOnly?: boolean }) {
   if (!requestMatchingEnabled() || requestBreakerOpen()) return null;
   // Over the hard token cap the request agent only runs when requests are
   // exempt (llm.exemptRequests, on by default); otherwise return null and let
@@ -1763,7 +1763,7 @@ export async function runRequest(queue: any, { requester, text, signal, introBud
   if (!budget.requestsAllowed()) return null;
 
   try {
-    const out = await runRequestViaAgent(queue, { requester, text, signal, introBudgetMs });
+    const out = await runRequestViaAgent(queue, { requester, text, signal, introBudgetMs, evidenceOnly });
     requestBreakerSuccess();
     return out;
   } catch (err) {
@@ -1772,7 +1772,7 @@ export async function runRequest(queue: any, { requester, text, signal, introBud
   }
 }
 
-async function runRequestViaAgent(queue: any, { requester, text, signal, introBudgetMs }: { requester: string; text: string; signal?: AbortSignal; introBudgetMs?: () => number }) {
+async function runRequestViaAgent(queue: any, { requester, text, signal, introBudgetMs, evidenceOnly }: { requester: string; text: string; signal?: AbortSignal; introBudgetMs?: () => number; evidenceOnly?: boolean }) {
   return withTrace({ kind: 'request', requester }, async () => {
     const throwIfAborted = () => {
       if (!signal?.aborted) return;
@@ -1821,6 +1821,7 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
       messages,
       scope,
       persona: requestSpeech.persona,
+      ...(evidenceOnly ? { evidenceOnly: true } : {}),
       ...(signal ? { abortSignal: signal } : {}),
     });
     throwIfAborted();

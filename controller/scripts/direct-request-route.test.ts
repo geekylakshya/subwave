@@ -376,9 +376,11 @@ test('a failed intro preserves the requested music and reports success', async (
 });
 
 test('a late intro cannot discard an already selected track', async () => {
-  await settings.update({ tts: { enabled: true }, llm: { requestTimeoutMs: 3000 } } as never);
+  // 5000 ms is the settings floor: the intro gets that less the queue reserve,
+  // so the request settles after about three seconds and must be waited for.
+  await settings.update({ tts: { enabled: true }, llm: { requestTimeoutMs: 5000 } } as never);
   introStalls = true;
-  const result = await submit();
+  const result = await submit(undefined, 1000);
   assert.equal(result.outcome, 'matched');
   assert.equal(queue.upcoming[0].track.id, exact.id);
   assert.equal(queue.upcoming[0].introScript, null);

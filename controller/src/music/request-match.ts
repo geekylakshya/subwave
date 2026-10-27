@@ -15,7 +15,6 @@ import {
   resolveRequestMood,
   looksLikeLyricRequest,
   isLyricOrFilmDescription,
-  isGreetingLikeRequest,
   LYRIC_CUE,
   hasUnspacedNativeScript,
   type RequestEnergy,

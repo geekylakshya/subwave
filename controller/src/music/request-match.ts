@@ -1186,10 +1186,16 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     || Boolean(song.moods?.some(m => requestName(m) === requestName(match.mood)));
   const energyMatches = (song: RequestSong) => !match.energy || requestName(song.energy) === requestName(match.energy);
   let resolvedArtistName = match.artist;
+  // The complete "X from Y" wording is a title in its own right ("Postcards
+  // from Italy"), so only the split "X" reading has to prove Y in the
+  // catalogue.
+  const contextProven = (song: RequestSong) => !match.releaseContext
+    || title === match.releaseContext.wholeTitle
+    || releaseContextMatches(match.releaseContext, song);
   const identity = (song: RequestSong) => (!title || requestTitleMatches(title, song.title))
     && requestCandidateArtistMatches(resolvedArtistName, song)
     && (!match.album || requestName(song.album) === requestName(match.album))
-    && (!match.releaseContext || releaseContextMatches(match.releaseContext, song));
+    && contextProven(song);
   const tags = (song: RequestSong) => [song.genre, ...(song.genres || []).map(g => typeof g === 'string' ? g : g.name)].map(requestName).filter(Boolean);
   let genre: string | null = null;
   // Small models may guess attributes despite the prompt. Only terms present
@@ -1259,8 +1265,7 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
       // matching already preserves a queued/cooldown identity for a refusal;
       // fuzzy matching must do the same instead of turning a verified repeat
       // into a misleading no-match.
-      .filter(song => constraints(song, source)
-        && (!match.releaseContext || releaseContextMatches(match.releaseContext, song)))
+      .filter(song => constraints(song, source) && contextProven(song))
       .map(song => ({ song, confidence: identityScore(song), titleScore: requestTitleSimilarity(title, song.title), artistScore: resolvedArtistName ? requestCandidateArtistSimilarity(resolvedArtistName, song) : 1 }))
       // Keep a wider, still meaningful candidate set for clarification. Only
       // the stricter confidence and margin checks below may auto-select.

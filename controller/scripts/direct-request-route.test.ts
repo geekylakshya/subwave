@@ -314,6 +314,20 @@ test('an artist-only model reply cannot erase a literal named song request', asy
   assert.equal(result.track.title, exact.title);
 });
 
+test('a title containing from queues that recording without album proof', async () => {
+  const postcards = { id: 'postcards', title: 'Postcards from Italy', artist: 'Beirut', album: 'Gulag Orkestar', duration: 260 };
+  const letter = { id: 'letter', title: 'Letter from America', artist: 'The Proclaimers', album: 'Sunshine on Leith', duration: 280 };
+  catalogueSongs = [filler, postcards, letter];
+  for (const [text, song] of [['play Postcards from Italy', postcards], ['Postcards from Italy', postcards], ['play Letter from America', letter]] as const) {
+    queue.upcoming = [];
+    modelOutput = { kind: 'track', title: song.title, search_terms: [song.title], scope: 'song' };
+    const result = await submit(text);
+    assert.equal(result.outcome, 'matched', text);
+    assert.equal(result.track.title, song.title, text);
+    assert.equal(queue.upcoming[0].track.id, song.id, text);
+  }
+});
+
 test('a failed intro preserves the requested music and reports success', async () => {
   await settings.update({ tts: { enabled: true } } as never);
   introError = true;

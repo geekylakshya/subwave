@@ -758,6 +758,16 @@ test('from remains part of a title unless a generic artist frame owns it', () =>
   assert.equal(modelFreeRequest('play a song from The Proclaimers').artist, 'The Proclaimers');
 });
 
+test('a two-letter ISO code is a title word, not language evidence', () => {
+  for (const text of ['play Rock It', 'play Folk It', 'Play It']) {
+    const match = modelFreeRequest(text);
+    assert.equal(match.title, text.replace(/^play\s+/iu, ''), text);
+    assert.equal(match.genre, null, text);
+    assert.equal(match.language, null, text);
+  }
+  assert.equal(modelFreeRequest('play rock in Italian').language, 'Italian');
+});
+
 test('free-form title words do not become a genre or mood plan', () => {
   const match = modelFreeRequest('I wanna dance with somebody who loves me');
   assert.equal(match.title, 'I wanna dance with somebody who loves me');

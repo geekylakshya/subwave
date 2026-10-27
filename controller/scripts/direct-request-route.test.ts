@@ -328,6 +328,22 @@ test('a title containing from queues that recording without album proof', async 
   }
 });
 
+test('a two-letter language code in a title is not a language request', async () => {
+  const rockIt = { id: 'rock-it', title: 'Rock It', artist: 'Herbie Hancock', album: 'Future Shock', genre: 'Jazz', duration: 320 };
+  catalogueSongs = [filler, rockIt];
+  genreSongs = [filler];
+  // Read by the interpreter, and by the literal parser when the interpreter fails.
+  for (const failed of [false, true]) {
+    queue.upcoming = [];
+    modelError = failed;
+    modelOutput = { kind: 'track', title: rockIt.title, search_terms: [rockIt.title], scope: 'song' };
+    const result = await submit('Play Rock It');
+    assert.equal(result.outcome, 'matched', `interpreter failed: ${failed}`);
+    assert.equal(result.track.title, rockIt.title, `interpreter failed: ${failed}`);
+    assert.equal(queue.upcoming[0].track.id, rockIt.id, `interpreter failed: ${failed}`);
+  }
+});
+
 test('a failed intro preserves the requested music and reports success', async () => {
   await settings.update({ tts: { enabled: true } } as never);
   introError = true;

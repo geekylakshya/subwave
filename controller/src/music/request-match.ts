@@ -319,9 +319,10 @@ export function nameSearchTerms(match: RequestMatch): string[] {
 
 // ICU supplies translated names for the languages recognised by literal
 // recovery. Never treat short ISO codes such as "en" or "de" as request
-// evidence: they are ordinary prepositions in other languages.
+// evidence: they are ordinary prepositions in other languages, and "it" is the
+// last word of "Rock It". Tags and model output resolve codes directly.
 function requestLanguageCode(name: string): string | undefined {
-  return resolveLanguageCode(name);
+  return /^[a-z]{2}$/u.test(requestName(name)) ? undefined : resolveLanguageCode(name);
 }
 
 function requestLanguageTerms(name: string): string[] {
@@ -335,7 +336,7 @@ function requestLanguageTerms(name: string): string[] {
 // keeps unknown words strict while allowing real-world library metadata to
 // satisfy an explicit language request.
 function requestLanguageTagMatches(want: string, got: string): boolean {
-  const code = requestLanguageCode(want);
+  const code = resolveLanguageCode(want);
   const canonicalWant = canonicalLanguage(want);
   const canonicalGot = canonicalLanguage(got);
   if (canonicalWant && canonicalGot && canonicalWant === canonicalGot) return true;
@@ -839,7 +840,7 @@ export function modelFreeRequest(text: string): RequestMatch {
     ? languageDisplayName(inferredGenre)
     : null;
   const inferredLanguage = !lyricLike && (explicitLanguageCue || nativeScriptCue || !inferredGenre)
-    ? languageDisplayName(languagePhrase?.[1] || attributeBody) || genreLanguage
+    ? (requestLanguageCode(languagePhrase?.[1] || attributeBody) ? languageDisplayName(languagePhrase?.[1] || attributeBody) : null) || genreLanguage
     : !lyricLike && genreLanguage
       ? genreLanguage
     : null;
@@ -1101,7 +1102,7 @@ export function normalizeRequestMatch(match: RequestMatch, options: { moods?: re
   // legacy or hand-written callers safe as well: an unknown model value must
   // not leak into pool lookup as if it were a valid energy bucket.
   const energy = match.energy ? resolveRequestEnergy(match.energy) : null;
-  const language = match.language && requestLanguageCode(match.language)
+  const language = match.language && resolveLanguageCode(match.language)
     ? (languageDisplayName(match.language) || match.language)
     : match.language || null;
   return { ...match, mood, energy, language };

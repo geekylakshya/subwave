@@ -179,6 +179,48 @@ test('an artist-only lyric hit does not choose the only local track without titl
   }
 });
 
+test('an artist\'s only local track is not chosen because its title sits inside the identified title', async () => {
+  const originalLlm = structuredClone(settings.get().llm);
+  const originalSearch = structuredClone(settings.get().search);
+  const realFetch = globalThis.fetch;
+  const json = (value: unknown) => Response.json(value);
+
+  try {
+    await settings.update({
+      llm: { provider: 'openai-compatible', model: 'fixture-model', compatibleMode: 'local', baseUrl: 'http://llm.substring.fixture/v1', fallback: { enabled: false } },
+      search: { provider: 'searxng', baseUrl: 'http://search.substring.fixture' },
+    } as never);
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.origin === 'http://search.substring.fixture') {
+        return json({ results: [{ title: 'U2 - Someone Like Me Lyrics', content: 'Someone like me lyrics by U2.' }] });
+      }
+      if (url.origin === 'http://llm.substring.fixture') {
+        const body = JSON.parse(String(init?.body || '{}'));
+        const toolName = body?.tools?.[0]?.function?.name || 'emit';
+        return json({ id: 'substring', object: 'chat.completion', created: 1, model: 'fixture-model', choices: [{
+          index: 0, message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_substring', type: 'function', function: { name: toolName, arguments: JSON.stringify({ title: 'Someone Like Me', artist: 'U2', keyword: 'Someone Like Me' }) } }] }, finish_reason: 'tool_calls',
+        }], usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 } });
+      }
+      if (url.origin === 'http://navidrome.fixture') {
+        const query = url.searchParams.get('query') || '';
+        const artistOnly = query === 'U2' && Number(url.searchParams.get('songCount') || 0) > 0;
+        return json({ 'subsonic-response': { status: 'ok', version: '1.16.1', searchResult3: {
+          artist: [], song: artistOnly ? [{ id: 'u2-one', title: 'One', artist: 'U2', album: 'Achtung Baby' }] : [],
+        } } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const built: any = identifyTool.build({ collect: (songs: any[]) => songs } as any);
+    const result = await built.execute({ reference: 'someone like me lyric fragment' }, {} as any);
+    assert.deepEqual(result, { candidates: [], note: 'could not find the described song in this library' });
+  } finally {
+    globalThis.fetch = realFetch;
+    await settings.update({ llm: originalLlm, search: originalSearch } as never);
+  }
+});
+
 test('a noisy first lyric result gets one exact-fragment retry before giving up', async () => {
   const originalLlm = structuredClone(settings.get().llm);
   const originalSearch = structuredClone(settings.get().search);

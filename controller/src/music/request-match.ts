@@ -5,6 +5,7 @@ import {
   languageTerms,
   requestName,
   requestNameVariants,
+  requestNameWithin,
   requestTextSimilarity,
   languageDisplayName,
   resolveLanguageCode,
@@ -669,33 +670,25 @@ function candidateAlternateTitles(song: RequestSong): string[] {
     : [];
 }
 
-function alternateTitleScore(requestedTitle: string | null, song: RequestSong, evidence: RequestCandidateEvidence): number {
+// Web text that mentions both titles is not alias evidence: a page about
+// "Viva la Vida" that also lists "Yellow" would otherwise prove "Yellow".
+// Only the catalogue's own alternate titles can bridge two different titles.
+function alternateTitleScore(requestedTitle: string | null, song: RequestSong): number {
   if (!requestedTitle) return 0;
-  const alternates = candidateAlternateTitles(song);
-  if (alternates.some(title => requestTitleSimilarity(requestedTitle, title) >= 0.82)) return 1;
-  const blob = evidenceText(evidence);
-  if (!blob) return 0;
-  const requested = requestNameVariants(requestedTitle);
-  const local = requestNameVariants(song.title);
-  const artist = candidateArtistCredits(song).flatMap(requestNameVariants);
-  const requestedInWeb = requested.some(value => value && blob.includes(value));
-  const localInWeb = local.some(value => value && blob.includes(value));
-  const artistInWeb = artist.some(value => value && blob.includes(value));
-  return requestedInWeb && localInWeb && artistInWeb ? 1 : 0;
+  return candidateAlternateTitles(song).some(title => requestTitleSimilarity(requestedTitle, title) >= 0.82) ? 1 : 0;
 }
 
 function webEvidenceScore(requestedTitle: string | null, requestedArtist: string | null, song: RequestSong, evidence: RequestCandidateEvidence): number {
   const blob = evidenceText(evidence);
   if (!blob) return 0;
-  const localTitle = requestNameVariants(song.title).some(value => value && blob.includes(value));
+  // The web can confirm a local recording only under the title asked for.
+  if (requestedTitle && !requestTitleMatches(requestedTitle, song.title)) return 0;
+  const named = (values: string[]) => values.some(value => requestNameWithin(blob, value));
+  const localTitle = named(requestNameVariants(song.title));
   const artistTerms = candidateArtistCredits(song).flatMap(requestNameVariants);
   const requestedArtistTerms = candidateArtistVariants(requestedArtist).flatMap(requestNameVariants);
-  const artistInWeb = requestedArtist
-    ? requestedArtistTerms.some(value => value && blob.includes(value))
-    : artistTerms.some(value => value && blob.includes(value));
-  const requestedTitleInWeb = requestedTitle
-    ? requestNameVariants(requestedTitle).some(value => value && blob.includes(value))
-    : false;
+  const artistInWeb = named(requestedArtist ? requestedArtistTerms : artistTerms);
+  const requestedTitleInWeb = requestedTitle ? named(requestNameVariants(requestedTitle)) : false;
   if (localTitle && artistInWeb && (!requestedTitle || requestedTitleInWeb)) return 1;
   if (localTitle && artistInWeb) return 0.5;
   return 0;
@@ -712,7 +705,7 @@ export function rankRequestCandidates(
     .map(song => {
       const artistScore = requestedArtist ? (requestCandidateArtistMatches(requestedArtist, song) ? 1 : 0) : 1;
       const titleScore = requestedTitle ? requestTitleSimilarity(requestedTitle, song.title) : 0;
-      const alternateScore = alternateTitleScore(requestedTitle, song, evidence);
+      const alternateScore = alternateTitleScore(requestedTitle, song);
       const lyricScore = lyricOverlapScore(evidence.lyricText, evidenceLyrics(evidence, song));
       const webScore = webEvidenceScore(requestedTitle, requestedArtist, song, evidence);
       const strongSignal = titleScore >= 0.82 || alternateScore >= 0.7 || lyricScore >= 0.35 || webScore >= 0.8;

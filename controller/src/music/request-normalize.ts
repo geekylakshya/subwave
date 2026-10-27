@@ -91,6 +91,12 @@ export function requestName(value: unknown): string {
     .replace(/[^\p{L}\p{N}\p{M}]+/gu, ' '));
 }
 
+// Whether requestName()-normalised text names a normalised value as whole
+// words. A raw substring test finds the title "One" inside "Someone".
+export function requestNameWithin(text: string, value: string): boolean {
+  return !!value && ` ${text} `.includes(` ${value} `);
+}
+
 export function transliteratedRequestName(value: unknown): string {
   try {
     return requestName(transliterate(String(value ?? '')));

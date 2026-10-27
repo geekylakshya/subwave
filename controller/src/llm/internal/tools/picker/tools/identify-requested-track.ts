@@ -6,7 +6,7 @@ import * as settings from '../../../../../settings.js';
 import { identifyTrackFromText } from '../../../prompts/request.js';
 import { definePickerTool } from '../defs.js';
 import { REQUEST_TEXT_MAX } from '../../../../../schemas/request.js';
-import { requestName } from '../../../../../music/request-normalize.js';
+import { requestName, requestNameWithin } from '../../../../../music/request-normalize.js';
 import { rankRequestCandidates, requestCandidateArtistMatches } from '../../../../../music/request-match.js';
 
 // Search snippets sometimes make the performer obvious but an identification
@@ -25,7 +25,7 @@ function webArtistHints(blob: string, title: string, keyword: string | null): st
   for (const line of blob.split(/\r?\n/)) {
     const lineKey = requestName(line);
     const lineWords = lineKey.split(' ');
-    const titleMatch = needles.some(needle => lineKey.includes(needle))
+    const titleMatch = needles.some(needle => requestNameWithin(lineKey, needle))
       || titleWords.filter(word => lineWords.some(other => similarWord(word, other))).length >= Math.min(2, titleWords.length);
     if (!titleMatch) continue;
     for (const match of line.matchAll(/(?:\bby\s*[:\-]?\s*|\bartist\s*[:\-]\s*|\|\s*)([^|:;,.\n]{2,80})/giu)) {
@@ -68,7 +68,7 @@ function evidenceSupportsGuess(guess: IdentifiedTrack, blob: string): boolean {
   const evidence = requestName(blob);
   const title = requestName(guess.title);
   const artist = requestName(guess.artist);
-  return !!title && evidence.includes(title) && (!artist || evidence.includes(artist));
+  return requestNameWithin(evidence, title) && (!artist || requestNameWithin(evidence, artist));
 }
 
 const TRUSTED_LYRIC_HOSTS = /(?:^|\.)\b(?:azlyrics|genius|musixmatch|lyrics|songlyrics|lyricsfreak|metrolyrics|lyricfind)\.(?:com|org)$/i;

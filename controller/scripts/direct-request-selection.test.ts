@@ -663,6 +663,16 @@ test('candidate ranking can use lyric overlap when the local title is an alias',
   assert.ok((ranked[0]?.lyricOverlap || 0) >= 0.8);
 });
 
+test('web evidence never proves a different local title by the same artist', () => {
+  const one = { id: 'u2-one', title: 'One', artist: 'U2' };
+  assert.deepEqual(rankRequestCandidates('Someone Like Me', 'U2', [one], { webText: 'U2 - Someone Like Me Lyrics' }), []);
+  const yellow = { id: 'yellow', title: 'Yellow', artist: 'Coldplay' };
+  const viva = { id: 'viva', title: 'Viva la Vida', artist: 'Coldplay' };
+  const webText = 'Coldplay - Viva la Vida Lyrics. Other Coldplay songs: Yellow, Fix You.';
+  assert.deepEqual(rankRequestCandidates('Viva la Vida', 'Coldplay', [yellow], { webText }), []);
+  assert.deepEqual(rankRequestCandidates('Viva la Vida', 'Coldplay', [yellow, viva], { webText }).map(row => row.song.id), ['viva']);
+});
+
 test('direct requests select decorated Preet Re from a composite credit over a title collision', async () => {
   const good = {
     id: 'preet-good',

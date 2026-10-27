@@ -1821,6 +1821,9 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
         ? result.candidates.map((candidate: any) => candidate?.id).filter((id: any): id is string => typeof id === 'string')
         : [];
     }));
+    const verifiedPool = (pool: Map<string, any>) => evidenceToolCalls.length
+      ? new Map([...pool].filter(([id]) => verifiedEvidenceIds.has(id)))
+      : pool;
     // Reassigned when the unknown-id salvage below (repickRequestFromSeen)
     // lands a corrective re-pick — same let-after-destructure shape
     // pickViaSelectionRoute uses for the identical reason.
@@ -1873,7 +1876,8 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
     // artist, unless nothing fresh is left. Spacing rides the call the request
     // was already spending, so it never costs one of its own here.
     const spacedOffer = (pool: Map<string, any>) => {
-      const { alt, dropped } = requestRepickCandidates(pool, neighbourRoots, (c) => standIn(c, pool));
+      const authoritativePool = verifiedPool(pool);
+      const { alt, dropped } = requestRepickCandidates(authoritativePool, neighbourRoots, (c) => standIn(c, authoritativePool));
       if (dropped) queue.log('request-guard', `${dropped} stand-in(s) by recently-played artists withheld from the corrective call (spacing window ${varietyWindow} slots)`);
       return alt;
     };
@@ -2016,7 +2020,7 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
       if (!corrected) {
         const spaced = await runArtistGuard<any>({
           song, object, pickAnchor: null,
-          seen: extras.seen,
+          seen: verifiedPool(extras.seen),
           recentRoots: neighbourRoots,
           // No recentDistances, deliberately: the least-recent swap carries no
           // ack or intro, and this answer is the listener's.

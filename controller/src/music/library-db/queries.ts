@@ -41,75 +41,6 @@ const MOOD_POOL_COLUMNS = `t.id, t.title, t.artist, t.album, t.album_id, t.artis
   t.year, t.genres, t.genre, t.moods, t.energy, t.duration_sec,
   t.language_primary, t.languages`;
 
-export interface LanguagePoolRecord {
-  id: string;
-  title: string | null;
-  artist: string | null;
-  album: string | null;
-  albumId: string | null;
-  artistId: string | null;
-  year: number | null;
-  genres: string[];
-  genre: string | null;
-  moods: string[];
-  energy: EnergyValue;
-  language: string | null;
-  languages: string[];
-}
-
-type LanguagePoolRow = {
-  id: string;
-  title: string | null;
-  artist: string | null;
-  album: string | null;
-  album_id: string | null;
-  artist_id: string | null;
-  year: number | null;
-  genres: string | null;
-  genre: string | null;
-  moods: string | null;
-  energy: EnergyValue;
-  language_primary: string | null;
-  languages: string | null;
-};
-
-function rowToLanguagePool(row: LanguagePoolRow): LanguagePoolRecord {
-  return {
-    id: row.id,
-    title: row.title,
-    artist: row.artist,
-    album: row.album,
-    albumId: row.album_id ?? null,
-    artistId: row.artist_id ?? null,
-    year: row.year,
-    genres: row.genres ? safeParseArray(row.genres) : [],
-    genre: row.genre,
-    moods: row.moods ? safeParseArray(row.moods) : [],
-    energy: row.energy ?? null,
-    language: row.language_primary ?? null,
-    languages: row.languages ? safeParseArray(row.languages) : [],
-  };
-}
-
-// Language tagging is optional on older library databases. Keep this read
-// seam defensive so a request resolver deployed before the language migration
-// continues to behave exactly as before instead of failing the whole request.
-export function songsByLanguage(language: string): LanguagePoolRecord[] {
-  if (!language.trim()) return [];
-  try {
-    const rows = requireDb().prepare(`SELECT t.id, t.title, t.artist, t.album,
-      t.album_id, t.artist_id, t.year, t.genres, t.genre, t.moods, t.energy,
-      t.language_primary, t.languages
-      FROM tracks t
-      WHERE t.language_primary = ?
-         OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(t.languages) THEN t.languages ELSE '[]' END) WHERE value = ?)
-      ORDER BY t.rowid`).all(language, language) as LanguagePoolRow[];
-    return rows.map(rowToLanguagePool);
-  } catch {
-    return [];
-  }
-}
-
 export interface LanguageTagProjection {
   language: string | null;
   languages: string[];
@@ -159,10 +90,17 @@ export function songsByEnergy(energy: EnergyValue): EnergyPoolRecord[] {
 }
 
 export function songsByLanguage(language: string): TrackRecord[] {
+  return songsByLanguages([language]);
+}
+
+export function songsByLanguages(languages: readonly string[]): TrackRecord[] {
+  const wanted = [...new Set(languages.map(language => language.trim()).filter(Boolean))];
+  if (!wanted.length) return [];
+  const placeholders = wanted.map(() => '?').join(', ');
   const rows = requireDb().prepare(`SELECT t.* FROM tracks t
-    WHERE t.language_primary = ?
-       OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(t.languages) THEN t.languages ELSE '[]' END) WHERE value = ?)
-    ORDER BY t.rowid`).all(language, language) as TrackRow[];
+    WHERE t.language_primary IN (${placeholders})
+       OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(t.languages) THEN t.languages ELSE '[]' END) WHERE value IN (${placeholders}))
+    ORDER BY t.rowid`).all(...wanted, ...wanted) as TrackRow[];
   return rows.map(rowToTrack);
 }
 

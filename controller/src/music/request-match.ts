@@ -24,7 +24,7 @@ import { bpmCompat, keyCompat } from './mix.js';
 // Keep the long-standing request-match exports stable for scripts and route
 // consumers while the shared normalization helpers live in their own module.
 export { requestName, looksLikeLyricRequest } from './request-normalize.js';
-export { isLyricOrFilmDescription, isGreetingLikeRequest } from './request-normalize.js';
+export { isLyricOrFilmDescription, isGreetingLikeRequest, isGenericRequestPhrase } from './request-normalize.js';
 
 export interface RequestMatch {
   kind?: string;

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  classifyListenerRequest, directRequestUnsupported, explicitRequestAttribute, isFramedTitleOnlyRequest, isGreetingLikeRequest, isLyricOrFilmDescription, looksLikeLyricRequest, modelFreeRequest, requestedTitle, rankRequestCandidates, repairRequestMatch, requestArtistMatches, requestCandidateArtistMatches, requestReleaseRank, requestTitleMatches,
+  classifyListenerRequest, directRequestUnsupported, explicitRequestAttribute, isFramedTitleOnlyRequest, isGenericRequestPhrase, isGreetingLikeRequest, isLyricOrFilmDescription, looksLikeLyricRequest, modelFreeRequest, requestedTitle, rankRequestCandidates, repairRequestMatch, requestArtistMatches, requestCandidateArtistMatches, requestReleaseRank, requestTitleMatches,
   resolveDirectRequest, type RequestCatalog, type RequestMatch, type RequestSong,
 } from '../src/music/request-match.js';
 
@@ -29,6 +29,11 @@ test('film evidence keeps the in form without capturing language requests', () =
 
 test('greeting matching handles normalized apostrophes', () => {
   assert.equal(isGreetingLikeRequest("what's up"), true);
+});
+
+test('generic request phrases are centralized with greeting matching', () => {
+  assert.equal(isGenericRequestPhrase('surprise me'), true);
+  assert.equal(isGenericRequestPhrase('play something for the evening'), false);
 });
 
 const exact: RequestSong = { id: 'exact', title: 'Bohemian Rhapsody', artist: 'Queen', album: 'A Night at the Opera', genre: 'Rock' };

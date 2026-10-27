@@ -28,7 +28,7 @@ import {
 } from '../middleware/ratelimit.js';
 import { validatePublicBody } from '../middleware/validate.js';
 import { listenerRequestSchema } from '../schemas/request.js';
-import { classifyListenerRequest, directRequestUnsupported, isFramedTitleOnlyRequest, isRefusedOutcome, isLyricOrFilmDescription, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, requestName, requestTitleSimilarity, resolveDirectRequest } from '../music/request-match.js';
+import { classifyListenerRequest, directRequestUnsupported, isFramedTitleOnlyRequest, isRefusedOutcome, isLyricOrFilmDescription, isGreetingLikeRequest, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, requestName, requestTitleSimilarity, resolveDirectRequest } from '../music/request-match.js';
 import { canonicalLanguage } from '../music/request-normalize.js';
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
@@ -507,7 +507,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     && Boolean(literal.title?.trim())
     && !literal.artist && !literal.album
     && !literal.genre && !literal.language && !literal.mood && !literal.energy
-    && !/^(?:hello|hi|hey|surprise|anything|something|music)(?:\s+(?:me|dj|radio|there|subwave|chill\s+zone))?[.!?]*$/iu.test(literal.title!.trim())
+    && !(isGreetingLikeRequest(literal.title!) || /^(?:surprise|anything|something|music)(?:\s+(?:me|dj|radio|there|subwave|chill\s+zone))?[.!?]*$/iu.test(literal.title!.trim()))
     // One-word asks are the high-confidence local-first case. Multi-word
     // text can be an unseparated artist+title ("Queen Bohemian Rhapsody") or
     // a broad instruction ("surprise me"), so a local miss must still reach
@@ -522,7 +522,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     && Boolean(literal.title?.trim())
     && !literal.artist && !literal.album
     && !literal.genre && !literal.language && !literal.mood && !literal.energy
-    && !/^(?:hello|hi|hey|surprise|anything|something|music)(?:\s+(?:me|dj|radio|there|subwave|chill\s+zone))?[.!?]*$/iu.test(literal.title!.trim());
+    && !(isGreetingLikeRequest(literal.title!) || /^(?:surprise|anything|something|music)(?:\s+(?:me|dj|radio|there|subwave|chill\s+zone))?[.!?]*$/iu.test(literal.title!.trim()));
   // These forms already carry all the identity/attribute information the
   // deterministic resolver needs. Calling the interpreter first only adds a
   // failure point (and used to leave album/mood requests waiting on a slow

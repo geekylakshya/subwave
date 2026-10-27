@@ -183,6 +183,19 @@ test('short transliterated lyric prose also goes through the evidence agent', as
   assert.equal(agentCalls, 1);
 });
 
+test('language-plus-genre requests stay on deterministic resolution', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  const punjabiRock = { id: 'punjabi-rock', title: 'Punjabi Rock Fixture', artist: 'Fixture Punjabi Artist', genre: 'Rock', language: 'Punjabi' };
+  catalogueSongs = [punjabiRock];
+  genreSongs = [punjabiRock];
+
+  const result = await submit('play some rock music in Punjabi');
+
+  assert.equal(result.outcome, 'matched');
+  assert.equal(result.track.title, punjabiRock.title);
+  assert.equal(agentCalls, 0);
+});
+
 test('a song request naming only a film goes through evidence identification', async () => {
   await settings.update({ llm: { requestMatching: 'agentic' } } as never);
   const shapeOfWoman = { id: 'shape-of-woman', title: 'Shape of Woman', artist: 'Fixture Artist', album: 'The Devil Wears Prada 2' };

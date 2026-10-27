@@ -14,6 +14,8 @@ import {
   resolveRequestGenre as resolveRequestGenreAlias,
   resolveRequestMood,
   looksLikeLyricRequest,
+  isLyricOrFilmDescription,
+  isGreetingLikeRequest,
   LYRIC_CUE,
   hasUnspacedNativeScript,
   type RequestEnergy,
@@ -23,6 +25,7 @@ import { bpmCompat, keyCompat } from './mix.js';
 // Keep the long-standing request-match exports stable for scripts and route
 // consumers while the shared normalization helpers live in their own module.
 export { requestName, looksLikeLyricRequest } from './request-normalize.js';
+export { isLyricOrFilmDescription, isGreetingLikeRequest } from './request-normalize.js';
 
 export interface RequestMatch {
   kind?: string;
@@ -748,16 +751,6 @@ function isAttributeOnlyRequest(
   return inputTokens.every(token => allowed.has(token) || knownAttributeToken(token) || !/^[a-z]+$/iu.test(token));
 }
 
-export function isLyricOrFilmDescription(text: string): boolean {
-  return looksLikeLyricRequest(text)
-    // A listener may name the film without saying "movie" or "film":
-    // "a song from The Devil Wears Prada 2". Keep that relation on the
-    // evidence path so the configured identification tool can resolve it
-    // against the local library instead of letting the interpreter mark it
-    // unsupported and short-circuiting before web evidence is available.
-    || /\b(?:song|track|music)\s+(?:from|in)\s+\S/iu.test(text);
-}
-
 export function isFramedTitleOnlyRequest(text: string, literal: RequestMatch): boolean {
   const lyricLike = looksLikeLyricRequest(text);
   return lyricLike
@@ -785,7 +778,8 @@ export function modelFreeRequest(text: string): RequestMatch {
     };
   }
   const attributeBody = cleaned
-    .replace(/^(?:some|something|music|songs?|tracks?|a\s+song|a\s+track)\s+/iu, '')
+    .replace(/^(?:(?:some|something|music|songs?|tracks?|a\s+song|a\s+track)\s+)+/iu, '')
+    .replace(/\s+(?:music|songs?|tracks?|genre|language|style)(?=\s+(?:in|en|de|में|ਵਿੱਚ)\b)/iu, '')
     .replace(/\s+(?:music|songs?|tracks?|genre|language|style)\s*$/iu, '')
     .trim();
   const namedSimilarity = cleaned.match(/^(?:something|anything)\s+like\s+(.+?)[.!?]*$/iu);
@@ -824,7 +818,7 @@ export function modelFreeRequest(text: string): RequestMatch {
   }
   // Parse a trailing language condition before resolving the other attributes,
   // so "energetic in Punjabi" and "rock in Punjabi" retain both constraints.
-  const languagePhrase = attributeBody.match(/\s+(?:in|en|de|में|में|ਵਿੱਚ)\s+([\p{L}][\p{L} -]*?)[.!?]*$/iu);
+  const languagePhrase = attributeBody.match(/(?:^|\s+)(?:in|en|de|में|ਵਿੱਚ)\s+([\p{L}][\p{L} -]*?)[.!?]*$/iu);
   const attributeCore = languagePhrase ? attributeBody.slice(0, languagePhrase.index).trim() : attributeBody;
   const inferredMood = !lyricLike ? resolveRequestMood(attributeCore) : null;
   const inferredEnergy = !lyricLike ? resolveRequestEnergy(attributeCore) : null;

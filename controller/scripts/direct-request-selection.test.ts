@@ -8,9 +8,18 @@ import {
 test('listener requests are classified into deterministic resolver lanes', () => {
   assert.equal(classifyListenerRequest('Bohemian Rhapsody by Queen'), 'named-song-or-artist');
   assert.equal(classifyListenerRequest('the song from the new Dune movie'), 'lyrics-or-description');
+  assert.equal(classifyListenerRequest('play some music in Punjabi'), 'attributes');
   assert.equal(classifyListenerRequest('play energetic Punjabi rock'), 'attributes');
   assert.equal(classifyListenerRequest('surprise me'), 'ambiguous-music');
   assert.equal(classifyListenerRequest('how are you today?'), 'non-music-chat');
+});
+
+test('language-plus-genre requests keep both deterministic constraints', () => {
+  const match = modelFreeRequest('play some rock music in Punjabi');
+  assert.equal(match.genre, 'rock');
+  assert.equal(match.language, 'Punjabi');
+  assert.equal(match.artist, null);
+  assert.equal(match.title, null);
 });
 
 const exact: RequestSong = { id: 'exact', title: 'Bohemian Rhapsody', artist: 'Queen', album: 'A Night at the Opera', genre: 'Rock' };

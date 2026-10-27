@@ -739,6 +739,24 @@ test('#1918 end to end: the skipped lookup finds the artist, and the re-pick que
   assert.equal(result?.ack, 'Got you, Michael — Billie Jean it is.');
 });
 
+test('a late corrective re-pick keeps the found track when no request budget remains', async () => {
+  agentAnswers({ kind: 'track', id: ISLA.id, ack: INCIDENT_ACK, intro: INCIDENT_INTRO }, [ISLA, HOLIDAY, GIRLS]);
+  const result = await withNetwork({
+    search: [BILLIE],
+    llm: [],
+  }, async (calls) => {
+    const out = await runRequest(queue, {
+      requester: 'Michael',
+      text: 'Michael Jackson please',
+      introBudgetMs: () => 0,
+    });
+    assert.equal(calls.llm.length, 0, 'an exhausted request deadline must not attempt the corrective model call');
+    return out;
+  });
+  assert.equal(result?.track?.id, ISLA.id, 'the already-found track remains the honest stand-in');
+  assert.equal(result?.guard, 'claim-plain');
+});
+
 test('an evidence-authorized request cannot be replaced by an unverified corrective candidate', async () => {
   const initialAck = 'Coming up for you.';
   const initialIntro = "Here's Madonna with Holiday.";

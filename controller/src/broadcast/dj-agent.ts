@@ -194,8 +194,8 @@ async function repickFromSeen({ seen, badId, predecessor, showAt = null, playlis
 // a result whose id is in `seen`, or null. Never throws.
 // `reason`, when given, replaces the bad-id framing — the claim guard (#1918)
 // reuses this call for a VALID id whose lines named another track.
-async function repickRequestFromSeen({ seen, badId, requester, text, persona, reason = null }:
-  { seen: Map<string, any>; badId: string | null; requester: string; text: string; persona?: Persona | null; reason?: string | null }) {
+async function repickRequestFromSeen({ seen, badId, requester, text, persona, reason = null, signal }:
+  { seen: Map<string, any>; badId: string | null; requester: string; text: string; persona?: Persona | null; reason?: string | null; signal?: AbortSignal }) {
   if (seen.size === 0) return null;
   const wantIntro = autoVoiceAllowed();
   const schema = modelTolerant(z.object({
@@ -213,11 +213,24 @@ async function repickRequestFromSeen({ seen, badId, requester, text, persona, re
       schema,
       temperature: 0.3,
       kind: 'djAgentRequestRepick',
+      signal,
     });
     return resolveRepickId(outcome, seen, 'request-repick');
   } catch {
     return null;
   }
+}
+
+async function repickRequestWithinDeadline(args: Omit<Parameters<typeof repickRequestFromSeen>[0], 'signal'>, deadlineMs?: () => number, parentSignal?: AbortSignal) {
+  const remaining = deadlineMs?.();
+  if (remaining !== undefined && remaining <= 0) return null;
+  if (remaining === undefined) {
+    return repickRequestFromSeen({ ...args, ...(parentSignal ? { signal: parentSignal } : {}) });
+  }
+  return withDeadline(remaining, 'request corrective re-pick', signal => repickRequestFromSeen({
+    ...args,
+    signal: parentSignal ? AbortSignal.any([parentSignal, signal!]) : signal,
+  }));
 }
 
 // The claim guard's corrective framing (#1918). Names the chosen track from
@@ -1910,10 +1923,10 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
     if (!song && object?.id && extras.seen.size) {
       throwIfAborted();
       corrected = true;
-      const repicked = await repickRequestFromSeen({
+      const repicked = await repickRequestWithinDeadline({
         seen: spacedOffer(extras.seen), badId: object?.id ?? null, requester, text,
         persona: requestSpeech.persona,
-      });
+      }, introBudgetMs, signal);
       if (repicked) {
         logEvent('pick.repicked', { agent: 'request', from: object?.id ?? null, to: repicked.id, candidates: extras.seen.size });
         queue.log('request', `agent returned unknown id "${object?.id}" — re-picked "${repicked.id}" from its own candidates`);
@@ -1984,10 +1997,10 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
       if (canRepick) corrected = true;
       throwIfAborted();
       const repicked = canRepick
-        ? await repickRequestFromSeen({
+        ? await repickRequestWithinDeadline({
           seen: spacedOffer(pool), badId: object?.id ?? null, requester, text,
           persona: requestSpeech.persona, reason: misnamedRepickReason(song, firstMiss),
-        })
+        }, introBudgetMs, signal)
         : null;
       const from = song.id;
       let stillMisnamed = firstMiss;
@@ -2028,10 +2041,10 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
           exempt: (c) => !standIn(c, extras.seen),
           repick: (alt, reason) => {
             corrected = true;
-            return repickRequestFromSeen({
+            return repickRequestWithinDeadline({
               seen: alt, badId: null, requester, text, persona: requestSpeech.persona,
               reason: `${reason} If no candidate is what they asked for, own the substitution — never present a stand-in as their ask.`,
-            });
+            }, introBudgetMs, signal);
           },
           // Unreachable: with no anchor the only cause is spacing.
           poolRescue: async () => 'empty',

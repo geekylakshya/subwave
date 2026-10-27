@@ -77,7 +77,7 @@ const GENRE_ALIASES: Record<string, string> = {
 // same expression when deciding whether a framed request needs evidence.
 export const LYRIC_CUE = /\b(?:lyrics?|words?|line\s+from|verse|song\s+goes|sung\s+by|gane\s+ke\s+bol|gaane\s+ke\s+bol|gane\s+ke\s+lyrics|gaane\s+ke\s+lyrics|geet\s+ke\s+bol)\b/iu;
 const LANGUAGE_CUE = /(?:^|\s)(?:in|en|de|में|ਵਿੱਚ)\s+([\p{L}][\p{L} -]*?)(?:[.!?]*$|\s)/iu;
-export const GREETING_CUE = /^(?:hello|hi|hey|how are you|what's up|good morning|good evening)\b/iu;
+export const GREETING_CUE = /^(?:hello|hi|hey|how are you|whats up|good morning|good evening)\b/iu;
 
 function compact(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
@@ -325,7 +325,8 @@ export function looksLikeLyricRequest(text: string): boolean {
 
 export function isLyricOrFilmDescription(text: string): boolean {
   return looksLikeLyricRequest(text)
-    || /\b(?:song|track|music)\s+from\s+\S/iu.test(text);
+    || /\b(?:song|track|music)\s+from\s+\S/iu.test(text)
+    || (/\b(?:song|track|music)\s+in\s+\S/iu.test(text) && !hasRequestLanguage(text));
 }
 
 // Native-script lyrics are often transcribed without spaces. They should use

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  classifyListenerRequest, directRequestUnsupported, explicitRequestAttribute, isFramedTitleOnlyRequest, looksLikeLyricRequest, modelFreeRequest, requestedTitle, rankRequestCandidates, repairRequestMatch, requestArtistMatches, requestCandidateArtistMatches, requestReleaseRank, requestTitleMatches,
+  classifyListenerRequest, directRequestUnsupported, explicitRequestAttribute, isFramedTitleOnlyRequest, isGreetingLikeRequest, isLyricOrFilmDescription, looksLikeLyricRequest, modelFreeRequest, requestedTitle, rankRequestCandidates, repairRequestMatch, requestArtistMatches, requestCandidateArtistMatches, requestReleaseRank, requestTitleMatches,
   resolveDirectRequest, type RequestCatalog, type RequestMatch, type RequestSong,
 } from '../src/music/request-match.js';
 
@@ -20,6 +20,15 @@ test('language-plus-genre requests keep both deterministic constraints', () => {
   assert.equal(match.language, 'Punjabi');
   assert.equal(match.artist, null);
   assert.equal(match.title, null);
+});
+
+test('film evidence keeps the in form without capturing language requests', () => {
+  assert.equal(isLyricOrFilmDescription('play song in Dune'), true);
+  assert.equal(isLyricOrFilmDescription('play some music in Punjabi'), false);
+});
+
+test('greeting matching handles normalized apostrophes', () => {
+  assert.equal(isGreetingLikeRequest("what's up"), true);
 });
 
 const exact: RequestSong = { id: 'exact', title: 'Bohemian Rhapsody', artist: 'Queen', album: 'A Night at the Opera', genre: 'Rock' };

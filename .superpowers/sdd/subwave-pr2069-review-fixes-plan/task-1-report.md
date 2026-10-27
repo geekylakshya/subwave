@@ -56,3 +56,57 @@ The final diff is limited to the two focused test files and the shared matcher/n
 ## Commit
 
 Local commit: `c6d18e97f` (`fix(request): centralize language evidence classification`)
+
+## Fix round 1
+
+### Review findings addressed
+
+1. Restored the `song|track|music in ...` film-evidence form while excluding recognized trailing language clauses via `hasRequestLanguage()`. Thus `play song in Dune` remains evidence-routed, while `play some music in Punjabi` remains deterministic.
+2. Normalized `GREETING_CUE` to `whats up`, matching the existing `requestName()` apostrophe fold. Added coverage for `isGreetingLikeRequest("what's up")`.
+
+### Changed files
+
+- `controller/src/music/request-normalize.ts`
+- `controller/scripts/direct-request-selection.test.ts`
+
+### Fix-round TDD RED
+
+Command:
+
+```text
+cd /tmp/subwave-latest-release/controller
+./node_modules/.bin/tsx scripts/run-tests.ts direct-request-selection.test.ts
+```
+
+After adding the two focused regressions, the test run reported `132 tests`, `130 passed`, `2 failed`. The failures were:
+
+- `film evidence keeps the in form without capturing language requests`: expected `true`, received `false` for `play song in Dune`;
+- `greeting matching handles normalized apostrophes`: expected `true`, received `false` for `what's up`.
+
+### Fix-round GREEN and relevant verification
+
+```text
+./node_modules/.bin/tsx scripts/run-tests.ts direct-request-selection.test.ts
+ℹ tests 132
+ℹ pass 132
+ℹ fail 0
+
+./node_modules/.bin/tsx scripts/run-tests.ts request-matrix-40.test.ts
+ℹ tests 41
+ℹ pass 41
+ℹ fail 0
+
+./node_modules/.bin/tsx scripts/run-tests.ts direct-request-route.test.ts
+ℹ tests 146
+ℹ pass 146
+ℹ fail 0
+
+npm run typecheck
+> tsc --noEmit
+exit 0
+
+git diff --check
+clean
+```
+
+Self-review found only the two requested production changes and their focused regression coverage; no unrelated files or behavior were changed.

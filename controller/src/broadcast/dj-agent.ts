@@ -11,7 +11,7 @@ import * as subsonic from '../music/subsonic.js';
 import * as dj from '../llm/dj.js';
 import { energyForDaypart, getClockContext, getDateContext, getTimeContext } from '../context.js';
 import { linkClockAt, linkClockStampFor } from './queue/pure.js';
-import { djObject, nearestId, modelTolerant } from '../llm/sdk.js';
+import { djObject, nearestId, modelTolerant, withDeadline } from '../llm/sdk.js';
 import * as budget from './dj-budget.js';
 import { withTrace, logEvent, timePhase } from '../observability/events.js';
 import { artistRootKey, recencyWindowsForLibrary, type CandidateLike } from '../music/recency.js';
@@ -1742,7 +1742,7 @@ export function requestMatchingEnabled(): boolean {
   return settings.get().llm?.requestMatching === 'agentic';
 }
 
-export async function runRequest(queue: any, { requester, text, signal }: { requester: string; text: string; signal?: AbortSignal }) {
+export async function runRequest(queue: any, { requester, text, signal, introBudgetMs }: { requester: string; text: string; signal?: AbortSignal; introBudgetMs?: () => number }) {
   if (!requestMatchingEnabled() || requestBreakerOpen()) return null;
   // Over the hard token cap the request agent only runs when requests are
   // exempt (llm.exemptRequests, on by default); otherwise return null and let
@@ -1750,7 +1750,7 @@ export async function runRequest(queue: any, { requester, text, signal }: { requ
   if (!budget.requestsAllowed()) return null;
 
   try {
-    const out = await runRequestViaAgent(queue, { requester, text, signal });
+    const out = await runRequestViaAgent(queue, { requester, text, signal, introBudgetMs });
     requestBreakerSuccess();
     return out;
   } catch (err) {
@@ -1759,7 +1759,7 @@ export async function runRequest(queue: any, { requester, text, signal }: { requ
   }
 }
 
-async function runRequestViaAgent(queue: any, { requester, text, signal }: { requester: string; text: string; signal?: AbortSignal }) {
+async function runRequestViaAgent(queue: any, { requester, text, signal, introBudgetMs }: { requester: string; text: string; signal?: AbortSignal; introBudgetMs?: () => number }) {
   return withTrace({ kind: 'request', requester }, async () => {
     const throwIfAborted = () => {
       if (!signal?.aborted) return;
@@ -2056,10 +2056,19 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
     // track. It is composed English, so where that cannot air — a persona that
     // speaks another language, a name in a script the frame can't carry — the
     // metadata-only intro the echo guard regenerates with stands in instead.
-    const regenerateIntro = () => dj.generateIntro({
-      track: trackFields(song), context: null, requestedBy: requester,
-      persona: requestSpeech.persona,
-    });
+    // The track is chosen, so a regeneration that would outrun the route's
+    // deadline costs the intro, never the track: the direct path's rule, with
+    // the budget the route leaves before its queue reserve.
+    const regenerateIntro = () => {
+      const generate = () => dj.generateIntro({
+        track: trackFields(song), context: null, requestedBy: requester,
+        persona: requestSpeech.persona,
+      });
+      const budgetMs = introBudgetMs?.();
+      if (budgetMs === undefined) return generate();
+      if (budgetMs <= 0) return Promise.reject(new Error('request intro deadline'));
+      return withDeadline(budgetMs, 'request intro', generate);
+    };
     const modelIntro = typeof object.intro === 'string' ? object.intro.trim() : '';
     let rawIntro = '';
     if (autoVoiceAllowed()) {
@@ -2087,6 +2096,8 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
     // in the intro, after misnaming the track) — join rather than let one
     // verdict hide another.
     const guardVerdict = [claimGuard, spacingGuard, guarded.guard, screened.guard].filter(Boolean).join('+') || null;
+    // A passed deadline has already told the listener it timed out, so queue
+    // nothing. Once push() has taken the track, the deadline never removes it.
     throwIfAborted();
     const pos = await queue.push({
       track: trackFields(song),
@@ -2098,10 +2109,6 @@ async function runRequestViaAgent(queue: any, { requester, text, signal }: { req
       introPersona: currentSpeech.persona,
       introHostSpeech: currentSpeech.hostSpeech,
     });
-    if (signal?.aborted) {
-      if (pos >= 0) await queue.removeUpcoming(song.id).catch(() => undefined);
-      throwIfAborted();
-    }
     // Never-play blocklist refused the pick — throw so the route's stateless
     // fallback cascade runs; its own resolution is blocklist-filtered, so the
     // listener gets the standard not-found decline rather than a silent drop.

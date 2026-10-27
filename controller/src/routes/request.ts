@@ -559,7 +559,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     entry.stages.push('web-evidence');
     entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
     try {
-      const agentRes = await djAgent.runRequest(queue, { requester, text, signal });
+      const agentRes = await djAgent.runRequest(queue, { requester, text, signal, introBudgetMs: () => requestIntroTimeoutMs(entry) });
       throwIfRequestResolutionAborted(signal);
       if (agentRes) {
         // Thread the agent's own echo-guard verdict into the durable log; the

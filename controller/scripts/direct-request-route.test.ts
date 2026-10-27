@@ -149,6 +149,24 @@ test('long lyric prose goes through the evidence agent instead of the literal pa
   assert.equal(agentCalls, 1);
 });
 
+test('a stalled intro regeneration on the evidence path cannot discard the identified track', async () => {
+  await settings.update({ tts: { enabled: true }, llm: { requestMatching: 'agentic', requestTimeoutMs: 5000 } } as never);
+  introStalls = true;
+  const lyric = 'But if you wanna party with somebody who might know About the devil on his shoulder under his halo When the toxins take their hold, you would rather die than let it go But if you are sick of him, I got you, I was patient zero';
+  const patientZero = { id: 'patient-zero', title: 'Patient Zero', artist: 'Taylor Swift' };
+  agentResult = {
+    // The intro reads the request back, so the echo guard regenerates it.
+    object: { id: patientZero.id, ack: 'Found the lyric match.', intro: `Here it is: ${lyric}` },
+    steps: 1,
+    toolCalls: [],
+    extras: { seen: new Map([[patientZero.id, patientZero]]) },
+  };
+  const result = await submit(lyric, 1000);
+  assert.equal(result.outcome, 'matched');
+  assert.equal(queue.upcoming[0].track.id, patientZero.id);
+  assert.equal(queue.upcoming[0].introScript, null);
+});
+
 test('short transliterated lyric prose also goes through the evidence agent', async () => {
   await settings.update({ llm: { requestMatching: 'agentic' } } as never);
   const chitteSuit = { id: 'chitte-suit', title: 'White Suit', artist: 'Fixture Punjabi Artist' };

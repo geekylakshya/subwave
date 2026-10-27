@@ -214,6 +214,23 @@ test('an evidence-agent miss does not enter the unsupported direct-request path'
   assert.equal(requestLog.snapshot(1)[0].pickSource, 'agent:evidence-miss');
 });
 
+test('an evidence agent that declines its candidates is an honest miss, not a re-picked match', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  const sameArtist = { id: 'same-artist', title: 'A Different Song', artist: 'Fixture Punjabi Artist' };
+  agentResult = {
+    object: { kind: 'track', id: null, ack: 'That one is not in the library.' },
+    steps: 1,
+    toolCalls: [{ name: 'identifyRequestedTrack' }],
+    extras: { seen: new Map([[sameArtist.id, sameArtist]]) },
+  };
+  const result = await submit('phull koyi vilyat wala lai geya ghod da main reh geya keyariyan');
+  assert.equal(result.status, 'failed');
+  assert.equal(result.outcome, 'no-match');
+  assert.equal(queue.upcoming.length, 0);
+  assert.equal(bodies.length, 0, 'a declined answer must not spend a re-pick or a direct matcher call');
+  assert.equal(requestLog.snapshot(1)[0].pickSource, 'agent:evidence-miss');
+});
+
 test('an evidence-provider failure is reported accurately without a hidden fallback', async () => {
   await settings.update({ llm: { requestMatching: 'agentic' } } as never);
   agentError = new WebSearchProviderError('searxng', 'rate-limit', 'SearXNG HTTP 429');

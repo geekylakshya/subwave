@@ -1821,9 +1821,9 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
     // wasn't a music request — answer in persona, queue nothing, skip the
     // cascade. The `kind` half is load-bearing: a null id ALONE is also what an
     // omitted id looks like once coerceModelPayload is done with it, so a weak
-    // model forgetting the field would otherwise turn a real music request into
-    // "nothing plays". Without kind:"chat" this falls through to the repick
-    // salvage and the stateless cascade, so the listener still gets music.
+    // model forgetting the field would otherwise answer a real music request
+    // as chat. Without kind:"chat" a null id is the agent's no-match, reported
+    // to the listener as one (RequestIdentificationMiss below).
     //
     // Echo guard (A2): the ack is the model's own free text, generated from a
     // message that may carry an injected script, so it is guarded like the
@@ -1891,8 +1891,10 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
     // One djObject call constrained to that set (repickRequestFromSeen,
     // above) salvages the run instead of discarding it wholesale — the
     // caller's stateless matcher cascade is still the fallback when this
-    // misses too (empty seen, or the re-pick call itself fails).
-    if (!song && extras.seen.size) {
+    // misses too (the re-pick call itself fails). A null id is the agent
+    // saying none of its candidates is the song, so it is never salvaged
+    // into a stand-in that the route would record as a match.
+    if (!song && object?.id && extras.seen.size) {
       throwIfAborted();
       corrected = true;
       const repicked = await repickRequestFromSeen({
@@ -1922,7 +1924,7 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
         agent: 'request', id: object?.id ?? null, candidates: extras.seen.size, toolCalls,
         idInSessionWindow: !!(object?.id && windowText.includes(object.id)),
       });
-      if (extras.seen.size === 0) {
+      if (extras.seen.size === 0 || !object?.id) {
         throw new RequestIdentificationMiss(`request agent found no matching track for id ${object?.id ?? 'none'}`);
       }
       throw new Error(`request agent returned unknown id ${object?.id}`);

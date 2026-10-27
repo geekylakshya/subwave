@@ -12,6 +12,77 @@
   independent. Operators who already reconfigured profiles under #1777 must
   mark those profiles before upgrading. See [upgrade and recovery steps](docs/multi-station.md#upgrading-existing-profiles).
 
+## [1.28.0](https://github.com/perminder-klair/subwave/compare/v1.27.0...v1.28.0) (2026-10-26)
+
+
+### Features
+
+* **app:** show synced lyrics on the Live page ([#2088](https://github.com/perminder-klair/subwave/issues/2088)) ([90c1777](https://github.com/perminder-klair/subwave/commit/90c1777bb9c08b396c4ee2d090a5b3a1a8aa7f9b))
+* **axo:** draw AXO-1 in pen again ([#2075](https://github.com/perminder-klair/subwave/issues/2075)) ([1210f4f](https://github.com/perminder-klair/subwave/commit/1210f4f9253f2b4029cb24c9b8d7a782ff75540e))
+* **dash:** show the playing file's format and rate next to the track ([#2010](https://github.com/perminder-klair/subwave/issues/2010)) ([eba648a](https://github.com/perminder-klair/subwave/commit/eba648a8cfc7a57ea07e686b1e0b5c44f4109900))
+* expose current track lyrics to players ([#1316](https://github.com/perminder-klair/subwave/issues/1316)) ([c4ef3d7](https://github.com/perminder-klair/subwave/commit/c4ef3d75ab53ff7a8e897abdb8fb4274161c1bd1))
+* **jingles:** opt-in station IDs over song openings ([#2009](https://github.com/perminder-klair/subwave/issues/2009)) ([7f4b96e](https://github.com/perminder-klair/subwave/commit/7f4b96e853eb287860d0934e3f22ed63cc57f3fb))
+* **library:** the whole run log on the Library page, and a file per run ([#2063](https://github.com/perminder-klair/subwave/issues/2063)) ([ae0eb06](https://github.com/perminder-klair/subwave/commit/ae0eb06c35b5c8693ba72d4907f945f6ade38fa3))
+* **lyrics:** LRCLIB fallback, and synced lyrics in the Classic and Drift skins ([#2074](https://github.com/perminder-klair/subwave/issues/2074)) ([a433b1f](https://github.com/perminder-klair/subwave/commit/a433b1f74f4c8d4ec271c58e82f9af2052ef1428))
+* **lyrics:** lyrics on by default, and look tracks up on LRCLIB when queued ([#2082](https://github.com/perminder-klair/subwave/issues/2082)) ([b1e6181](https://github.com/perminder-klair/subwave/commit/b1e61819ac93fa578f8b4353a0118293cc53079c))
+
+
+### Bug Fixes
+
+* **dj:** drop hourly tone that asks for the dark ([#2056](https://github.com/perminder-klair/subwave/issues/2056)) ([0cabbad](https://github.com/perminder-klair/subwave/commit/0cabbadf2939750048ba7a2d9597c5ac629a34b8))
+* **liquidsoap:** compensate liq_cue_in's codec-frame landing at the stem-blend clip → Y seam ([#2078](https://github.com/perminder-klair/subwave/issues/2078)) ([09692ec](https://github.com/perminder-klair/subwave/commit/09692ecef96f15e69565210ead15da95c7f76b4a))
+* **liquidsoap:** start an early MP3 Y sooner at the stem-blend clip → Y seam ([#2077](https://github.com/perminder-klair/subwave/issues/2077)) ([#2086](https://github.com/perminder-klair/subwave/issues/2086)) ([f5a055b](https://github.com/perminder-klair/subwave/commit/f5a055b1170bb0d945a4c9095eed9898aa244f7d))
+* **lyrics:** give lyrics the phone screen on the Classic skin ([#2085](https://github.com/perminder-klair/subwave/issues/2085)) ([d640883](https://github.com/perminder-klair/subwave/commit/d6408836384826ce4b3b23c53ce625dec866a565))
+* **web:** fit the appearance modal to the mobile viewport ([#2084](https://github.com/perminder-klair/subwave/issues/2084)) ([bc219b7](https://github.com/perminder-klair/subwave/commit/bc219b7fe9495e3d65b30dd40157840227c9ffe4))
+
+
+### Documentation
+
+* **news:** lyrics are on by default, and LRCLIB is asked when a song is queued ([#2083](https://github.com/perminder-klair/subwave/issues/2083)) ([9c2b54d](https://github.com/perminder-klair/subwave/commit/9c2b54d0265df1ff760d7a54a62cc9c630cb4378))
+* **news:** sing along with the station, a dispatch on synced lyrics ([#2079](https://github.com/perminder-klair/subwave/issues/2079)) ([37528d6](https://github.com/perminder-klair/subwave/commit/37528d6554a47c758583c169bef012e277bd1d1c))
+
+## [1.27.0](https://github.com/perminder-klair/subwave/compare/v1.26.0...v1.27.0) (2026-10-22)
+
+
+### Features
+
+* **axo:** build AXO-1 in Unit SW-9's hardware, as Cipher-3 is ([#2050](https://github.com/perminder-klair/subwave/issues/2050)) ([598cd42](https://github.com/perminder-klair/subwave/commit/598cd4263c854c7e4bd2898d13b980b5f4636260))
+* **cipher:** build Cipher-3 in Unit SW-9's hardware, every depth at 30° ([#2038](https://github.com/perminder-klair/subwave/issues/2038)) ([6943b0c](https://github.com/perminder-klair/subwave/commit/6943b0cbacb3cb17df73d1f761e9cb18fea4efe2))
+* **themes:** replace Signal and Flare with Phosphor and Riso ([#2034](https://github.com/perminder-klair/subwave/issues/2034)) ([9237842](https://github.com/perminder-klair/subwave/commit/923784291df3f8c38861f2038cd0e088d057f8d0))
+* **tty:** ANSI landscapes in focus mode, a scope pane and an ASCII cover ([#2051](https://github.com/perminder-klair/subwave/issues/2051)) ([603464a](https://github.com/perminder-klair/subwave/commit/603464ab54c827209cb684be992402bcaf5c3faa))
+* **web:** booth glass for the admin sidebar and top bar ([#2054](https://github.com/perminder-klair/subwave/issues/2054)) ([642696f](https://github.com/perminder-klair/subwave/commit/642696f9ca536c88971ddb83acb59734929b884e))
+* **web:** focus modes for the AXO and Platter skins ([#2037](https://github.com/perminder-klair/subwave/issues/2037)) ([a036c60](https://github.com/perminder-klair/subwave/commit/a036c606505d0191885d0f26db78604e1190f8f8))
+* **web:** give DJ Doc moods, an isometric look and one buddy per page ([#2053](https://github.com/perminder-klair/subwave/issues/2053)) ([77491ad](https://github.com/perminder-klair/subwave/commit/77491ad38ebedd760d204d4f81140f04dc92cd55))
+* **web:** merge the Dash's Never play into one Skip button ([#2052](https://github.com/perminder-klair/subwave/issues/2052)) ([6f1ea01](https://github.com/perminder-klair/subwave/commit/6f1ea015bc552cef54133a9a260caf00df6b264e))
+* **web:** redesign the Appearance menu with theme specimens and skin miniatures ([#2035](https://github.com/perminder-klair/subwave/issues/2035)) ([1426c9f](https://github.com/perminder-klair/subwave/commit/1426c9f0e533813a997b9628c90629099a32da24))
+* **web:** serve /llms.txt for language models ([#2045](https://github.com/perminder-klair/subwave/issues/2045)) ([88a5dec](https://github.com/perminder-klair/subwave/commit/88a5dece89c4ee92697de0183a51dc1876fecf0a))
+* **web:** the Observatory follows the theme, wears booth glass and folds its sides ([#2055](https://github.com/perminder-klair/subwave/issues/2055)) ([2e0d8e3](https://github.com/perminder-klair/subwave/commit/2e0d8e3303cd56686f6fee95057aa4753c3f375a))
+
+
+### Bug Fixes
+
+* **platter:** stop the record turning when the player stops ([#2036](https://github.com/perminder-klair/subwave/issues/2036)) ([980dd44](https://github.com/perminder-klair/subwave/commit/980dd44dedaf20c1ac37fd524df1f1b910a7f59a))
+* **web:** bring the lite mode toggle back to the Appearance menu ([#2057](https://github.com/perminder-klair/subwave/issues/2057)) ([2d5b30f](https://github.com/perminder-klair/subwave/commit/2d5b30fe724f1dc6479688ed64e931683cf52fca))
+* **web:** raised keys keep their depth on dark themes ([#2039](https://github.com/perminder-klair/subwave/issues/2039)) ([ef8bf24](https://github.com/perminder-klair/subwave/commit/ef8bf24fa2304a69398ff1aa615895a0ff66c3b9))
+* **web:** sharpen Riso, smooth the first Appearance open, and line up the skin bars ([#2049](https://github.com/perminder-klair/subwave/issues/2049)) ([bacbaf6](https://github.com/perminder-klair/subwave/commit/bacbaf6173821cfb415b098f3c223144e2334cbe))
+* **web:** skin miniatures and Press Run plates show Cipher's and Platter's current looks ([#2040](https://github.com/perminder-klair/subwave/issues/2040)) ([2704113](https://github.com/perminder-klair/subwave/commit/2704113ede2030b0dccdd8a32ca8761278eb66d1))
+
+
+### Performance
+
+* **web:** keep Cipher and Unit SW-9 smooth on iPad Safari ([#2061](https://github.com/perminder-klair/subwave/issues/2061)) ([1f178bb](https://github.com/perminder-klair/subwave/commit/1f178bb4444cd34f8cb4402e42d4b69296667c14))
+* **web:** lighten the AXO and Platter skins for iPad Safari ([#2060](https://github.com/perminder-klair/subwave/issues/2060)) ([a04f7da](https://github.com/perminder-klair/subwave/commit/a04f7da70ee60fb783e43bc6d99f3c36ef7c2c71))
+* **web:** make the TTY skin cheap enough for iPad Safari ([#2059](https://github.com/perminder-klair/subwave/issues/2059)) ([0b26db2](https://github.com/perminder-klair/subwave/commit/0b26db26695bcf53688043f4be8a0f301935093c))
+* **web:** stop Classic, Drift and Subamp repainting on iPad Safari ([#2062](https://github.com/perminder-klair/subwave/issues/2062)) ([3f60641](https://github.com/perminder-klair/subwave/commit/3f606418f84de30182c56cb67b8aa1b2417dec79))
+* **web:** stop Safari re-filtering the whole player, rewriting the theme every 30 s, and blanking skin switches ([#2058](https://github.com/perminder-klair/subwave/issues/2058)) ([19d3392](https://github.com/perminder-klair/subwave/commit/19d3392c8c21c5972a672037cae0fb9dbe414e96))
+
+
+### Documentation
+
+* add CREDITS.md for the packages, models and services SUB/WAVE uses ([#2044](https://github.com/perminder-klair/subwave/issues/2044)) ([ac9b3ee](https://github.com/perminder-klair/subwave/commit/ac9b3eef7f5851235c942924ded2ac7f667c6774))
+* **news:** dress up your radio, a dispatch on the eight skins and themes ([#2065](https://github.com/perminder-klair/subwave/issues/2065)) ([2d72093](https://github.com/perminder-klair/subwave/commit/2d7209378670ec248fad6697fd2202273819be2c))
+* trim the CLAUDE.md files and fix stale internals text ([#2042](https://github.com/perminder-klair/subwave/issues/2042)) ([37b0971](https://github.com/perminder-klair/subwave/commit/37b09715ce56e61e7b14ffe1e95c393eac7ddba1))
+
 ## [1.26.0](https://github.com/perminder-klair/subwave/compare/v1.25.0...v1.26.0) (2026-10-21)
 
 

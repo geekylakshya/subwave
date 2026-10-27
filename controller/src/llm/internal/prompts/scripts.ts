@@ -501,7 +501,8 @@ export function nextHourlyTimeClause(clock: any) {
 }
 
 // Hourly-only override after the saved persona: omitting weather context alone
-// still lets a weather-inviting soul or seasonal angle invent conditions (#1752).
+// still lets a weather-inviting soul invent conditions (#1752). A tone asking
+// for them beats this rule anyway, so no hourly tone in ANGLES does (#2056).
 const HOURLY_NO_WEATHER_RULE = 'For this hourly time check, do not mention weather or outdoor conditions.'
   + ' Do not infer them from persona instructions, the day, season, daypart, daylight or darkness, or recent speech/recap.'
   + ' This rule overrides persona and tone instructions for this segment; weather belongs only in the dedicated weather segment.';

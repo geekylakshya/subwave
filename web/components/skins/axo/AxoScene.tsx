@@ -2,20 +2,28 @@
 
 // The drawn stack. The switch, knob and keys in the drawing ARE the controls:
 // power tunes in, the knob sets volume, MUTE mutes, REC opens a request, KEEP
-// likes the track. One rAF loop moves what the music moves (reels, platter,
-// tonearm, cones, sound lines) by writing attributes straight to the nodes;
-// lite mode and reduced motion stop it outright and the render paints one
-// still frame instead, since neither the CSS animation kill nor the media
-// query can reach a JS loop.
+// likes the track. It is drawn in pen at 30°: every box its three faces in
+// the theme's paper shaded toward its ink, hairlines where faces meet and a
+// heavier silhouette round each unit. Unpowered, the hairlines fall back to
+// dashed construction lines in a faded pen, and tuning in inks them. One rAF
+// loop moves what the music moves (reels, record, tonearm, cones, sound
+// lines) by writing attributes straight to the nodes, and only the ones that
+// changed (loop.ts); lite mode and reduced motion stop it outright and the
+// render paints one still frame instead, since neither the CSS animation kill
+// nor the media query can reach a JS loop. The drawing itself is memoised
+// (Stack): the skin re-renders every second, and only the few parts that read
+// the song's progress (TickCtx) re-render with it.
 
-import { useEffect, useId, useRef, useSyncExternalStore } from 'react';
+import { createContext, memo, useContext, useEffect, useId, useMemo, useRef, useSyncExternalStore } from 'react';
 import type { KeyboardEvent, PointerEvent, ReactNode, RefObject } from 'react';
 import { Heart } from 'lucide-react';
 import styles from './Axo.module.css';
 import { cn } from '@/lib/cn';
 import { useAnalyser } from '@/lib/hooks';
+import { isIOSDevice } from '@/lib/platform';
 import { round2 } from '@/components/iso/geometry';
 import { AXO, LID_SHEET, VIEWBOX, arcOpacity, arcPath, armAngle, knobAngle, type DrawnBlock, type RackLevel } from './geometry';
+import { TOUCH_FRAME_MS, createWriter, frameGate } from './loop';
 import { ROW, SCREEN, SEGMENTS, screenLayout, type LidScreenInfo } from './screen';
 import { foldBpm, isPowered, type ListenPhase } from '../shared';
 import { useSvgTextFit } from '../sharedHooks';
@@ -86,41 +94,47 @@ function beatSeconds(bpm: number | null): number {
 
 const noSubscribe = () => () => {};
 
-export default function AxoScene(props: AxoSceneProps) {
-  const {
-    variant, phase, talk, muted, volume, ratio, counter, duration, lcd, tapeLabel,
-    djName, calm, audioRef, like, screen = null, gateTap, onGateTap, onPower, onMute, onVolume,
-    onRequest, onLike,
-  } = props;
-  const mob = variant === 'mobile';
+// The scene's gradients: a side panel receding, a top falling into the shadow
+// of the shelf above, the contact shadow a unit leaves on its shelf, and the
+// light a lit lamp spills. Ids are unique per mounted scene (desktop and
+// mobile both render, so a fixed id would collide), and every part reads them
+// from context.
+const PAINTS = ['shade', 'fall', 'dropX', 'dropY', 'glow'] as const;
+type PaintKey = (typeof PAINTS)[number];
+type PaintIds = Record<PaintKey, string>;
+const paintIds = (uid: string) => Object.fromEntries(PAINTS.map(k => [k, `${uid}-${k}`])) as PaintIds;
+const url = (id: string) => `url(#${id})`;
+const PaintCtx = createContext<PaintIds>(paintIds('axo'));
+
+/** What changes every second while a song plays. Stack is memoised against
+ *  it, so a tick re-renders only the parts that read this. */
+interface Tick {
+  ratio: number | null;
+  counter: string;
+  screen: LidScreenInfo | null;
+}
+const TickCtx = createContext<Tick>({ ratio: null, counter: '', screen: null });
+
+function AxoScene(props: AxoSceneProps) {
+  const { ratio, counter, screen = null, ...drawn } = props;
+  const { phase, muted, volume, calm, audioRef } = drawn;
   const rootRef = useRef<HTMLDivElement | null>(null);
   // useId's punctuation varies across React versions; keep url(#…) plain.
   const uid = `axo-${useId().replace(/[^\w-]/g, '')}`;
-  const wobId = `${uid}-wob`;
-  const paint: PaintIds = {
-    shade: `${uid}-shade`, fall: `${uid}-fall`, dropX: `${uid}-dropx`, dropY: `${uid}-dropy`, glow: `${uid}-glow`,
-  };
-  const screenIds: ScreenIds = {
+  const paint = useMemo(() => paintIds(uid), [uid]);
+  const screenIds = useMemo<ScreenIds>(() => ({
     clip: `${uid}-scrclip`, scan: `${uid}-scan`, bloom: `${uid}-bloom`, sweep: `${uid}-sweep`,
-  };
+  }), [uid]);
 
   // The screen's rows are laid out by character budget; once drawn, any
-  // still overflowing its window is squeezed.
+  // still overflowing its window is squeezed. Its clock is never squeezed,
+  // so a tick of it doesn't refit the rest.
   const screenText = screen
-    ? [screen.eyebrow, screen.title, screen.artist, screen.detail, screen.foot?.text ?? '', screen.elapsed].join('\n')
+    ? [screen.eyebrow, screen.title, screen.artist, screen.detail, screen.foot?.text ?? ''].join('\n')
     : '';
   useSvgTextFit(rootRef, screenText);
 
-  // False through SSR and hydration. `calm` can differ between the two (the
-  // reduced-motion query only answers in the browser), so nothing printed
-  // may hang off it until hydration is done.
-  const hydrated = useSyncExternalStore(noSubscribe, () => true, () => false);
-
-  const powered = isPowered(phase);
-  const live = phase === 'live';
-  const connecting = phase === 'connecting';
-  const standby = phase === 'standby';
-  const audible = live && !muted && volume > 0;
+  const audible = phase === 'live' && !muted && volume > 0;
 
   // The loop reads the latest props without re-subscribing every render.
   const latest = useRef(props);
@@ -133,8 +147,14 @@ export default function AxoScene(props: AxoSceneProps) {
   useEffect(() => {
     const root = rootRef.current;
     if (calm || !root) return;
+    // Every iPhone and iPad browser is WebKit, which repaints SVG on the CPU:
+    // there the loop runs every other frame, and the platter's strobe ring
+    // holds still.
+    const touch = isIOSDevice();
     const all = <E extends Element>(sel: string) => Array.from(root.querySelectorAll<E>(sel));
-    const spin = all<SVGGElement>('[data-spin]').map(el => ({ el, v: Number(el.dataset.spin) }));
+    const spin = all<SVGGElement>('[data-spin]')
+      .filter(el => !(touch && el.dataset.touchStill != null))
+      .map(el => ({ el, v: Number(el.dataset.spin) }));
     const cones = all<SVGGElement>('[data-cone]').map(el => ({ el, big: el.dataset.cone === 'big' }));
     const arcs = all<SVGPathElement>('[data-arc]').map(el => {
       const [s, k] = (el.dataset.arc ?? '0:0').split(':').map(Number);
@@ -145,7 +165,8 @@ export default function AxoScene(props: AxoSceneProps) {
     const lcds = all<SVGTextElement>('[data-lcd]');
     const marquees = lcds.map(el => ({ el, text: '', len: 0, measured: -Infinity, t0: 0 }));
     const pulses = all<SVGCircleElement>('[data-pulse]');
-    const boils = all<SVGFETurbulenceElement>('[data-boil]');
+    const w = createWriter();
+    const due = frameGate(touch ? TOUCH_FRAME_MS : 0);
 
     let visible = true;
     const io = 'IntersectionObserver' in window
@@ -159,16 +180,19 @@ export default function AxoScene(props: AxoSceneProps) {
     let arm = armAngle('rest', null);
     let lv = 0;
     let vo = 0;
-    let nextBoil = 0;
     let raf = 0;
 
     const tick = (now: number) => {
       raf = requestAnimationFrame(tick);
       if (!visible) { last = now; return; }
+      if (!due(now)) return;
       const p = latest.current;
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
       const t = (now - t0) / 1000;
+      // The smoothing below is set per 60 Hz frame; this keeps its pace in
+      // seconds at any frame rate.
+      const ease = (k: number) => 1 - (1 - k) ** (dt * 60);
       const isLive = p.phase === 'live';
       const isTalk = isLive && p.talk;
       const loud = isLive && !p.muted && p.volume > 0;
@@ -193,37 +217,48 @@ export default function AxoScene(props: AxoSceneProps) {
             * (isTalk ? 0.4 : 1) * (0.5 + p.volume * 0.6));
         }
       }
-      lv += (target - lv) * (target > lv ? 0.55 : 0.12);
+      lv += (target - lv) * ease(target > lv ? 0.55 : 0.12);
       // A real signal already pumps; the simulated one needs the kick shape.
       const excite = loud ? (real != null ? lv : kick * lv) : 0;
       const vt = isTalk
         ? Math.abs(Math.sin(t * 8.5)) * (0.55 + 0.45 * Math.sin(t * 1.9)) * (0.7 + Math.random() * 0.3)
         : 0;
-      vo += (vt - vo) * 0.3;
+      vo += (vt - vo) * ease(0.3);
 
       if (isLive) ang += dt;
-      for (const s of spin) s.el.setAttribute('transform', `rotate(${((ang * s.v) % 360).toFixed(1)})`);
+      for (const s of spin) w.attr(s.el, 'transform', `rotate(${((ang * s.v) % 360).toFixed(1)})`);
 
+      // The arm comes to rest on its mark. A playing arm's mark creeps a
+      // hair each second, and chasing it to the hundredth of a degree kept
+      // the arm repainting every frame of every song.
       const armTarget = armAngle(isLive ? 'play' : p.phase === 'connecting' ? 'cue' : 'rest', p.ratio);
       arm += (armTarget - arm) * Math.min(1, dt * 1.6);
-      for (const el of arms) el.setAttribute('transform', `rotate(${arm.toFixed(2)} 190 24)`);
+      if (Math.abs(armTarget - arm) < 0.05) arm = armTarget;
+      const armAt = `rotate(${arm.toFixed(1)} 190 24)`;
+      for (const el of arms) w.attr(el, 'transform', armAt);
 
       for (const c of cones) {
-        c.el.setAttribute('transform', `scale(${(1 + excite * (c.big ? 0.1 : 0.05)).toFixed(3)})`);
+        w.attr(c.el, 'transform', `scale(${(1 + excite * (c.big ? 0.1 : 0.05)).toFixed(3)})`);
       }
 
+      // An unlit line keeps its old shape: nobody sees it.
       const energy = isTalk ? Math.max(vo, lv * 0.6) : lv * 0.6;
       for (const a of arcs) {
-        a.el.setAttribute('d', arcPath(a.s, a.k, energy));
-        a.el.style.opacity = loud || isTalk ? arcOpacity(a.k, energy).toFixed(2) : '0';
+        const o = loud || isTalk ? arcOpacity(a.k, energy) : 0;
+        w.style(a.el, 'opacity', o > 0 ? o.toFixed(2) : '0');
+        if (o > 0) w.attr(a.el, 'd', arcPath(a.s, a.k, energy));
       }
 
       if (p.phase === 'connecting') {
+        // The needle sweeps every frame while tuning, and outside it React
+        // prints the needle's x, so a remembered write could be stale:
+        // these go straight to the node.
         const x = (16 + 104 * (0.5 + 0.5 * Math.sin(t * 1.7))).toFixed(1);
         for (const el of needles) { el.setAttribute('x1', x); el.setAttribute('x2', x); }
-        for (const el of lcds) el.style.opacity = Math.floor(t * 2) % 2 === 0 ? '1' : '0.25';
+        const blink = Math.floor(t * 2) % 2 === 0 ? '1' : '0.25';
+        for (const el of lcds) w.style(el, 'opacity', blink);
       } else {
-        for (const el of lcds) el.style.removeProperty('opacity');
+        for (const el of lcds) w.style(el, 'opacity', null);
       }
 
       for (const m of marquees) {
@@ -234,30 +269,24 @@ export default function AxoScene(props: AxoSceneProps) {
         if (text !== m.text) { m.text = text; m.t0 = t; m.measured = -Infinity; }
         if (t - m.measured > 3) { m.len = m.el.getComputedTextLength(); m.measured = t; }
         const over = m.len - LCD_ROOM;
-        if (over <= 0) { m.el.removeAttribute('transform'); continue; }
+        if (over <= 0) { w.attr(m.el, 'transform', null); continue; }
         const run = over / MARQUEE_SPEED;
         const u = (t - m.t0) % (MARQUEE_HOLD * 2 + run);
         const x = u < MARQUEE_HOLD ? 0 : Math.min(over, (u - MARQUEE_HOLD) * MARQUEE_SPEED);
-        m.el.setAttribute('transform', `translate(${(-x).toFixed(1)} 0)`);
+        w.attr(m.el, 'transform', `translate(${(-x).toFixed(1)} 0)`);
       }
 
       for (const el of pulses) {
         if (p.phase === 'standby') {
           const ph = (t % 1.6) / 1.6;
-          el.setAttribute('r', (10 + ph * 12).toFixed(1));
-          el.style.opacity = ((1 - ph) * 0.9).toFixed(2);
+          w.attr(el, 'r', (10 + ph * 12).toFixed(1));
+          w.style(el, 'opacity', ((1 - ph) * 0.9).toFixed(2));
         } else if (p.phase === 'connecting') {
-          el.setAttribute('r', '12');
-          el.style.opacity = (0.25 + 0.75 * Math.abs(Math.cos(t * Math.PI))).toFixed(2);
+          w.attr(el, 'r', '12');
+          w.style(el, 'opacity', (0.25 + 0.75 * Math.abs(Math.cos(t * Math.PI))).toFixed(2));
         } else {
-          el.style.opacity = '0';
+          w.style(el, 'opacity', '0');
         }
-      }
-
-      // Line boil: re-seed the wobble in steps, quicker while the DJ talks.
-      if (now > nextBoil) {
-        for (const el of boils) el.setAttribute('seed', String(1 + Math.floor(Math.random() * 90)));
-        nextBoil = now + (isTalk ? 220 : 520);
       }
     };
     raf = requestAnimationFrame(tick);
@@ -277,14 +306,50 @@ export default function AxoScene(props: AxoSceneProps) {
     };
   }, [calm]);
 
-  // Still-frame values, used only while calm; otherwise the loop owns these
-  // attributes and React must leave them alone (an undefined prop is never
-  // written, so a one-second re-render can't snap the arm back).
-  const staticArm = `rotate(${armAngle(live ? 'play' : connecting ? 'cue' : 'rest', ratio)} 190 24)`;
+  const tick = useMemo(() => ({ ratio, counter, screen }), [ratio, counter, screen]);
+
+  return (
+    <TickCtx.Provider value={tick}>
+      <Stack {...drawn} rootRef={rootRef} uid={uid} paint={paint} screenIds={screenIds} focus={screen != null} />
+    </TickCtx.Provider>
+  );
+}
+
+export default memo(AxoScene);
+
+/** What the drawing is drawn from: everything but what TickCtx carries. */
+type StackProps = Omit<AxoSceneProps, 'ratio' | 'counter' | 'screen'> & {
+  /** The scene's root, which the loop and the screen's fit search. */
+  rootRef: RefObject<HTMLDivElement | null>;
+  uid: string;
+  paint: PaintIds;
+  screenIds: ScreenIds;
+  /** Focus mode: the cover is a screen, whose card TickCtx carries. */
+  focus: boolean;
+};
+
+/** The drawing and the hit areas over its controls. */
+const Stack = memo(function Stack(props: StackProps) {
+  const {
+    variant, phase, talk, muted, volume, duration, lcd, tapeLabel, djName, calm, like,
+    gateTap, onGateTap, onPower, onMute, onVolume, onRequest, onLike, rootRef, uid, paint, screenIds, focus,
+  } = props;
+  const mob = variant === 'mobile';
+
+  // False through SSR and hydration. `calm` can differ between the two (the
+  // reduced-motion query only answers in the browser), so nothing printed
+  // may hang off it until hydration is done.
+  const hydrated = useSyncExternalStore(noSubscribe, () => true, () => false);
+
+  const powered = isPowered(phase);
+  const live = phase === 'live';
+  const connecting = phase === 'connecting';
+  const standby = phase === 'standby';
+  const audible = live && !muted && volume > 0;
+
+  // The sound lines' still frame, used only while calm; otherwise the loop
+  // owns them and React must leave them alone.
   const staticEnergy = talk && live ? 0.6 : audible ? 0.36 : 0;
-  const needleX = (16 + 104 * (live ? (ratio ?? 0.5) : connecting ? 0.5 : 0)).toFixed(2);
-  const needleOwned = calm || !connecting;
-  const r = ratio ?? 0.5;
   const sigLit = live ? 4 : connecting ? 1 : 0;
   // The loop scrolls a long line; a still frame ends it with an ellipsis.
   const lcdStill = lcd.length > LCD_CHARS ? `${lcd.slice(0, LCD_CHARS - 1)}…` : lcd;
@@ -322,237 +387,194 @@ export default function AxoScene(props: AxoSceneProps) {
         aria-label="Hi-fi stack: receiver, tape deck and turntable"
       >
         <defs>
-          <filter id={wobId} x="-10%" y="-10%" width="120%" height="120%">
-            <feTurbulence data-boil="" type="fractalNoise" baseFrequency="0.03" numOctaves={2} seed={2} result="n" />
-            <feDisplacementMap in="SourceGraphic" in2="n" scale={1.8} xChannelSelector="R" yChannelSelector="G" />
-          </filter>
-          {/* Light: a side panel deepens toward the back, a top tucked under
-              the shelf above darkens toward it, each unit leaves a contact
-              shadow on its shelf, and a lit lamp glows. */}
-          <linearGradient id={paint.shade} x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0" className={styles.shade0} />
-            <stop offset="1" className={styles.shade1} />
-          </linearGradient>
-          <linearGradient id={paint.fall} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0" className={styles.fall0} />
-            <stop offset="1" className={styles.fall1} />
-          </linearGradient>
-          <linearGradient id={paint.dropX} x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0" className={styles.drop0} />
-            <stop offset="1" className={styles.drop1} />
-          </linearGradient>
-          <linearGradient id={paint.dropY} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0" className={styles.drop0} />
-            <stop offset="1" className={styles.drop1} />
-          </linearGradient>
-          <radialGradient id={paint.glow}>
-            <stop offset="0" className={styles.glow0} />
-            <stop offset="1" className={styles.glow1} />
-          </radialGradient>
-          {screen && <ScreenDefs ids={screenIds} />}
+          <Paints ids={paint} />
+          {focus && <ScreenDefs ids={screenIds} />}
         </defs>
 
-        <g className={cn(styles.draw, !powered && styles.drawOff)} aria-hidden="true">
-          <path d={AXO.hatch} strokeWidth={0.5} opacity={0.5} />
+        <PaintCtx.Provider value={paint}>
+          <g className={cn(styles.draw, !powered && styles.drawOff)} aria-hidden="true">
+            <path d={AXO.hatch} strokeWidth={0.5} opacity={0.5} />
 
-          <Speaker block={AXO.spL} shade={paint.shade} />
+            <Speaker block={AXO.spL} />
 
-          <Bay level={AXO.rack[0]} paint={paint} />
+            <Bay level={AXO.rack[0]} />
 
-          {/* Receiver */}
-          <Face of={AXO.rcv} side="T" className={styles.fBg} shade={paint.fall}>
-            <path d="M14 20H206M14 28H206M14 36H206" strokeWidth={0.4} opacity={0.5} />
-          </Face>
-          <Face of={AXO.rcv} side="R" className={styles.fR} shade={paint.shade} />
-          <Face of={AXO.rcv} side="L" className={styles.fL}>
-            <Well id={`${uid}-dial`} x={12} y={10} w={112} h={26} t={2.5} className={styles.fBg}>
-              <path d={AXO.dialTicks} strokeWidth={0.6} className={styles.solid} />
-              <text x="15" y="34" fontSize={5.5} fontWeight={500} className={cn(styles.tx, styles.mono)}>0:00</text>
-              <text x="121" y="34" fontSize={5.5} fontWeight={500} textAnchor="end" className={cn(styles.tx, styles.mono)}>
-                {duration}
+            {/* Receiver */}
+            <Face of={AXO.rcv} side="T" className={styles.fBg} shade="fall">
+              <path d="M14 20H206M14 28H206M14 36H206" strokeWidth={0.4} opacity={0.5} />
+            </Face>
+            <Face of={AXO.rcv} side="R" className={styles.fR} shade="shade" />
+            <Face of={AXO.rcv} side="L" className={styles.fL}>
+              <Well id={`${uid}-dial`} x={12} y={10} w={112} h={26} t={2.5} className={styles.fBg}>
+                <path d={AXO.dialTicks} strokeWidth={0.6} className={styles.solid} />
+                <text x="15" y="34" fontSize={5.5} fontWeight={500} className={cn(styles.tx, styles.mono)}>0:00</text>
+                <text x="121" y="34" fontSize={5.5} fontWeight={500} textAnchor="end" className={cn(styles.tx, styles.mono)}>
+                  {duration}
+                </text>
+                <DialNeedle phase={phase} calm={calm} />
+              </Well>
+              <Well id={`${uid}-lcd`} x={12} y={42} w={112} h={20} t={2} className={styles.fInk}>
+                <text data-lcd="" x="17" y="56" fontSize={6.5} fontWeight={700} letterSpacing="0.12em" className={cn(styles.txBg, styles.mono)}>
+                  {hydrated && !calm ? lcd : lcdStill}
+                </text>
+              </Well>
+              <text x="12" y="74" fontSize={5} fontWeight={500} letterSpacing="0.18em" className={cn(styles.txMuted, styles.mono)}>AXO-1</text>
+              <text x="46" y="74" fontSize={4.5} fontWeight={700} letterSpacing="0.16em" className={cn(styles.tx, styles.mono)}>SIG</text>
+              {AXO.sigBars.map((b, i) => (
+                <rect
+                  key={b.x}
+                  x={b.x}
+                  y={b.y}
+                  width="2.6"
+                  height={b.h}
+                  strokeWidth={i < sigLit ? undefined : 0.4}
+                  className={i < sigLit ? cn(styles.fInk, styles.ns) : cn(styles.fNone, styles.solid)}
+                />
+              ))}
+              <Lamp cx={90} cy={72.4} r={2.2} lit={live} />
+              <text x="95" y="74" fontSize={4.5} fontWeight={700} letterSpacing="0.16em" className={cn(styles.tx, styles.mono)}>STEREO</text>
+
+              <circle
+                data-pulse=""
+                cx="142"
+                cy="24"
+                r={calm ? (standby ? 13 : 12) : undefined}
+                opacity={calm ? (standby || connecting ? 0.8 : 0) : undefined}
+                strokeWidth={1.3}
+                className={cn(styles.fNone, styles.sAcc, styles.solid)}
+              />
+              <Boss on="L" cx={142} cy={24} r={9} t={3} className={styles.fW}>
+                <path
+                  d="M-3.18 -3.18A4.5 4.5 0 1 0 3.18 -3.18M0 -6V-0.5"
+                  strokeWidth={1.6}
+                  className={cn(powered ? styles.sAcc : styles.sInk, styles.solid)}
+                />
+              </Boss>
+              <text x="142" y="41" fontSize={5} fontWeight={700} letterSpacing="0.14em" textAnchor="middle" className={cn(styles.tx, styles.mono)}>
+                POWER
               </text>
-              <line
-                data-needle=""
-                x1={needleOwned ? needleX : undefined}
-                x2={needleOwned ? needleX : undefined}
-                y1="10"
-                y2="38"
-                strokeWidth={1.6}
-                className={cn(styles.sAcc, styles.solid)}
-              />
-            </Well>
-            <Well id={`${uid}-lcd`} x={12} y={42} w={112} h={20} t={2} className={styles.fInk}>
-              <text
-                data-lcd=""
-                x="17"
-                y="56"
-                fontSize={6.5}
-                fontWeight={700}
-                letterSpacing="0.12em"
-                className={cn(styles.txBg, styles.mono)}
-              >
-                {hydrated && !calm ? lcd : lcdStill}
+
+              {/* A latching key: muted, it stays pressed in and lit. */}
+              <Key on="L" x={130} y={48} w={24} h={14} t={muted ? 1 : 3} className={muted ? styles.fAcc : styles.fBg}>
+                <text
+                  x="142"
+                  y="57.2"
+                  fontSize={5}
+                  fontWeight={700}
+                  letterSpacing="0.1em"
+                  textAnchor="middle"
+                  className={cn(muted ? styles.txOn : styles.tx, styles.mono)}
+                >
+                  {muted ? 'MUTED' : 'MUTE'}
+                </text>
+              </Key>
+
+              <path d={AXO.volTicks} strokeWidth={0.8} className={styles.solid} />
+              {/* The knob: a flange, then a cap standing proud of it with the pointer on its face. */}
+              <Boss on="L" cx={186} cy={38} r={22} t={2.5} className={styles.fW} />
+              <Boss on="L" cx={183.5} cy={40.5} r={15} t={5} className={styles.fBg}>
+                <g transform={`rotate(${knobAngle(volume).toFixed(1)})`}>
+                  <line x1="0" y1="-13" x2="0" y2="-5" strokeWidth={2.4} className={cn(styles.sAcc, styles.solid)} />
+                </g>
+              </Boss>
+              <text x="186" y="75" fontSize={5} fontWeight={700} letterSpacing="0.14em" textAnchor="middle" className={cn(styles.tx, styles.mono)}>
+                VOLUME
               </text>
-            </Well>
-            <text x="12" y="74" fontSize={5} fontWeight={500} letterSpacing="0.18em" className={cn(styles.txMuted, styles.mono)}>AXO-1</text>
-            <text x="46" y="74" fontSize={4.5} fontWeight={700} letterSpacing="0.16em" className={cn(styles.tx, styles.mono)}>SIG</text>
-            {AXO.sigBars.map((b, i) => (
-              <rect
-                key={b.x}
-                x={b.x}
-                y={b.y}
-                width="2.6"
-                height={b.h}
-                strokeWidth={i < sigLit ? undefined : 0.4}
-                className={i < sigLit ? cn(styles.fInk, styles.ns) : cn(styles.fNone, styles.solid)}
-              />
-            ))}
-            <Lamp cx={90} cy={72.4} r={2.2} lit={live} glow={paint.glow} />
-            <text x="95" y="74" fontSize={4.5} fontWeight={700} letterSpacing="0.16em" className={cn(styles.tx, styles.mono)}>STEREO</text>
+            </Face>
+            <path d={AXO.rcv.sil} strokeWidth={1.5} className={styles.solid} />
 
-            <circle
-              data-pulse=""
-              cx="142"
-              cy="24"
-              r={calm ? (standby ? 13 : 12) : undefined}
-              opacity={calm ? (standby || connecting ? 0.8 : 0) : undefined}
-              strokeWidth={1.3}
-              className={cn(styles.fNone, styles.sAcc, styles.solid)}
-            />
-            <Boss on="L" cx={142} cy={24} r={9} t={3} className={styles.fW}>
-              <path
-                d="M-3.18 -3.18A4.5 4.5 0 1 0 3.18 -3.18M0 -6V-0.5"
-                strokeWidth={1.6}
-                className={cn(powered ? styles.sAcc : styles.sInk, styles.solid)}
-              />
-            </Boss>
-            <text x="142" y="41" fontSize={5} fontWeight={700} letterSpacing="0.14em" textAnchor="middle" className={cn(styles.tx, styles.mono)}>
-              POWER
-            </text>
+            <Posts of={AXO.rack[0]} />
+            <Bay level={AXO.rack[1]} />
 
-            {/* A latching key: muted, it stays pressed in and lit. */}
-            <Key on="L" x={130} y={48} w={24} h={14} t={muted ? 1 : 3} className={muted ? styles.fAcc : styles.fBg}>
+            {/* Tape deck */}
+            <Face of={AXO.tape} side="T" className={styles.fBg} shade="fall" />
+            <Face of={AXO.tape} side="R" className={styles.fR} shade="shade" />
+            <Face of={AXO.tape} side="L" className={styles.fL}>
+              <Well id={`${uid}-tape`} x={12} y={8} w={110} h={46} t={3} className={styles.fW}>
+                {/* The cassette sits in the well, its shell proud of the floor. */}
+                <Key on="L" x={18} y={12} w={98} h={38} t={2} className={styles.fBg}>
+                  <Spools />
+                  <rect x="56" y="28" width="22" height="12" strokeWidth={0.5} />
+                  <rect x="24" y="14" width="86" height="9" strokeWidth={0.5} className={styles.fBg} />
+                  <text x="27" y="20.6" fontSize={5} fontWeight={700} letterSpacing="0.14em" className={cn(styles.tx, styles.mono)}>
+                    {tapeLabel}
+                  </text>
+                  <Reel cx={44} />
+                  <Reel cx={90} />
+                </Key>
+              </Well>
+              <Well id={`${uid}-count`} x={134} y={8} w={44} h={14} t={1.5} className={styles.fInk}>
+                <Counter />
+              </Well>
+              <text x="186" y="18" fontSize={5} fontWeight={500} letterSpacing="0.16em" className={cn(styles.txMuted, styles.mono)}>TAPE</text>
+              <Key on="L" x={134} y={30} w={44} h={16} t={3} className={styles.fBg}>
+                <circle cx="143" cy="38" r="3" className={cn(styles.fAcc, styles.ns)} />
+                <text x="149" y="40.4" fontSize={6.5} fontWeight={700} letterSpacing="0.16em" className={cn(styles.tx, styles.mono)}>REC</text>
+              </Key>
+              <text x="156" y="55" fontSize={5} fontWeight={700} letterSpacing="0.16em" textAnchor="middle" className={cn(styles.txAcc, styles.mono)}>
+                REQUEST
+              </text>
+              {/* Latching too: a kept track leaves KEEP pressed in and lit. */}
+              <Key on="L" x={184} y={30} w={28} h={16} t={like.liked ? 1 : 3} className={like.liked ? styles.fAcc : styles.fBg}>
+                <Heart
+                  x={likeX}
+                  y={35}
+                  width={6}
+                  height={6}
+                  strokeWidth={3.5}
+                  className={cn(styles.icon, likeInk, like.liked && styles.icFill)}
+                />
+                {likeCount && (
+                  <text
+                    x={likeX + 7.5}
+                    y="40.6"
+                    fontSize={6.5}
+                    fontWeight={700}
+                    className={cn(like.liked ? styles.txOn : styles.tx, styles.mono)}
+                  >
+                    {likeCount}
+                  </text>
+                )}
+              </Key>
               <text
-                x="142"
-                y="57.2"
+                x="198"
+                y="55"
                 fontSize={5}
                 fontWeight={700}
-                letterSpacing="0.1em"
+                letterSpacing="0.16em"
                 textAnchor="middle"
-                className={cn(muted ? styles.txOn : styles.tx, styles.mono)}
+                className={cn(like.available ? styles.tx : styles.txMuted, styles.mono)}
               >
-                {muted ? 'MUTED' : 'MUTE'}
+                KEEP
               </text>
-            </Key>
+            </Face>
+            <path d={AXO.tape.sil} strokeWidth={1.5} className={styles.solid} />
 
-            <path d={AXO.volTicks} strokeWidth={0.8} className={styles.solid} />
-            {/* The knob: a flange, then a cap standing proud of it with the pointer on its face. */}
-            <Boss on="L" cx={186} cy={38} r={22} t={2.5} className={styles.fW} />
-            <Boss on="L" cx={183.5} cy={40.5} r={15} t={5} className={styles.fBg}>
-              <g transform={`rotate(${knobAngle(volume).toFixed(1)})`}>
-                <line x1="0" y1="-13" x2="0" y2="-5" strokeWidth={2.4} className={cn(styles.sAcc, styles.solid)} />
-              </g>
-            </Boss>
-            <text x="186" y="75" fontSize={5} fontWeight={700} letterSpacing="0.14em" textAnchor="middle" className={cn(styles.tx, styles.mono)}>
-              VOLUME
-            </text>
-          </Face>
-          <path d={AXO.rcv.sil} strokeWidth={1.5} className={styles.solid} />
+            <Posts of={AXO.rack[1]} />
+            <Bay level={AXO.rack[2]} />
 
-          <Posts of={AXO.rack[0]} />
-          <Bay level={AXO.rack[1]} paint={paint} />
-
-          {/* Tape deck */}
-          <Face of={AXO.tape} side="T" className={styles.fBg} shade={paint.fall} />
-          <Face of={AXO.tape} side="R" className={styles.fR} shade={paint.shade} />
-          <Face of={AXO.tape} side="L" className={styles.fL}>
-            <Well id={`${uid}-tape`} x={12} y={8} w={110} h={46} t={3} className={styles.fW}>
-              {/* The cassette sits in the well, its shell proud of the floor. */}
-              <Key on="L" x={18} y={12} w={98} h={38} t={2} className={styles.fBg}>
-                {/* Tape packs: the left spool empties onto the right as the song plays. */}
-                <circle cx="44" cy="34" r={(9 + 7 * (1 - r)).toFixed(2)} strokeWidth={0.5} className={styles.fL} />
-                <circle cx="90" cy="34" r={(9 + 7 * r).toFixed(2)} strokeWidth={0.5} className={styles.fL} />
-                <rect x="56" y="28" width="22" height="12" strokeWidth={0.5} />
-                <rect x="24" y="14" width="86" height="9" strokeWidth={0.5} className={styles.fBg} />
-                <text x="27" y="20.6" fontSize={5} fontWeight={700} letterSpacing="0.14em" className={cn(styles.tx, styles.mono)}>
-                  {tapeLabel}
-                </text>
-                <Reel cx={44} />
-                <Reel cx={90} />
-              </Key>
-            </Well>
-            <Well id={`${uid}-count`} x={134} y={8} w={44} h={14} t={1.5} className={styles.fInk}>
-              <text x="156" y="18" fontSize={8} fontWeight={700} letterSpacing="0.06em" textAnchor="middle" className={cn(styles.txBg, styles.mono)}>
-                {counter}
+            {/* Turntable. The cover leans back past upright, wholly behind the
+                plinth, so it goes down first and the plinth covers its foot. */}
+            <DustCover powered={powered} ids={screenIds} />
+            <Face of={AXO.tt} side="L" className={styles.fL}>
+              <text x="12" y="15" fontSize={5} fontWeight={500} letterSpacing="0.18em" className={cn(styles.txMuted, styles.mono)}>
+                AXO-1 · DIRECT DRIVE · 33⅓
               </text>
-            </Well>
-            <text x="186" y="18" fontSize={5} fontWeight={500} letterSpacing="0.16em" className={cn(styles.txMuted, styles.mono)}>TAPE</text>
-            <Key on="L" x={134} y={30} w={44} h={16} t={3} className={styles.fBg}>
-              <circle cx="143" cy="38" r="3" className={cn(styles.fAcc, styles.ns)} />
-              <text x="149" y="40.4" fontSize={6.5} fontWeight={700} letterSpacing="0.16em" className={cn(styles.tx, styles.mono)}>REC</text>
-            </Key>
-            <text x="156" y="55" fontSize={5} fontWeight={700} letterSpacing="0.16em" textAnchor="middle" className={cn(styles.txAcc, styles.mono)}>
-              REQUEST
-            </text>
-            {/* Latching too: a kept track leaves KEEP pressed in and lit. */}
-            <Key on="L" x={184} y={30} w={28} h={16} t={like.liked ? 1 : 3} className={like.liked ? styles.fAcc : styles.fBg}>
-              <Heart
-                x={likeX}
-                y={35}
-                width={6}
-                height={6}
-                strokeWidth={3.5}
-                className={cn(styles.icon, likeInk, like.liked && styles.icFill)}
-              />
-              {likeCount && (
-                <text
-                  x={likeX + 7.5}
-                  y="40.6"
-                  fontSize={6.5}
-                  fontWeight={700}
-                  className={cn(like.liked ? styles.txOn : styles.tx, styles.mono)}
-                >
-                  {likeCount}
-                </text>
-              )}
-            </Key>
-            <text
-              x="198"
-              y="55"
-              fontSize={5}
-              fontWeight={700}
-              letterSpacing="0.16em"
-              textAnchor="middle"
-              className={cn(like.available ? styles.tx : styles.txMuted, styles.mono)}
-            >
-              KEEP
-            </text>
-          </Face>
-          <path d={AXO.tape.sil} strokeWidth={1.5} className={styles.solid} />
-
-          <Posts of={AXO.rack[1]} />
-          <Bay level={AXO.rack[2]} paint={paint} />
-
-          {/* Turntable. The cover leans back past upright, wholly behind the
-              plinth, so it goes down first and the plinth covers its foot. */}
-          <DustCover screen={screen} powered={powered} ids={screenIds} />
-          <Face of={AXO.tt} side="L" className={styles.fL}>
-            <text x="12" y="15" fontSize={5} fontWeight={500} letterSpacing="0.18em" className={cn(styles.txMuted, styles.mono)}>
-              AXO-1 · DIRECT DRIVE · 33⅓
-            </text>
-          </Face>
-          <Face of={AXO.tt} side="R" className={styles.fR} shade={paint.shade} />
-          <Face of={AXO.tt} side="T" className={styles.fBg}>
-            {/* The platter stands proud of the plinth and the record lies on
-                it; each spins in its own group so the cylinder sides, which
-                face the viewer whatever the angle, stay put. */}
-            <Boss on="T" cx={96} cy={66} r={58} t={5} className={styles.fW}>
-              <g data-spin={SPIN_PLATTER}>
-                <circle r="56.5" strokeWidth={1.6} strokeDasharray="0.8 2.6" strokeLinecap="butt" />
-              </g>
-            </Boss>
-            <Boss on="T" cx={91} cy={61} r={53} t={1.5} className={styles.fL}>
-              <g data-spin={SPIN_PLATTER}>
+            </Face>
+            <Face of={AXO.tt} side="R" className={styles.fR} shade="shade" />
+            <Face of={AXO.tt} side="T" className={styles.fBg}>
+              {/* The platter stands proud of the plinth and the record lies on
+                  it. Only what looks different turned is turned (WebKit
+                  repaints a turning node on the CPU every frame): the cylinder
+                  sides, the grooves and the label stay put. On iOS so do the
+                  strobe dots round the platter's rim, as a strobe's do at
+                  speed; turning, they repainted the whole platter. */}
+              <Boss on="T" cx={96} cy={66} r={58} t={5} className={styles.fW}>
+                <g data-spin={SPIN_PLATTER} data-touch-still="">
+                  <circle r="56.5" strokeWidth={1.6} strokeDasharray="0.8 2.6" strokeLinecap="butt" />
+                </g>
+              </Boss>
+              <Boss on="T" cx={91} cy={61} r={53} t={1.5} className={styles.fL}>
                 <circle r="49" strokeWidth={0.35} />
                 <circle r="45" strokeWidth={0.35} />
                 <circle r="38" strokeWidth={0.7} />
@@ -560,88 +582,48 @@ export default function AxoScene(props: AxoSceneProps) {
                 <circle r="27" strokeWidth={0.7} />
                 <circle r="23" strokeWidth={0.35} />
                 <circle r="18" className={cn(styles.fAcc, styles.ns)} />
-                <line x1="0" y1="-17" x2="0" y2="-7" strokeWidth={1.8} className={cn(styles.sBg, styles.solid)} />
-                <line x1="0" y1="-53" x2="0" y2="-45" strokeWidth={1.4} className={styles.solid} />
-              </g>
-              <circle r="2" className={cn(styles.fInk, styles.ns)} />
-            </Boss>
-            <Key on="T" x={203} y={34} w={6} h={14} t={3} className={styles.fW} />
-            <Boss on="T" cx={182} cy={104} r={3.5} t={7} className={styles.fW} />
-            <Boss on="T" cx={190} cy={24} r={11} t={3} className={styles.fW} />
-            <Boss on="T" cx={187} cy={21} r={4.5} t={6} className={styles.fBg} />
-            {/* The arm floats above the record, so its shadow lands a little
-                below it; both swing on the same angle. */}
-            <g transform="translate(-3 -3)">
-              <g data-arm="" transform={calm ? staticArm : undefined} className={styles.shadow}>
-                <line x1="190" y1="24" x2="190" y2="102" strokeWidth={3} />
-                <rect x="185" y="100" width="10" height="12" />
-              </g>
-            </g>
-            <g transform="translate(-9 -9)">
-              <g data-arm="" transform={calm ? staticArm : undefined}>
-                <rect x="186" y="3" width="8" height="11" className={styles.fInk} />
-                <line x1="190" y1="24" x2="190" y2="102" strokeWidth={3} />
-                <line x1="190" y1="24" x2="190" y2="102" strokeWidth={1.2} className={cn(styles.sBg, styles.solid)} />
-                <rect x="185" y="100" width="10" height="12" className={styles.fInk} />
-              </g>
-            </g>
-            <Key on="T" x={12} y={108} w={16} h={12} t={2} className={styles.fInk}>
-              <text x="20" y="116.4" fontSize={5.5} fontWeight={700} textAnchor="middle" className={cn(styles.txBg, styles.mono)}>33</text>
-            </Key>
-            <Key on="T" x={32} y={108} w={16} h={12} t={2} className={styles.fBg}>
-              <text x="40" y="116.4" fontSize={5.5} fontWeight={700} textAnchor="middle" className={cn(styles.tx, styles.mono)}>45</text>
-            </Key>
-            {/* The pilot lamp: lit while the platter turns. */}
-            <Lamp cx={57} cy={114} r={2.4} lit={live} glow={paint.glow} />
-          </Face>
-          <path d={AXO.tt.sil} strokeWidth={1.5} className={styles.solid} />
-          {AXO.hinges.map((h, i) => <Box key={i} block={h} />)}
+                <g data-spin={SPIN_PLATTER}>
+                  <line x1="0" y1="-17" x2="0" y2="-7" strokeWidth={1.8} className={cn(styles.sBg, styles.solid)} />
+                  <line x1="0" y1="-53" x2="0" y2="-45" strokeWidth={1.4} className={styles.solid} />
+                </g>
+                <circle r="2" className={cn(styles.fInk, styles.ns)} />
+              </Boss>
+              <Key on="T" x={203} y={34} w={6} h={14} t={3} className={styles.fW} />
+              <Boss on="T" cx={182} cy={104} r={3.5} t={7} className={styles.fW} />
+              <Boss on="T" cx={190} cy={24} r={11} t={3} className={styles.fW} />
+              <Boss on="T" cx={187} cy={21} r={4.5} t={6} className={styles.fBg} />
+              <Tonearm phase={phase} calm={calm} />
+              <Key on="T" x={12} y={108} w={16} h={12} t={2} className={styles.fInk}>
+                <text x="20" y="116.4" fontSize={5.5} fontWeight={700} textAnchor="middle" className={cn(styles.txBg, styles.mono)}>33</text>
+              </Key>
+              <Key on="T" x={32} y={108} w={16} h={12} t={2} className={styles.fBg}>
+                <text x="40" y="116.4" fontSize={5.5} fontWeight={700} textAnchor="middle" className={cn(styles.tx, styles.mono)}>45</text>
+              </Key>
+              {/* The pilot lamp: lit while the platter turns. */}
+              <Lamp cx={57} cy={114} r={2.4} lit={live} />
+            </Face>
+            <path d={AXO.tt.sil} strokeWidth={1.5} className={styles.solid} />
+            {AXO.hinges.map((h, i) => <Box key={i} block={h} />)}
 
-          <Speaker block={AXO.spR} shade={paint.shade} />
-        </g>
+            <Speaker block={AXO.spR} />
+          </g>
 
-        {/* The inked layer: sound lines, and notes only where they help. */}
-        <g filter={`url(#${wobId})`} className={styles.ink} strokeWidth={mob ? 1.6 : 1.3} aria-hidden="true">
-          {AXO.arcs.map(([s, k]) => (
-            <path
-              key={`${s}:${k}`}
-              data-arc={`${s}:${k}`}
-              d={calm ? arcPath(s, k, staticEnergy) : undefined}
-              opacity={calm ? arcOpacity(k, staticEnergy) : undefined}
-            />
-          ))}
-          {standby && <path d={AXO.loopPower} />}
-          {standby && !mob && (
-            <>
-              <path d={AXO.arrowPress} />
-              <text x="-238" y="212" fontSize={22} fontWeight={600} className={cn(styles.txAcc, styles.display)}>
-                press to listen
-              </text>
-            </>
-          )}
-          {live && muted && !mob && (
-            <>
-              <path d={AXO.loopMute} />
-              <path d={AXO.arrowMute} />
-              <text x="-226" y="196" fontSize={18} fontWeight={600} className={cn(styles.txAcc, styles.display)}>
-                you’re muted
-              </text>
-            </>
-          )}
-          {phase === 'offline' && <path d={AXO.crossLcd} />}
-          {live && talk && (
-            <g transform={mob ? 'translate(250 -330) rotate(-8) scale(0.9)' : 'translate(258 -322) rotate(-8)'}>
-              <rect x="-54" y="-18" width="108" height="36" strokeWidth={1.6} />
-              <rect x="-49" y="-13" width="98" height="26" strokeWidth={0.6} />
-              <text y="6" fontSize={15} fontWeight={700} letterSpacing="0.22em" textAnchor="middle" className={cn(styles.txAcc, styles.mono)}>
-                ON AIR
-              </text>
-              <text y="40" fontSize={15} fontWeight={600} textAnchor="middle" className={cn(styles.txAcc, styles.display)}>
-                — {djName}
-              </text>
-            </g>
-          )}
-        </g>
+          {/* The inked layer: the sound coming off the speakers, and the ON
+              AIR stamp while the DJ is on the mic. */}
+          <g className={styles.ink} strokeWidth={mob ? 1.6 : 1.3} aria-hidden="true">
+            {AXO.arcs.map(([s, k]) => (
+              <path
+                key={`${s}:${k}`}
+                data-arc={`${s}:${k}`}
+                d={calm ? arcPath(s, k, staticEnergy) : undefined}
+                opacity={calm ? arcOpacity(k, staticEnergy) : undefined}
+              />
+            ))}
+            {live && talk && (
+              <OnAirStamp djName={djName} transform={mob ? 'translate(250 -330) rotate(-8) scale(0.9)' : 'translate(258 -322) rotate(-8)'} />
+            )}
+          </g>
+        </PaintCtx.Provider>
 
         {/* With the tune-in overlay up, a tap anywhere on the drawing tunes in
             (oversized, so a letterboxed frame's margins count too). It sits
@@ -740,30 +722,123 @@ export default function AxoScene(props: AxoSceneProps) {
       </svg>
     </div>
   );
+});
+
+/** The dial's needle, where the song has got to. While tuning in the loop
+ *  sweeps it, and React leaves its x alone. */
+function DialNeedle({ phase, calm }: { phase: ListenPhase; calm: boolean }) {
+  const { ratio } = useContext(TickCtx);
+  const live = phase === 'live';
+  const connecting = phase === 'connecting';
+  const x = (16 + 104 * (live ? (ratio ?? 0.5) : connecting ? 0.5 : 0)).toFixed(2);
+  const owned = calm || !connecting;
+  return (
+    <line
+      data-needle=""
+      x1={owned ? x : undefined}
+      x2={owned ? x : undefined}
+      y1="10"
+      y2="38"
+      strokeWidth={1.6}
+      className={cn(styles.sAcc, styles.solid)}
+    />
+  );
 }
 
-/** Ids of the scene's gradients, unique per mounted scene: desktop and
- *  mobile both render, so a fixed id would collide. */
-interface PaintIds { shade: string; fall: string; dropX: string; dropY: string; glow: string }
+/** The tape counter, in its window. */
+function Counter() {
+  const { counter } = useContext(TickCtx);
+  return (
+    <text x="156" y="18" fontSize={8} fontWeight={700} letterSpacing="0.06em" textAnchor="middle" className={cn(styles.txBg, styles.mono)}>
+      {counter}
+    </text>
+  );
+}
+
+/** The tape packed on each spool: the left emptying onto the right as the
+ *  song plays. */
+function Spools() {
+  const { ratio } = useContext(TickCtx);
+  const r = ratio ?? 0.5;
+  return (
+    <>
+      <circle cx="44" cy="34" r={(9 + 7 * (1 - r)).toFixed(2)} strokeWidth={0.5} className={styles.fL} />
+      <circle cx="90" cy="34" r={(9 + 7 * r).toFixed(2)} strokeWidth={0.5} className={styles.fL} />
+    </>
+  );
+}
+
+/** The tonearm. It floats above the record, so its shadow lands a little
+ *  below it; both swing on the same angle. The loop owns that angle, and a
+ *  still frame prints it here: an undefined transform is never written, so
+ *  a one-second re-render can't snap a moving arm back. */
+function Tonearm({ phase, calm }: { phase: ListenPhase; calm: boolean }) {
+  const { ratio } = useContext(TickCtx);
+  const pose = phase === 'live' ? 'play' : phase === 'connecting' ? 'cue' : 'rest';
+  const still = calm ? `rotate(${armAngle(pose, ratio)} 190 24)` : undefined;
+  return (
+    <>
+      <g transform="translate(-3 -3)">
+        <g data-arm="" transform={still} className={styles.shadow}>
+          <line x1="190" y1="24" x2="190" y2="102" strokeWidth={3} />
+          <rect x="185" y="100" width="10" height="12" />
+        </g>
+      </g>
+      <g transform="translate(-9 -9)">
+        <g data-arm="" transform={still}>
+          <rect x="186" y="3" width="8" height="11" className={styles.fInk} />
+          <line x1="190" y1="24" x2="190" y2="102" strokeWidth={3} />
+          <line x1="190" y1="24" x2="190" y2="102" strokeWidth={1.2} className={cn(styles.sBg, styles.solid)} />
+          <rect x="185" y="100" width="10" height="12" className={styles.fInk} />
+        </g>
+      </g>
+    </>
+  );
+}
+
+/** The scene's gradients. Light comes from above and a little to the left:
+ *  a side panel deepens toward the back, a top tucked under the shelf above
+ *  darkens toward it, each unit leaves a contact shadow on its shelf, and a
+ *  lit lamp glows. */
+function Paints({ ids }: { ids: PaintIds }) {
+  const lin = (id: string, vertical: boolean, stops: Array<[number, string | undefined]>) => (
+    <linearGradient id={id} x1="0" y1="0" x2={vertical ? 0 : 1} y2={vertical ? 1 : 0}>
+      {stops.map(([o, c]) => <stop key={o} offset={o} className={c} />)}
+    </linearGradient>
+  );
+  return (
+    <>
+      {lin(ids.shade, false, [[0, styles.shade0], [1, styles.shade1]])}
+      {lin(ids.fall, true, [[0, styles.fall0], [1, styles.fall1]])}
+      {lin(ids.dropX, false, [[0, styles.drop0], [1, styles.drop1]])}
+      {lin(ids.dropY, true, [[0, styles.drop0], [1, styles.drop1]])}
+      <radialGradient id={ids.glow}>
+        <stop offset="0" className={styles.glow0} />
+        <stop offset="1" className={styles.glow1} />
+      </radialGradient>
+    </>
+  );
+}
 
 /** One face of a block: its plane, and a rect sized from the block filling it
  *  (top w × d, front-left w × h, front-right d × h), with whatever is drawn
- *  on it laid out in that plane. `shade` lays a gradient over it — a side
- *  panel receding, a top falling into the shadow of the shelf above. */
+ *  on it laid out in that plane. `shade` lays one of the scene's gradients
+ *  over it — a side panel receding, a top falling into the shadow of the
+ *  shelf above. */
 function Face({ of: b, side, className, shade, children }: {
   of: DrawnBlock;
   side: 'T' | 'L' | 'R';
   className?: string;
-  /** Id of the gradient to lay over it. */
-  shade?: string;
+  shade?: PaintKey;
   children?: ReactNode;
 }) {
+  const p = useContext(PaintCtx);
   const width = side === 'R' ? b.d : b.w;
   const height = side === 'T' ? b.d : b.h;
   return (
     <g transform={b[side]}>
       <rect width={width} height={height} className={className} />
-      {shade && <rect width={width} height={height} fill={`url(#${shade})`} className={styles.ns} />}
+      {shade && <rect width={width} height={height} fill={url(p[shade])} className={styles.ns} />}
       {children}
     </g>
   );
@@ -880,10 +955,11 @@ function Well({ id, x, y, w, h, t, className, children }: {
 }
 
 /** An indicator lamp; lit, it throws a little light on the panel round it. */
-function Lamp({ cx, cy, r, lit, glow }: { cx: number; cy: number; r: number; lit: boolean; glow: string }) {
+function Lamp({ cx, cy, r, lit }: { cx: number; cy: number; r: number; lit: boolean }) {
+  const p = useContext(PaintCtx);
   return (
     <>
-      {lit && <circle cx={cx} cy={cy} r={r * 3.2} fill={`url(#${glow})`} className={styles.ns} />}
+      {lit && <circle cx={cx} cy={cy} r={r * 3.2} fill={url(p.glow)} className={styles.ns} />}
       <circle
         cx={cx}
         cy={cy}
@@ -895,6 +971,22 @@ function Lamp({ cx, cy, r, lit, glow }: { cx: number; cy: number; r: number; lit
   );
 }
 
+/** The ON AIR stamp, inked beside the stack, and whose mic it is. */
+function OnAirStamp({ djName, transform }: { djName: string; transform: string }) {
+  return (
+    <g transform={transform}>
+      <rect x="-54" y="-18" width="108" height="36" strokeWidth={1.6} />
+      <rect x="-49" y="-13" width="98" height="26" strokeWidth={0.6} />
+      <text y="6" fontSize={15} fontWeight={700} letterSpacing="0.22em" textAnchor="middle" className={cn(styles.txAcc, styles.mono)}>
+        ON AIR
+      </text>
+      <text y="40" fontSize={15} fontWeight={600} textAnchor="middle" className={cn(styles.txAcc, styles.display)}>
+        — {djName}
+      </text>
+    </g>
+  );
+}
+
 /** The open dust cover, in smoked acrylic: every wall shows through the
  *  others. The panel faces away and is seen from inside, so it takes the
  *  faintest tint; the walls are seen edge-on through more of the plastic,
@@ -903,7 +995,8 @@ function Lamp({ cx, cy, r, lit, glow }: { cx: number; cy: number; r: number; lit
  *  in front of its edges, and it takes the glint's place — those strokes run
  *  straight through the card's rows, and the lit glass reads as glass without
  *  them. */
-function DustCover({ screen, powered, ids }: { screen: LidScreenInfo | null; powered: boolean; ids: ScreenIds }) {
+function DustCover({ powered, ids }: { powered: boolean; ids: ScreenIds }) {
+  const { screen } = useContext(TickCtx);
   const { lid } = AXO;
   return (
     <>
@@ -994,108 +1087,113 @@ function LidScreen({ screen, powered, ids }: { screen: LidScreenInfo; powered: b
             </g>
           </>
         )}
-        {/* Keyed by the song, so a new one flickers on rather than swapping. */}
-        <g key={screen.title} filter={powered ? `url(#${ids.bloom})` : undefined} className={styles.screenIn}>
-          {screen.onAir && <circle cx={x + 2.2} cy={L.eyebrow.y - 2.3} r={2.2} className={cn(styles.fAcc, styles.ns)} />}
-          <text
-            data-fit={screen.onAir ? w - 7 : w}
-            x={screen.onAir ? x + 7 : x}
-            y={L.eyebrow.y}
-            fontSize={ROW.eyebrow.size}
-            fontWeight={700}
-            letterSpacing={`${ROW.eyebrow.tracking}em`}
-            className={cn(styles.txAcc, styles.mono)}
-          >
-            {L.eyebrow.text}
-          </text>
-          {L.title.rows.map(r => (
+        {/* Keyed by the song, so a new one flickers on rather than swapping.
+            The flicker rides a group round the bloom, not the bloomed group
+            itself: restyling a filtered node re-runs its filter in WebKit,
+            and the group's opacity lands after the filter either way. */}
+        <g key={screen.title} className={styles.screenIn}>
+          <g filter={powered ? `url(#${ids.bloom})` : undefined}>
+            {screen.onAir && <circle cx={x + 2.2} cy={L.eyebrow.y - 2.3} r={2.2} className={cn(styles.fAcc, styles.ns)} />}
             <text
-              key={r.y}
-              data-fit={w}
-              x={x}
-              y={r.y}
-              fontSize={L.title.size}
-              fontWeight={800}
-              className={cn(styles.tx, styles.display)}
-            >
-              {r.text}
-            </text>
-          ))}
-          {L.artist && (
-            <text
-              data-fit={w}
-              x={x}
-              y={L.artist.y}
-              fontSize={ROW.artist.size}
+              data-fit={screen.onAir ? w - 7 : w}
+              x={screen.onAir ? x + 7 : x}
+              y={L.eyebrow.y}
+              fontSize={ROW.eyebrow.size}
               fontWeight={700}
-              letterSpacing={`${ROW.artist.tracking}em`}
+              letterSpacing={`${ROW.eyebrow.tracking}em`}
+              className={cn(styles.txAcc, styles.mono)}
+            >
+              {L.eyebrow.text}
+            </text>
+            {L.title.rows.map(r => (
+              <text
+                key={r.y}
+                data-fit={w}
+                x={x}
+                y={r.y}
+                fontSize={L.title.size}
+                fontWeight={800}
+                className={cn(styles.tx, styles.display)}
+              >
+                {r.text}
+              </text>
+            ))}
+            {L.artist && (
+              <text
+                data-fit={w}
+                x={x}
+                y={L.artist.y}
+                fontSize={ROW.artist.size}
+                fontWeight={700}
+                letterSpacing={`${ROW.artist.tracking}em`}
+                className={cn(styles.tx, styles.mono)}
+              >
+                {L.artist.text}
+              </text>
+            )}
+            {L.detail && (
+              <text
+                data-fit={w}
+                x={x}
+                y={L.detail.y}
+                fontSize={ROW.detail.size}
+                fontWeight={500}
+                letterSpacing={`${ROW.detail.tracking}em`}
+                className={cn(styles.txMuted, styles.mono)}
+              >
+                {L.detail.text}
+              </text>
+            )}
+            {Array.from({ length: SEGMENTS }, (_, i) => (
+              <rect
+                key={i}
+                x={round2(L.bar.x + i * pitch)}
+                y={L.bar.y}
+                width={round2(pitch * 0.62)}
+                height={L.bar.h}
+                className={cn(i < lit ? styles.fAcc : styles.seg, styles.ns)}
+              />
+            ))}
+            <text
+              x={x}
+              y={L.timeY}
+              fontSize={ROW.time.size}
+              fontWeight={700}
+              letterSpacing={`${ROW.time.tracking}em`}
               className={cn(styles.tx, styles.mono)}
             >
-              {L.artist.text}
+              {screen.elapsed}
             </text>
-          )}
-          {L.detail && (
             <text
-              data-fit={w}
-              x={x}
-              y={L.detail.y}
-              fontSize={ROW.detail.size}
+              x={right}
+              y={L.timeY}
+              fontSize={ROW.time.size}
               fontWeight={500}
-              letterSpacing={`${ROW.detail.tracking}em`}
+              letterSpacing={`${ROW.time.tracking}em`}
+              textAnchor="end"
               className={cn(styles.txMuted, styles.mono)}
             >
-              {L.detail.text}
+              {screen.duration.toUpperCase()}
             </text>
-          )}
-          {Array.from({ length: SEGMENTS }, (_, i) => (
-            <rect
-              key={i}
-              x={round2(L.bar.x + i * pitch)}
-              y={L.bar.y}
-              width={round2(pitch * 0.62)}
-              height={L.bar.h}
-              className={cn(i < lit ? styles.fAcc : styles.seg, styles.ns)}
-            />
-          ))}
-          <text
-            x={x}
-            y={L.timeY}
-            fontSize={ROW.time.size}
-            fontWeight={700}
-            letterSpacing={`${ROW.time.tracking}em`}
-            className={cn(styles.tx, styles.mono)}
-          >
-            {screen.elapsed}
-          </text>
-          <text
-            x={right}
-            y={L.timeY}
-            fontSize={ROW.time.size}
-            fontWeight={500}
-            letterSpacing={`${ROW.time.tracking}em`}
-            textAnchor="end"
-            className={cn(styles.txMuted, styles.mono)}
-          >
-            {screen.duration.toUpperCase()}
-          </text>
-          {L.foot?.kind === 'next' && (
-            <text
-              data-fit={w}
-              x={x}
-              y={L.foot.y}
-              fontSize={ROW.next.size}
-              letterSpacing={`${ROW.next.tracking}em`}
-              className={styles.mono}
-            >
-              <tspan fontWeight={700} className={styles.txAcc}>NEXT</tspan>
-              <tspan dx="4" fontWeight={500} className={styles.tx}>{L.foot.text}</tspan>
-            </text>
-          )}
-          {L.foot?.kind === 'quote' && (
-            <text data-fit={w} x={x} y={L.foot.y} fontSize={ROW.quote.size} fontWeight={500} className={cn(styles.tx, styles.display)}>
-              {L.foot.text}
-            </text>
-          )}
+            {L.foot?.kind === 'next' && (
+              <text
+                data-fit={w}
+                x={x}
+                y={L.foot.y}
+                fontSize={ROW.next.size}
+                letterSpacing={`${ROW.next.tracking}em`}
+                className={styles.mono}
+              >
+                <tspan fontWeight={700} className={styles.txAcc}>NEXT</tspan>
+                <tspan dx="4" fontWeight={500} className={styles.tx}>{L.foot.text}</tspan>
+              </text>
+            )}
+            {L.foot?.kind === 'quote' && (
+              <text data-fit={w} x={x} y={L.foot.y} fontSize={ROW.quote.size} fontWeight={500} className={cn(styles.tx, styles.display)}>
+                {L.foot.text}
+              </text>
+            )}
+          </g>
         </g>
       </g>
       <path d={GLASS_CORNERS} strokeWidth={0.9} className={cn(powered && styles.sAcc, powered && styles.solid)} />
@@ -1103,13 +1201,15 @@ function LidScreen({ screen, powered, ids }: { screen: LidScreenInfo; powered: b
   );
 }
 
-function Speaker({ block, shade }: { block: DrawnBlock; shade: string }) {
+/** A floor-standing speaker: the cabinet, a bevel round its baffle and its
+ *  top, and the drivers set in the baffle. */
+function Speaker({ block }: { block: DrawnBlock }) {
   return (
     <>
       <Face of={block} side="T" className={styles.fBg}>
         <rect x="8" y="8" width="64" height="84" strokeWidth={0.4} opacity={0.6} />
       </Face>
-      <Face of={block} side="R" className={styles.fR} shade={shade} />
+      <Face of={block} side="R" className={styles.fR} shade="shade" />
       <Face of={block} side="L" className={styles.fL}>
         <rect x="6" y="6" width="68" height="238" strokeWidth={0.4} />
         {/* Each driver: a surround standing off the baffle, and the cone
@@ -1145,12 +1245,13 @@ function Speaker({ block, shade }: { block: DrawnBlock; shade: string }) {
 
 /** A shelf, with the contact shadow of the unit standing on it along the
  *  strips of it that show: in front of the unit and to its right. */
-function Shelf({ block, paint }: { block: DrawnBlock; paint: PaintIds }) {
+function Shelf({ block }: { block: DrawnBlock }) {
+  const p = useContext(PaintCtx);
   return (
     <>
       <Face of={block} side="T" className={styles.fBg}>
-        <rect x="10" y="142" width="220" height="6" fill={`url(#${paint.dropY})`} className={styles.ns} />
-        <rect x="230" y="10" width="6" height="138" fill={`url(#${paint.dropX})`} className={styles.ns} />
+        <rect x="10" y="142" width="220" height="6" fill={url(p.dropY)} className={styles.ns} />
+        <rect x="230" y="10" width="6" height="138" fill={url(p.dropX)} className={styles.ns} />
       </Face>
       <Face of={block} side="L" className={styles.fL} />
       <Face of={block} side="R" className={styles.fR} />
@@ -1170,10 +1271,10 @@ function Post({ block }: { block: DrawnBlock }) {
 
 /** A shelf, then the back post segments standing on it — before the unit it
  *  carries, which hides most of them. */
-function Bay({ level, paint }: { level: RackLevel; paint: PaintIds }) {
+function Bay({ level }: { level: RackLevel }) {
   return (
     <>
-      <Shelf block={level.shelf} paint={paint} />
+      <Shelf block={level.shelf} />
       {level.back.map((p, i) => <Post key={i} block={p} />)}
     </>
   );
@@ -1184,6 +1285,8 @@ function Posts({ of: level }: { of: RackLevel }) {
   return level.front.map((p, i) => <Post key={i} block={p} />);
 }
 
+/** A cassette hub: three spokes in a ring. Only the spokes turn; the ring
+ *  looks the same at any angle. */
 function Reel({ cx }: { cx: number }) {
   return (
     <>
@@ -1191,8 +1294,8 @@ function Reel({ cx }: { cx: number }) {
       <g transform={`translate(${cx} 34)`}>
         <g data-spin={SPIN_REEL}>
           <path d="M0 -3V-7M2.6 1.5L6.06 3.5M-2.6 1.5L-6.06 3.5" strokeWidth={1.2} className={styles.solid} />
-          <circle r="3" strokeWidth={0.8} />
         </g>
+        <circle r="3" strokeWidth={0.8} />
       </g>
     </>
   );

@@ -21,6 +21,7 @@ import {
   LOUDNESS_TARGET_LUFS_BOUNDS,
   normalizeGeminiSafety,
   type JingleRotateOwner,
+  type JinglePlacement,
 } from '../schemas/settings.js';
 import { SHOW_MAX_TRACK_SECONDS, SHOW_MIN_TRACK_LENGTH_MAX } from '../schemas/show.js';
 import { DEFAULT_THEME_ID } from '../themes.js';
@@ -39,6 +40,7 @@ import {
 } from './vocab.js';
 
 export const DEFAULTS = {
+  jinglePlacement: 'between' as JinglePlacement,
   jingleRatio: 30, // 1 jingle per N music tracks
   // WHO counts those tracks (#1619). 'mixer' is the pre-existing station —
   // radio.liq's own rotate draws the stinger and the controller finds out
@@ -727,8 +729,8 @@ export const DEFAULTS = {
   },
   // Dead-air trim — cut near-silent runs off the head/tail of a track so a bad
   // rip's leading blank or a long mastering gap doesn't air as silence
-  // (music/silence-trim.ts stamps liq_cue_in / liq_cue_out; radio.liq's
-  // cue_cut does the cutting). OFF by default: it acts on a MEASUREMENT, and
+  // (music/silence-trim.ts stamps liq_cue_in / liq_cue_out; Liquidsoap cuts
+  // at request resolution). OFF by default: it acts on a MEASUREMENT, and
   // an upgrade must sound byte-identical until the operator asks for this.
   // Controller-side only — no mixer restart.
   silenceTrim: {
@@ -807,6 +809,19 @@ export const DEFAULTS = {
     influenceDj: false,
     maxTracks: 10,
     windowDays: 30, // 0 = all time
+  },
+
+  // The listener Lyrics panel (`GET /lyrics/current`). On out of the box, and
+  // an upgrade turns it on too: it republishes lyric text publicly and costs a
+  // music-server call per track, which an operator can switch off. Per-track
+  // timing fixes live in library.db, not here.
+  lyrics: {
+    enabled: true,
+    // Look up synced lyrics on LRCLIB for a queued or on-air track the music
+    // server has no timed lyrics for (music/lyrics-sources.ts). On by default
+    // with the panel: it sends each such track's artist, title, album and
+    // length to lrclib.net (or LRCLIB_URL), and acts only while the panel is on.
+    lrclib: true,
   },
 };
 

@@ -1,20 +1,50 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import dynamic from 'next/dynamic';
 import * as Dialog from '@radix-ui/react-dialog';
-import { Palette } from 'lucide-react';
+import { Palette, Zap } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { resolveFont, type Theme } from '@/lib/theme';
 import { useDynamicStyle } from '../hooks/useDynamicStyle';
+import { useLiteMode } from '../hooks/useLiteMode';
 import { useThemeSwitcher } from './ThemeProvider';
 import { useSkinSelection } from './skins/SkinContext';
 
 // The skin miniatures only matter once the menu is open, so they load with it
 // rather than riding every skin's first paint; hovering or focusing the trigger
-// starts the fetch early.
-const SkinPreview = dynamic(() => import('./skins/SkinPreview'));
-const prefetchSkinPreview = () => { void import('./skins/SkinPreview'); };
+// starts the fetch early. Loaded by hand, not through next/dynamic: its lazy
+// component suspends on the first render that meets it however warm the chunk
+// is, and with `ssr` on and no `loading` it brings no Suspense boundary of its
+// own — so the first open suspended the whole player. The face blanked, sat
+// hidden through React's reveal throttle (~300ms) and remounted its effects.
+type SkinPreviewComponent = typeof import('./skins/SkinPreview').default;
+let skinPreview: SkinPreviewComponent | null = null;
+let skinPreviewLoad: Promise<SkinPreviewComponent> | null = null;
+function loadSkinPreview(): Promise<SkinPreviewComponent> {
+  skinPreviewLoad ??= import('./skins/SkinPreview').then(
+    m => (skinPreview = m.default),
+    err => {
+      skinPreviewLoad = null;
+      throw err;
+    },
+  );
+  return skinPreviewLoad;
+}
+const prefetchSkinPreview = () => { loadSkinPreview().catch(() => {}); };
+
+// Each specimen tile sets its theme's display face, and next/font fetches a face
+// only once something uses it — so the first open after a load fetched five or
+// six at once, blanked their text for the block period and reflowed when they
+// landed. Every later open was smooth. A stack names its faces through the
+// next/font variables, which `document.fonts.load` can't read, so they resolve
+// against <html> first.
+function warmDisplayFonts(fontIds: string[]) {
+  const root = getComputedStyle(document.documentElement);
+  for (const id of new Set(fontIds)) {
+    const stack = resolveFont(id).replace(/var\((--[\w-]+)\)/g, (_, name: string) => root.getPropertyValue(name).trim() || 'serif');
+    void document.fonts.load(`22px ${stack}`).catch(() => {});
+  }
+}
 
 // A theme as a type specimen: its own paper, ink and display face, with the
 // accent as a stripe along the foot. The colours are scoped to this one tile, so
@@ -92,13 +122,15 @@ function SectionHead({ label, overridden, stationName, resetLabel, followingLabe
 export interface ThemeSwitcherProps {
   /** Trigger button text styling, so it picks up the right cluster's font. */
   variant?: 'player' | 'admin';
+  /** Extra classes for the trigger, e.g. a skin's alignment nudge. */
+  className?: string;
 }
 
-// Per-listener theme + skin switcher; picks persist in localStorage and beat the
-// station-wide defaults until reset. Modal rather than a dropdown so it reads the
+// Per-listener theme + skin switcher, plus this browser's lite-mode toggle; picks
+// persist in localStorage and beat the station-wide defaults until reset. Modal rather than a dropdown so it reads the
 // same on every skin — an anchored popover collided with each skin's own chrome.
 // Renders nothing while the registry is loading or empty.
-export default function ThemeSwitcher({ variant = 'player' }: ThemeSwitcherProps) {
+export default function ThemeSwitcher({ variant = 'player', className }: ThemeSwitcherProps) {
   const ctx = useThemeSwitcher();
   // Skin selection only exists inside a PlayerShell; the admin variant gets null
   // and hides the section, as does a build shipping a single skin.
@@ -107,12 +139,42 @@ export default function ThemeSwitcher({ variant = 'player' }: ThemeSwitcherProps
   const [open, setOpen] = useState(false);
   const [peekTheme, setPeekTheme] = useState<string | null>(null);
   const [peekSkin, setPeekSkin] = useState<string | null>(null);
+  const [, setPreviewLoaded] = useState(false);
   const activeChipRef = useRef<HTMLButtonElement>(null);
+  const { lite, setLite } = useLiteMode();
+
+  // Opened before the warm-up below landed: the cards draw empty and fill in
+  // when the chunk arrives, without suspending anything around them.
+  useEffect(() => {
+    if (!open || !showSkins || skinPreview) return;
+    let live = true;
+    loadSkinPreview().then(() => { if (live) setPreviewLoaded(true); }, () => {});
+    return () => { live = false; };
+  }, [open, showSkins]);
 
   // A custom theme can push the pick past the strip's visible end.
   useEffect(() => {
     if (open) activeChipRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }, [open]);
+
+  // Warm what the first open would otherwise fetch mid-animation — the
+  // miniatures' chunk and the specimens' faces — once the page is idle, so the
+  // first open runs like every later one. Keyed by the face list rather than the
+  // registry array, which the theme poll replaces.
+  const specimenFonts = ctx?.themes.map(t => t.tokens['--display-font'] ?? 'fraunces').join(',') ?? '';
+  useEffect(() => {
+    if (!specimenFonts) return;
+    const warm = () => {
+      if (showSkins) prefetchSkinPreview();
+      warmDisplayFonts(specimenFonts.split(','));
+    };
+    if (typeof requestIdleCallback === 'function') {
+      const handle = requestIdleCallback(warm, { timeout: 4000 });
+      return () => cancelIdleCallback(handle);
+    }
+    const handle = setTimeout(warm, 2000);
+    return () => clearTimeout(handle);
+  }, [specimenFonts, showSkins]);
 
   if (!ctx || ctx.themes.length === 0) return null;
 
@@ -120,6 +182,7 @@ export default function ThemeSwitcher({ variant = 'player' }: ThemeSwitcherProps
   const shownTheme = themes.find(t => t.id === peekTheme) ?? themes.find(t => t.id === effectiveId);
   const shownSkin = skinCtx?.skins.find(s => s.id === peekSkin)
     ?? skinCtx?.skins.find(s => s.id === skinCtx.effectiveId);
+  const SkinPreview = skinPreview;
 
   return (
     <Dialog.Root
@@ -144,6 +207,7 @@ export default function ThemeSwitcher({ variant = 'player' }: ThemeSwitcherProps
             variant === 'admin'
               ? 'caption min-h-9 min-w-9 text-muted sm:min-h-0 sm:min-w-0'
               : 'text-muted hover:text-ink',
+            className,
           )}
         >
           <Palette className="h-4 w-4" aria-hidden="true" />
@@ -158,8 +222,10 @@ export default function ThemeSwitcher({ variant = 'player' }: ThemeSwitcherProps
             'v3-modal-pop fixed top-1/2 left-1/2 z-50 flex flex-col border border-ink bg-bg text-ink shadow-drawer outline-none',
             '-translate-x-1/2 -translate-y-1/2',
             // Four skin cards a row want the room; the admin's theme strip alone
-            // doesn't. Clamped to the viewport either way.
-            'max-h-[calc(100vh-3rem)]',
+            // doesn't. Clamped to the viewport either way: dvh, not vh, because
+            // mobile vh counts the space under the browser's toolbars and the
+            // centred box overflowed both edges.
+            'max-h-[calc(100dvh-2rem)]',
             showSkins ? 'w-[min(760px,calc(100vw-2rem))]' : 'w-[min(560px,calc(100vw-2rem))]',
           )}
         >
@@ -280,7 +346,7 @@ export default function ThemeSwitcher({ variant = 'player' }: ThemeSwitcherProps
                             isActive ? 'border-vermilion bg-[var(--accent-soft)]' : 'border-ink bg-field',
                           )}
                         >
-                          <SkinPreview id={s.id} />
+                          {SkinPreview && <SkinPreview id={s.id} />}
                         </span>
                         <span className="flex min-w-0 items-center gap-1.5 px-2 py-1.5">
                           {isActive && (
@@ -305,6 +371,43 @@ export default function ThemeSwitcher({ variant = 'player' }: ThemeSwitcherProps
                 {shownSkin && <Readout name={shownSkin.name} description={shownSkin.description} />}
               </section>
             )}
+
+            {/* Lite mode belongs to this browser, not the station, so its heading
+                carries no reset. The menu stays open so the listener sees the
+                blur and motion drop away behind it. */}
+            <section className="grid gap-1.5">
+              <div className="border-b border-soft-border px-1 pb-1">
+                <span className="v3-eyebrow text-[10px] tracking-[0.3em]">Performance</span>
+              </div>
+              <button
+                type="button"
+                aria-pressed={lite}
+                onClick={() => setLite(!lite)}
+                className={cn(
+                  'v3-focus mx-1 mt-1.5 flex cursor-pointer items-center gap-2.5 border px-3 py-2 text-left transition-colors duration-150',
+                  lite
+                    ? 'border-vermilion bg-[var(--accent-soft)]'
+                    : 'border-ink bg-bg hover:bg-[var(--overlay)]',
+                )}
+              >
+                <Zap className={cn('h-4 w-4 shrink-0', lite ? 'text-vermilion' : 'text-muted')} aria-hidden="true" />
+                <span className="grid min-w-0 flex-1 gap-0.5">
+                  <span className="truncate text-[10px] font-bold tracking-[0.14em] uppercase">Lite mode</span>
+                  <span className="truncate text-[10px] leading-[1.3] text-muted">
+                    Drops blur and animation, for low-power screens
+                  </span>
+                </span>
+                <span
+                  className={cn(
+                    'shrink-0 font-mono text-[9px] font-bold tracking-[0.2em] uppercase',
+                    lite ? 'text-vermilion' : 'text-muted',
+                  )}
+                  aria-hidden="true"
+                >
+                  {lite ? 'On' : 'Off'}
+                </span>
+              </button>
+            </section>
           </div>
         </Dialog.Content>
       </Dialog.Portal>

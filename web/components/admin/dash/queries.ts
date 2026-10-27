@@ -8,6 +8,7 @@ import {
   type ConnectionsState,
   type DashStatus,
   type HealthStats,
+  type NowPlayingFile,
   type QueueState,
   type RequestEntry,
 } from './types';
@@ -27,6 +28,9 @@ export const dashKeys = {
   takeoverWindow: () => ['dash', 'takeover', 'window'] as const,
   navidrome: () => ['dash', 'banner', 'navidrome'] as const,
   musicStarved: () => ['dash', 'banner', 'music-starved'] as const,
+  // Keyed by the track the request names (?id=): the format of one file never
+  // changes, so a known one is fetched once per track.
+  nowPlayingFile: (id: string) => ['dash', 'now-playing-file', id] as const,
 };
 
 async function degradedJson<T>(request: Promise<T>): Promise<T | null> {
@@ -196,4 +200,8 @@ export function fetchNavidromeStatus(fetcher: AdminFetch, signal: AbortSignal): 
 export async function fetchMusicStarved(fetcher: AdminFetch, signal: AbortSignal): Promise<boolean> {
   const body = await adminJson<{ musicStarved?: boolean }>(fetcher, '/state', undefined, signal);
   return body.musicStarved === true;
+}
+
+export function fetchNowPlayingFile(fetcher: AdminFetch, id: string, signal: AbortSignal): Promise<NowPlayingFile> {
+  return adminJson(fetcher, `/now-playing/file?id=${encodeURIComponent(id)}`, undefined, signal);
 }

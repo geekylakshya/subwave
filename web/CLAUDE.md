@@ -8,6 +8,7 @@ Next.js App Router + Tailwind. Read [`DEPENDENCIES.md`](DEPENDENCIES.md) before 
 - A skin consumes only the core contexts, the shared hooks and `StationClient`. It renders the tune-in gate through `useTuneInGate`, honours the theme tokens, and co-locates its styles. Never add skin styles to `globals.css`; the two classic blocks still there are debt.
 - The shell's `<audio>` carries `ref={attachAudio}`, never the plain `audioRef`. The private-station gate remounts it mid-session, and an object ref leaves the new node with no listeners (#1232).
 - Player and skin fetches go through `lib/stationClient.ts`; install-level calls (themes, onboarding) use `defaultStationClient`. `PlayerPageEffects.tsx` (first-run redirect, audience beacon) mounts only on `/` and `/listen`, never in a showcase embed.
+- The TTY skin draws every picture (focus-mode scenes, the scope, the ASCII cover) as characters on one grid painted by `skins/tty/term/AsciiCanvas.tsx`. A drawing names a palette ramp and an intensity, never a colour (`term/palette.ts`), so the same scene works on dark and light themes; block, box, braille and scan-line glyphs are drawn as geometry (`term/glyphs.ts`); and focus mode's card owns the bottom-left, so a scene keeps its focal point right of centre (`scenes/kit.ts`). iPad Safari is the budget: its canvas is CPU-drawn and iOS caps canvas memory, failing silently past it, so the painter blits only changed cells (`term/damage.ts`) from an atlas that grows on demand (`term/atlas.ts`) and zeroes every canvas on unmount.
 - Listeners never get a skip: `PlayerCore.tsx` passes `useMediaSession` no `onSkip`, so a stray AirPods double-tap can't skip for everyone.
 - MP3 is the floor. `hooks/usePlayer.ts` upgrades to Opus only when three things hold: the station's `stream.opusEnabled` is explicitly `true`, `canPlayType` says `'probably'`, and the browser is neither iOS nor Firefox (both break on chained Ogg at a crossfade). The upgrade lands on the next `tune()`, never on a playing element, and an Opus error pins MP3 for the session.
 
@@ -37,6 +38,8 @@ Next.js App Router + Tailwind. Read [`DEPENDENCIES.md`](DEPENDENCIES.md) before 
 ## Drawings
 
 - The isometric kit (`components/iso/`) is shared by AXO, Platter and the landing and admin figures. Construction lines mean not built, not checked or nothing yet; ink means real. A figure's resting CSS is its finished still frame: motion layers on only under `prefers-reduced-motion: no-preference`, and `html.lite` kills it. Words a reader needs go in HTML beside the drawing, never in SVG text.
+- An SVG `filter` on a perfectly vertical or horizontal line has a zero-width box, so its default filter region is empty and the line vanishes. Glow such a line with a wider, fainter stroke beneath it.
+- A canvas or WebGL drawing reads theme colours through `lib/theme-rgb.ts` (`readThemeRgb` + `watchTheme`), never a hex literal. The Observatory galaxy names tones, and `observatory/palette.ts` turns them into the live theme's night sky, ramp and labels.
 - The landing "Press Run" plates (`lib/press-run-plates.ts`) are screenshots. When a skin's look changes, re-capture them against a running station with `cd web && npm i --no-save playwright sharp && npx tsx scripts/capture-gallery.mjs`.
 
 <!-- BEGIN:nextjs-agent-rules -->

@@ -36,6 +36,7 @@ import {
   trackMeta,
   turnClock,
 } from '../shared';
+import { CAP_CENTRE, CAP_CENTRE_16 } from '../capCentre';
 import { useDjOnAir, useRequestSlip, useSkinMotion, useTrackLike, useVolumeNudge } from '../sharedHooks';
 import type { SkinProps } from '../types';
 
@@ -77,18 +78,23 @@ const LABEL_CUT = {
 };
 
 /** Sized to fill its square container so it scales fluidly; reused (parked,
- *  not playing) inside the tune-in gate. */
+ *  not playing) inside the tune-in gate. The arm reads --pf, set on the arm
+ *  itself. */
 function Deck({
   playing,
+  ratio = null,
   stationName,
   title,
   artist,
 }: {
   playing: boolean;
+  ratio?: number | null;
   stationName: string;
   title: string;
   artist: string;
 }) {
+  const armRef = useRef<SVGSVGElement | null>(null);
+  useDynamicStyle(armRef, { '--pf': ratio ?? 0 });
   return (
     <div className="[container-type:inline-size] relative aspect-square w-[min(52vw,29vh,210px)] lg:w-[min(42vw,72vh,520px)]">
       <div
@@ -134,6 +140,7 @@ function Deck({
 
       {/* Match the pivot at 86% 19% to .arm transform-origin in Platter.module.css. */}
       <svg
+        ref={armRef}
         viewBox="0 0 100 100"
         className={cn(
           'pointer-events-none absolute inset-0 h-full w-full overflow-visible',
@@ -207,9 +214,12 @@ export default function PlatterSkin(_props: SkinProps) {
     [setVolume],
   );
 
-  // Progress + volume fills ride CSS vars, never an inline style attr.
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  useDynamicStyle(rootRef, { '--pf': ratio ?? 0, '--vf': volume });
+  // Progress and volume ride CSS vars (never an inline style attr), each set
+  // on the element whose children read it: on the skin's root, the progress
+  // var's change every second restyled the whole skin.
+  const progRef = useRef<HTMLDivElement | null>(null);
+  useDynamicStyle(progRef, { '--pf': ratio ?? 0 });
+  useDynamicStyle(faderRef, { '--vf': volume });
 
   const slip = useRequestSlip({
     sent: 'Slip on the platter — the booth has your note.',
@@ -289,16 +299,19 @@ export default function PlatterSkin(_props: SkinProps) {
   ) : null;
 
   return (
-    <div ref={rootRef} className="absolute inset-0 flex flex-col overflow-hidden bg-bg font-sans text-ink">
+    <div className="absolute inset-0 flex flex-col overflow-hidden bg-bg font-sans text-ink">
       <div className="flex flex-none items-center justify-between gap-x-6 border-b border-ink px-5 py-3 sm:px-8">
         <div className="flex min-w-0 items-center gap-3">
           <span className="flex-none text-[15px] font-extrabold tracking-[0.14em]">{stationName.toUpperCase()}</span>
         </div>
-        <div className="flex shrink-0 items-center gap-3">
-          <div className="hidden items-center gap-3 font-mono text-[11px] tracking-[0.16em] uppercase md:flex">
+        {/* One baseline for the run; the icons sit on its cap centre. The run
+            is hidden below md, so the palette's nudge (CAP_CENTRE_16) starts there
+            too — alone, it centres as a box. */}
+        <div className="flex shrink-0 items-baseline gap-3 font-mono text-[11px]">
+          <div className="hidden items-baseline gap-3 tracking-[0.16em] uppercase md:flex">
             {showName && (
-              <span className="flex min-w-0 items-center gap-1.5">
-                <Play className="size-2.5 flex-none fill-current" />
+              <span className="flex min-w-0 items-baseline gap-1.5">
+                <Play className={cn('size-2.5 flex-none fill-current', CAP_CENTRE)} />
                 <span className="max-w-[22vw] truncate">{showName}</span>
               </span>
             )}
@@ -315,6 +328,7 @@ export default function PlatterSkin(_props: SkinProps) {
             title={focusOn ? 'Show the column (F)' : 'Focus — fold the column away (F)'}
             className={cn(
               'v3-focus hidden shrink-0 cursor-pointer items-center justify-center border-0 bg-transparent p-0 leading-none lg:inline-flex',
+              CAP_CENTRE_16,
               focusOn ? 'text-[var(--accent)]' : 'text-muted hover:text-ink',
             )}
           >
@@ -322,7 +336,7 @@ export default function PlatterSkin(_props: SkinProps) {
               ? <PanelRightOpen className="size-4" aria-hidden="true" />
               : <PanelRightClose className="size-4" aria-hidden="true" />}
           </button>
-          <ThemeSwitcher />
+          <ThemeSwitcher className="md:-my-2 md:translate-y-[calc(50%-0.5cap)]" />
         </div>
       </div>
 
@@ -342,7 +356,7 @@ export default function PlatterSkin(_props: SkinProps) {
             <div className={cn('absolute inset-x-6 top-12 bottom-6', stageMoves && styles.stageIn)}>{isoDeck}</div>
           ) : (
             <div className="flex w-full items-center justify-center pt-8 lg:contents">
-              <Deck playing={playing} stationName={stationName} title={title} artist={artist} />
+              <Deck playing={playing} ratio={ratio} stationName={stationName} title={title} artist={artist} />
             </div>
           )}
 
@@ -499,7 +513,7 @@ export default function PlatterSkin(_props: SkinProps) {
 
           <div className="flex items-center gap-3">
             <span className="font-mono text-[13px] font-bold tabular-nums">{fmtTime(elapsed)}</span>
-            <div className="relative h-[6px] flex-1 bg-[color-mix(in_oklab,var(--ink)_14%,var(--bg))]">
+            <div ref={progRef} className="relative h-[6px] flex-1 bg-[color-mix(in_oklab,var(--ink)_14%,var(--bg))]">
               <div className={cn('absolute inset-y-0 left-0 bg-[var(--accent)]', ratio == null ? 'w-full opacity-40' : styles.progFill)} />
               {ratio != null && <div className={cn('absolute top-[-5px] h-[13px] w-[3px] bg-ink', styles.progHead)} />}
             </div>

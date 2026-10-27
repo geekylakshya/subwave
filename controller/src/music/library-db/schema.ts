@@ -470,16 +470,59 @@ export async function migrate(embeddingDim: number, reseed = false, adoptStoredD
   }
 
   if (userVersion < 30) {
+    // The operator's lyric timing correction, one per track (lyrics.ts). A
+    // property of the track's lyric file, so it is station-wide and keyed on the
+    // track alone; id-adoption.ts carries it across an ID rotation like plays.
+    runDdl(d, `
+      CREATE TABLE IF NOT EXISTS lyric_offsets (
+        track_id   TEXT PRIMARY KEY,
+        offset_ms  INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    d.pragma('user_version = 30');
+  }
+
+  if (userVersion < 31) {
+    // What LRCLIB answered for a track the music server has no timed lyrics
+    // for (music/lyrics-sources.ts). A row with neither body is a stored miss,
+    // so a track is asked about again only once its checked_at is old enough.
+    // id-adoption.ts carries it across an ID rotation like the offsets.
+    runDdl(d, `
+      CREATE TABLE IF NOT EXISTS lyrics_external (
+        track_id     TEXT PRIMARY KEY,
+        source       TEXT NOT NULL,
+        synced_lrc   TEXT,
+        plain_text   TEXT,
+        instrumental INTEGER NOT NULL DEFAULT 0,
+        external_id  TEXT,
+        checked_at   TEXT NOT NULL
+      );
+    `);
+    d.pragma('user_version = 31');
+  }
+
+  if (userVersion < 32) {
     // Language tags are optional metadata, but the request resolver's local
     // language queries need their storage columns on every fresh and upgraded
     // library. Keep the additive, nullable shape compatible with PR #2080's
     // language tagging writes.
+    //
+    // The earlier language branch used version 30 before the lyric migrations
+    // landed on develop. Such a database has the language columns but may not
+    // have lyric_offsets, so keep this repair idempotent for that history too.
+    runDdl(d, `
+      CREATE TABLE IF NOT EXISTS lyric_offsets (
+        track_id   TEXT PRIMARY KEY,
+        offset_ms  INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
     const have = new Set((d.prepare('PRAGMA table_info(tracks)').all() as Array<{ name: string }>).map(c => c.name));
     const add = ['language_primary', 'languages'].filter(column => !have.has(column));
     if (add.length) runDdl(d, add.map(column => `ALTER TABLE tracks ADD COLUMN ${column} TEXT;`).join('\n'));
-    d.pragma('user_version = 30');
+    d.pragma('user_version = 32');
   }
-
   // Before the vector reconcile below, which bumps it when it drops vectors.
   // Never throws. Its update trigger names tracks.genres and tracks.moods, and
   // SQLite refuses to DROP COLUMN either while it exists: a migration above

@@ -36,7 +36,8 @@ The compose files sit at the repo root: `docker-compose.yml` (prod, with Caddy a
 - **Lint is the merge gate.** `npm run lint` in `controller/`, `web/`, `app/` and `mcp-subwave/` runs in `.github/workflows/lint.yml`, alongside the theme-token, schema-mirror and zod-parity checks. Only the controller and web lint jobs are required to merge.
 - **CI does not run the test suites** (apart from two ffmpeg tests in `audio-tests.yml`). Run `npm test` yourself in `controller/`, `web/` or `app/` before pushing changes there.
 - **Always run tests through `npm test`** (`npm test -- <substring>` filters). The controller runner gives each file its own temp `STATE_DIR`; `node --test` or `tsx <file>` can write into the repo's `state/`, the dev station's own. Files run one at a time by default (`--jobs N` in the controller). Dropping in `controller/scripts/*.test.ts`, or a web test under a root listed in `web/scripts/run-tests.mjs`, is the whole registration. The `controller/scripts/run-tests.ts` header covers the rest (`node:test`, reserved ports, `createTempDir`). A test removes its temp dir with `await removeTempDir(dir)` (`scripts/test-utils/temp-dir.ts`), never a bare `rmSync`, which races in-flight writes into `ENOTEMPTY`.
-- If `observatory-scale.test.ts` fails with `SQLITE_IOERR_WRITE`, point `TMPDIR` at real disk (`/tmp` is tmpfs).
+- **Run heavy commands one at a time, never in parallel.** Lint, `tsc`, a test suite, `npm ci` and a build each get the machine to themselves: no two in one message, no second one while a background one runs, and one package's suite at a time. Together they have OOM-killed a 16 GB dev box.
+- The scale benches (`npm run bench:admin`, `bench:lookups`, `bench:observatory`) are outside `npm test` because they seed GB-sized libraries (`bench:observatory` peaks at ~1.3 GB RSS plus a ~0.9 GB DB at its default 200k rows). Run one only when asked or after touching its read path, alone, with its `*_TMP` on real disk (`/tmp` is tmpfs on some hosts, and a full one fails the seed with `SQLITE_IOERR_WRITE`).
 
 ## Pull requests target `develop`
 
@@ -79,7 +80,7 @@ The pieces are Broadcast (Icecast + Liquidsoap), Controller (Express, ESM, TypeS
 - **One writer per file**: `queue.playJingle()` is the only writer of `jingle-now.txt` (the automatic rotate calls it), and `queue.onSpoken()` is the only place post-air bookkeeping happens.
 - **A pushed track is "handed over", never "playable".** Resolution is the `proto_subhttp` probe outcome, consumed by `queue.verifyPushResolved()`; never infer it from `dj_queue.queue()` membership.
 - **Policy lives in its own module** (`*-policy.ts`, `dj-budget.ts`, `talk-scheduler.ts`, `util/request-guard.ts`, `music/blocklist-rules.ts`, …). A decision reached from several call sites is made in one place, and a second copy of the check is the bug.
-- **A gate's failure direction is deliberate; never unify two.** `POST /listener-auth` fails open while listener auth is off, while `POST /station-auth` and `middleware/station-auth.ts` fail closed. The listener-count gates fail open on an unknown count, while `presentListeners()` fails closed. `validate*Strict` throws and `normalize*` repairs or drops, and neither restates a rule.
+- **A gate's failure direction is deliberate; never unify two.** `POST /listener-auth` fails open while listener auth is off, while `POST /station-auth` and `middleware/station-auth.ts` fail closed. The listener-count gates fail open on an unknown count, while `presentListeners()` fails closed, and the idle wake probe (`peekListeners()`) commits nothing and acts only on a positive reading. `validate*Strict` throws and `normalize*` repairs or drops, and neither restates a rule.
 - **A validated shape is defined once**, in `controller/src/schemas/<feature>.ts`, and mirrored to `web/lib/schemas.generated.ts` by `npm run gen:schemas` (CI diffs it; never hand-edit it). Those files import only `zod`; impure rules go in a `*-server.ts` sibling.
 - **A behaviour-preserving refactor preserves behaviour, accidental leniency included.** Tightening it is a separate PR, stated as a behaviour change (`schemas.md`, on the patch registry).
 - **Keep the broadcast entrypoint and the AIO supervisor in lockstep.** `docker/broadcast-entrypoint.sh` and the AIO duplicate six things (`infrastructure.md` lists them, and four tests drive both copies), so fix one, fix both.
@@ -89,6 +90,7 @@ The pieces are Broadcast (Icecast + Liquidsoap), Controller (Express, ESM, TypeS
 **Timing** (`broadcast.md`)
 - **Published timestamps are live-edge**, and listeners sit `stream.bufferSeconds` (22 s) behind. Listener surfaces add the offset; operator surfaces don't. `<burst-size>` is bytes, computed per mount. Never judge the cushion with `buffered.end − currentTime`.
 - **Every scheduled spoken segment is a row in one slot table** (`broadcast/talk-scheduler.ts`), driven by one per-minute `talkTick`, one talker per minute. A slot is a window, and a held row postpones, never cancels. A second talk cron is the bug.
+- **The one sanctioned exception is the over-music jingle ID** (`jinglePlacement: over | both`): the now-playing watcher offers it once per song, at the opening, and it stands down to any speech rather than taking a slot (`broadcast.md`).
 - **A rendered segment is placed, not trimmed**: the lever at a boundary is which boundary it takes (`broadcast/vocal-runway.ts`).
 - **A pause-and-talk break is silence on the music timeline.** The voice still goes through `say.txt`.
 - **A show handoff is prepared for the confirmed final outgoing track**, never by look-ahead alone (`show-boundary-handoffs.md`).
@@ -117,6 +119,7 @@ The pieces are Broadcast (Icecast + Liquidsoap), Controller (Express, ESM, TypeS
 - The seed track id is not a pick (`util/pick-seed.ts`).
 - The blocklist is absolute, with no never-starve anywhere, requests included. Its rules ride the existing chokepoints, and every name tier keys through one fold (`recency.nameKey`).
 - The stem cache's scan order and eviction order are one rule (`music/stem-priority.ts`).
+- LRCLIB lyrics reach the listener Lyrics panel only, never the analyzer, and are looked up when a track is queued and again at air time, never on the read path (`music/lyrics-sources.ts`).
 - LLM calls go through the `llm/sdk` primitives, and provider quirks live only in `llm/internal/provider/capabilities.ts`. The default provider is a slow homelab Ollama, so add no aggressive retry.
 - TTS goes through `tts.speak(text, {kind})`. The rescue chain is a list of voice slots, and a rescue target is engine + provider.
 
@@ -127,7 +130,8 @@ The pieces are Broadcast (Icecast + Liquidsoap), Controller (Express, ESM, TypeS
 - `requestedBy` says which exemptions a track gets, not who is waiting. Count waiting listeners as `queue.pendingListenerRequests()` plus the requests still resolving in `routes/request.ts`, which hold no queue slot yet.
 - Gate before generation, never at `speak()`.
 - Public reads are explicit allowlists: never widen one to TTS config, skills or behaviour dials. A persona's `soul` is a system prompt, published only behind `publishPersonaSouls`, and absent (not empty) when off.
-- Absent or malformed settings coerce to the pre-existing behaviour, so an upgrade is byte-identical. The one exception is legacy `llm.pickerAgent: false` → Track Shortlist, which is announced.
+- A DJ template without `{location}` withholds the place from every model: prompts and skill tools see the live context only through `settings.spokenContext()` (`buildContextLines`, `segment-tools.ts`); display and operator surfaces keep it (#2099).
+- Absent or malformed settings coerce to the pre-existing behaviour, so an upgrade is byte-identical. The exceptions, each announced, are legacy `llm.pickerAgent: false` → Track Shortlist, and the Lyrics panel with its LRCLIB fallback (`settings.lyrics`), which an upgrade turns on.
 - A multi-station switch is a pointer write + mixer restart + controller `process.exit`; never hot-swap state paths in-process.
 - A scheduled job deletes only files it wrote itself, matched on an anchored name (`backup/pure.ts`).
 - Operator curation outranks listener signal: an operator heart skips the `topLiked` cutoff and survives the trim.

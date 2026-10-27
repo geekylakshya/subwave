@@ -190,6 +190,14 @@ export function adoptRotatedIds(liveIds: ReadonlySet<string>): AdoptionResult {
   const putAudioVec = d.prepare('INSERT INTO track_audio_vectors (id, embedding) VALUES (?, ?)');
   const delAudioVec = d.prepare('DELETE FROM track_audio_vectors WHERE id = ?');
   const movePlays = d.prepare('UPDATE plays SET track_id = ? WHERE track_id = ?');
+  // The operator's lyric timing fix follows the track. The new id's own row
+  // wins when it already has one (the `new ?? old` rule the columns follow).
+  const moveLyricOffset = d.prepare('UPDATE OR IGNORE lyric_offsets SET track_id = ? WHERE track_id = ?');
+  const dropLyricOffset = d.prepare('DELETE FROM lyric_offsets WHERE track_id = ?');
+  // LRCLIB's stored answer follows too, by the same rule, so a rotation does
+  // not cost a second lookup.
+  const moveExternalLyrics = d.prepare('UPDATE OR IGNORE lyrics_external SET track_id = ? WHERE track_id = ?');
+  const dropExternalLyrics = d.prepare('DELETE FROM lyrics_external WHERE track_id = ?');
   const delTrack = d.prepare('DELETE FROM tracks WHERE id = ?');
   const journal = d.prepare('INSERT OR REPLACE INTO id_rotation_journal (old_id, new_id) VALUES (?, ?)');
 
@@ -231,6 +239,10 @@ export function adoptRotatedIds(liveIds: ReadonlySet<string>): AdoptionResult {
       carry.run(...cols.map((c) => merged[c] ?? null), neu);
 
       movePlays.run(neu, old);
+      moveLyricOffset.run(neu, old);
+      dropLyricOffset.run(old);
+      moveExternalLyrics.run(neu, old);
+      dropExternalLyrics.run(old);
       journal.run(old, neu);
       delTrack.run(old);
       // Facet rows follow the merged columns: carry the old id's rows where the

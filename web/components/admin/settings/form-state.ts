@@ -335,5 +335,10 @@ export function settingsForm(v: NonNullable<SettingsData['values']>): FormState 
       maxTracks: String(v.likes?.maxTracks ?? 10),
       windowDays: String(v.likes?.windowDays ?? 30),
     },
+    // Off unless the station has said otherwise: the controller's default.
+    lyrics: {
+      enabled: v.lyrics?.enabled === true,
+      lrclib: v.lyrics?.lrclib === true,
+    },
   };
 }

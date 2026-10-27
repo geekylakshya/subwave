@@ -7,7 +7,7 @@ import { identifyTrackFromText } from '../../../prompts/request.js';
 import { definePickerTool } from '../defs.js';
 import { REQUEST_TEXT_MAX } from '../../../../../schemas/request.js';
 import { requestName, requestNameWithin } from '../../../../../music/request-normalize.js';
-import { rankRequestCandidates, requestCandidateArtistMatches } from '../../../../../music/request-match.js';
+import { rankRequestCandidates, requestCandidateArtistMatches, type RankedRequestCandidate } from '../../../../../music/request-match.js';
 
 // Search snippets sometimes make the performer obvious but an identification
 // model may leave `artist` null when several pages use different credits. Keep
@@ -39,6 +39,17 @@ function webArtistHints(blob: string, title: string, keyword: string | null): st
     }
   }
   return hints;
+}
+
+// Two recordings by different artists that tie on the evidence, with no
+// artist to tell them apart, are different songs sharing a title: a no-match,
+// never whichever has the lower library id.
+function verifiedTop(ranked: RankedRequestCandidate[], artist: string | null): RankedRequestCandidate['song'][] {
+  const [top, next] = ranked;
+  if (!top) return [];
+  const tied = !artist && !!next && top.score - next.score < 1e-9
+    && !requestCandidateArtistMatches(top.song.artist, next.song);
+  return tied ? [] : [top.song];
 }
 
 type WebTrackResult = { title?: string; content?: string; url?: string };
@@ -320,7 +331,8 @@ export default definePickerTool({
             webText: evidenceText,
             lyricText: reference,
           });
-          if (ranked.length) return [ranked[0]!.song];
+          const verified = verifiedTop(ranked, candidate.artist);
+          if (verified.length) return verified;
           const sameArtist = candidate.artist
             ? songs.filter(song => requestCandidateArtistMatches(candidate.artist, song))
             : songs;
@@ -335,7 +347,8 @@ export default definePickerTool({
             lyricText: reference,
             lyricsById,
           });
-          if (lyricRanked.length) return [lyricRanked[0]!.song];
+          const lyricVerified = verifiedTop(lyricRanked, candidate.artist);
+          if (lyricVerified.length) return lyricVerified;
           // An artist-only hit is not title evidence. Even a one-track local
           // catalogue can be incomplete, and accepting it turns a lyric or
           // web miss into an arbitrary same-artist recording. A title alias,

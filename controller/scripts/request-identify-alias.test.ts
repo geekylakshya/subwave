@@ -221,6 +221,53 @@ test('an artist\'s only local track is not chosen because its title sits inside 
   }
 });
 
+test('two same-title recordings with no artist evidence are a no-match, not the lower id', async () => {
+  const originalLlm = structuredClone(settings.get().llm);
+  const originalSearch = structuredClone(settings.get().search);
+  const realFetch = globalThis.fetch;
+  const json = (value: unknown) => Response.json(value);
+  const adele = { id: 'hello-adele', title: 'Hello', artist: 'Adele', album: '25' };
+  const richie = { id: 'hello-richie', title: 'Hello', artist: 'Lionel Richie', album: "Can't Slow Down" };
+  const cases = [
+    { origin: 'http://search.tie.fixture', content: 'Hello lyrics. Hello, it is me, I was wondering.', expected: { candidates: [], note: 'could not find the described song in this library' } },
+    // The web naming one performer is the artist evidence that breaks the tie.
+    { origin: 'http://search.tie-adele.fixture', content: 'Hello lyrics. The Adele song opens: hello, it is me.', expected: { candidates: [adele] } },
+  ];
+
+  try {
+    for (const { origin, content, expected } of cases) {
+      await settings.update({
+        llm: { provider: 'openai-compatible', model: 'fixture-model', compatibleMode: 'local', baseUrl: 'http://llm.tie.fixture/v1', fallback: { enabled: false } },
+        search: { provider: 'searxng', baseUrl: origin },
+      } as never);
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+        if (url.origin === origin) return json({ results: [{ title: 'Hello lyrics', content }] });
+        if (url.origin === 'http://llm.tie.fixture') {
+          const body = JSON.parse(String(init?.body || '{}'));
+          const toolName = body?.tools?.[0]?.function?.name || 'emit';
+          return json({ id: 'tie', object: 'chat.completion', created: 1, model: 'fixture-model', choices: [{
+            index: 0, message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_tie', type: 'function', function: { name: toolName, arguments: JSON.stringify({ title: 'Hello', artist: null, keyword: 'Hello' }) } }] }, finish_reason: 'tool_calls',
+          }], usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 } });
+        }
+        if (url.origin === 'http://navidrome.fixture') {
+          const query = url.searchParams.get('query') || '';
+          const songs = query === 'Hello' && Number(url.searchParams.get('songCount') || 0) > 0 ? [adele, richie] : [];
+          return json({ 'subsonic-response': { status: 'ok', version: '1.16.1', searchResult3: { artist: [], song: songs } } });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }) as typeof fetch;
+
+      const built: any = identifyTool.build({ collect: (songs: any[]) => songs } as any);
+      const result = await built.execute({ reference: 'hello it is me' }, {} as any);
+      assert.deepEqual(result, expected, origin);
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    await settings.update({ llm: originalLlm, search: originalSearch } as never);
+  }
+});
+
 test('a noisy first lyric result gets one exact-fragment retry before giving up', async () => {
   const originalLlm = structuredClone(settings.get().llm);
   const originalSearch = structuredClone(settings.get().search);

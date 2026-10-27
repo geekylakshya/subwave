@@ -326,6 +326,18 @@ export default definePickerTool({
         };
 
         const hints = extractLyricTrackHints(web);
+        const identityCache = new Map<string, Promise<IdentifiedTrack | null>>();
+        const identify = (evidenceText: string) => {
+          const key = `${reference}\u0000${evidenceText}`;
+          const cached = identityCache.get(key);
+          if (cached) return cached;
+          const result = identifyTrackFromText(reference, evidenceText, signal).catch(err => {
+            if (signal?.aborted) throw err;
+            return null;
+          });
+          identityCache.set(key, result);
+          return result;
+        };
         const verifyCandidate = async (candidate: IdentifiedTrack, songs: any[], evidenceText = blob) => {
           const ranked = rankRequestCandidates(candidate.title, candidate.artist, songs, {
             webText: evidenceText,
@@ -368,10 +380,7 @@ export default definePickerTool({
         // is the complete fallback path.
         let guess: IdentifiedTrack | null = null;
         if (llmConfigured()) {
-          try { guess = await identifyTrackFromText(reference, blob, signal); } catch (err) {
-            if (signal?.aborted) throw err;
-            guess = null;
-          }
+          guess = await identify(blob);
           if (guess && evidenceSupportsGuess(guess, blob)) {
             const modelSongs = await resolveGuess(guess, blob);
             const modelCandidates = collect(await verifyCandidate(guess, modelSongs));
@@ -388,12 +397,7 @@ export default definePickerTool({
         }
 
         if (!llmConfigured()) return { error: 'could not identify a specific song from the available search results' };
-        if (!guess) {
-          try { guess = await identifyTrackFromText(reference, blob, signal); } catch (err) {
-            if (signal?.aborted) throw err;
-            guess = null;
-          }
-        }
+        if (!guess) guess = await identify(blob);
         if (!guess) return { error: 'could not identify a specific song from that description' };
 
         // A noisy meta-search response can contain the lyric but omit the
@@ -427,7 +431,7 @@ export default definePickerTool({
           const focused = await searchBudget.search(lyricSearchQuery(reference, guess.artist, 'head'));
           const focusedBlob = webBlob(focused, 5000);
           if (focusedBlob) {
-            const focusedGuess = await identifyTrackFromText(reference, focusedBlob, signal);
+            const focusedGuess = await identify(focusedBlob);
             const focusedEvidence = focusedBlob + '\n' + blob;
             if (focusedGuess && evidenceSupportsGuess(focusedGuess, focusedEvidence)) {
               const focusedSongs = await resolveGuess(focusedGuess, focusedEvidence);

@@ -387,6 +387,46 @@ test('a noisy first lyric result gets one exact-fragment retry before giving up'
   }
 });
 
+test('a null identification is not retried with the same evidence input', async () => {
+  const originalLlm = structuredClone(settings.get().llm);
+  const originalSearch = structuredClone(settings.get().search);
+  const realFetch = globalThis.fetch;
+  let identifyCalls = 0;
+  const json = (value: unknown) => Response.json(value);
+
+  try {
+    await settings.update({
+      llm: { provider: 'openai-compatible', model: 'fixture-model', compatibleMode: 'local', baseUrl: 'http://llm.same-input.fixture/v1', fallback: { enabled: false } },
+      search: { provider: 'searxng', baseUrl: 'http://search.same-input.fixture' },
+    } as never);
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.origin === 'http://search.same-input.fixture') {
+        return json({ results: [{ title: 'Unhelpful result', content: 'generic lyrics search result' }] });
+      }
+      if (url.origin === 'http://llm.same-input.fixture') {
+        identifyCalls++;
+        const body = JSON.parse(String(init?.body || '{}'));
+        const toolName = body?.tools?.[0]?.function?.name || 'emit';
+        return json({ id: 'same-input', object: 'chat.completion', created: 1, model: 'fixture-model', choices: [{
+          index: 0,
+          message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_same_input', type: 'function', function: { name: toolName, arguments: JSON.stringify({ title: null, artist: null, keyword: null }) } }] },
+          finish_reason: 'tool_calls',
+        }], usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const built: any = identifyTool.build({ collect: (songs: any[]) => songs } as any);
+    const result = await built.execute({ reference: 'a vague lyric fragment with no identifying credit' }, {} as any);
+    assert.deepEqual(result, { error: 'could not identify a specific song from that description' });
+    assert.equal(identifyCalls, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+    await settings.update({ llm: originalLlm, search: originalSearch } as never);
+  }
+});
+
 test('a canonical lyric result resolves Patient Zero without an LLM guess', async () => {
   const originalLlm = structuredClone(settings.get().llm);
   const originalSearch = structuredClone(settings.get().search);

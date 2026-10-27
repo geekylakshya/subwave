@@ -202,7 +202,7 @@ test('a song request naming only a film goes through evidence identification', a
   agentResult = {
     object: { id: shapeOfWoman.id, ack: 'Found a track from that film.' },
     steps: 1,
-    toolCalls: [{ name: 'identifyRequestedTrack' }],
+    toolCalls: [{ name: 'identifyRequestedTrack', result: { candidates: [shapeOfWoman] } }],
     extras: { seen: new Map([[shapeOfWoman.id, shapeOfWoman]]) },
   };
   for (const text of ['a song from The Devil Wears Prada 2', 'a song from The Devil Wears Prada2']) {
@@ -241,6 +241,27 @@ test('an evidence agent that declines its candidates is an honest miss, not a re
   assert.equal(result.outcome, 'no-match');
   assert.equal(queue.upcoming.length, 0);
   assert.equal(bodies.length, 0, 'a declined answer must not spend a re-pick or a direct matcher call');
+  assert.equal(requestLog.snapshot(1)[0].pickSource, 'agent:evidence-miss');
+});
+
+test('an evidence agent cannot report a real stand-in id as a matched request', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  const standIn = { id: 'same-artist', title: 'A Different Song', artist: 'Fixture Punjabi Artist' };
+  const verifiedCandidate = { id: 'verified-song', title: 'The Requested Song', artist: 'Fixture Punjabi Artist' };
+  agentResult = {
+    object: { kind: 'track', id: standIn.id, ack: 'Coming up for you.' },
+    steps: 1,
+    toolCalls: [{
+      name: 'identifyRequestedTrack',
+      result: { candidates: [verifiedCandidate] },
+    }],
+    extras: { seen: new Map([[standIn.id, standIn], [verifiedCandidate.id, verifiedCandidate]]) },
+  };
+  const result = await submit('the song from the film with the unforgettable closing scene');
+  assert.equal(result.status, 'failed');
+  assert.equal(result.outcome, 'no-match');
+  assert.match(result.message, /identify that song/i);
+  assert.equal(queue.upcoming.length, 0);
   assert.equal(requestLog.snapshot(1)[0].pickSource, 'agent:evidence-miss');
 });
 

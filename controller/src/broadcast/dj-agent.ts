@@ -1812,6 +1812,15 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
     });
     throwIfAborted();
     const { toolCalls, extras } = run;
+    const evidenceToolCalls = toolCalls.filter((call: any) => call?.name === 'identifyRequestedTrack');
+    const verifiedEvidenceIds = new Set<string>(evidenceToolCalls.flatMap((call: any) => {
+      const result = typeof call?.result === 'string'
+        ? (() => { try { return JSON.parse(call.result); } catch { return null; } })()
+        : call?.result;
+      return Array.isArray(result?.candidates)
+        ? result.candidates.map((candidate: any) => candidate?.id).filter((id: any): id is string => typeof id === 'string')
+        : [];
+    }));
     // Reassigned when the unknown-id salvage below (repickRequestFromSeen)
     // lands a corrective re-pick — same let-after-destructure shape
     // pickViaSelectionRoute uses for the identical reason.
@@ -1928,6 +1937,15 @@ async function runRequestViaAgent(queue: any, { requester, text, signal, introBu
         throw new RequestIdentificationMiss(`request agent found no matching track for id ${object?.id ?? 'none'}`);
       }
       throw new Error(`request agent returned unknown id ${object?.id}`);
+    }
+
+    // An evidence lookup is authoritative for description/lyrics requests: a
+    // real id surfaced by another tool is still only a stand-in unless the
+    // identity tool verified that exact library candidate. Keep this an
+    // expected miss so the request breaker remains healthy and the route does
+    // not record or queue an unacknowledged substitution as "matched".
+    if (evidenceToolCalls.length > 0 && !verifiedEvidenceIds.has(song.id)) {
+      throw new RequestIdentificationMiss(`request agent selected an unverified evidence candidate ${song.id}`);
     }
 
     // Claim guard (#1918): a REAL candidate id under lines that name another

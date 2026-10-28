@@ -118,6 +118,7 @@ const REQUEST_SCHEMA = z.object({
   sort: z.string().nullable().describe('"latest" for latest/new/newest/recent, "oldest" for old/classic, "popular" for popular/best/top, else null'),
   scope: z.enum(['album', 'song']).describe('what the listener wants; default "song"'),
   mood: z.string().nullable().describe('one of energetic|calm|reflective|celebratory|romantic|spiritual|focus|workout|driving|cooking|rainy|sunny|night|morning|evening|festival|cultural — or null. ALWAYS set this for vibe/feeling requests ("overcast mood" → calm or reflective, "cosy" → calm, "pumped up" → energetic, "late night drive" → night — pick the strongest single match).'),
+  energy: z.enum(['low', 'medium', 'high']).nullable().describe('the requested playback energy when explicit, using low, medium, or high. Treat words such as mellow, slow, chill as low; upbeat, pumped, intense as high; moderate or balanced as medium. Null when energy was not requested.'),
   intent: z.string().describe('one short sentence describing what the listener wants'),
   ack: z.string().describe(`short acknowledgement in the DJ voice and persona language, max 20 words, shown only when the library matches the request (or the chat reply); sounds like a real radio DJ — no "thank you for listening" or self-intros, and never names a song or artist the listener did not name`),
 });
@@ -140,7 +141,7 @@ const REQUEST_SCHEMA = z.object({
 // directly); the "call sites use the barrel" rule is about production code,
 // not the test suite.
 export const REQUEST_SCHEMA_TOLERANT = modelTolerant(REQUEST_SCHEMA, {
-  objectFallbacks: { kind: 'track', unsupported: [], search_terms: [], scope: 'song', intent: '', ack: '' },
+  objectFallbacks: { kind: 'track', unsupported: [], search_terms: [], scope: 'song', intent: '', ack: '', energy: null },
 });
 
 // Full system prompt for the legacy request-matcher fallback. Exported pure so

@@ -40,6 +40,7 @@ export const router = express.Router();
 
 export type ListenerResolutionOutcome =
   | 'matched'
+  | 'partial'
   | 'no-match'
   | 'already-queued'
   | 'cooldown'
@@ -93,6 +94,7 @@ export interface ListenerRequestEntry {
   classification?: string;
   intent?: string | null;
   mood?: string | null;
+  energy?: string | null;
   scope?: string | null;
   sort?: string | null;
   artist?: string | null;
@@ -177,7 +179,7 @@ async function pickMoreByArtist(artistName: string, recentIds: Set<string>, seed
     },
     moodSongs: async () => [], fallbackSongs: async () => [],
   });
-  return result.outcome === 'matched' ? result.track : null;
+  return result.outcome === 'matched' || result.outcome === 'partial' ? result.track : null;
 }
 
 // "more like this" fallback when the playing artist has nothing else in the
@@ -492,9 +494,9 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // A bare title+artist pair is already a complete identity plan. Keep it on
   // the local-first path instead of waiting on the optional interpreter; the
   // interpreter is still useful when the same named request carries an
-  // explicit language, genre, or mood constraint that needs parsing.
+  // explicit language, genre, mood, or energy constraint that needs parsing.
   const bareExplicitNamedRequest = explicitNamedRequest
-    && !literal.album && !literal.genre && !literal.language && !literal.mood;
+    && !literal.album && !literal.genre && !literal.language && !literal.mood && !literal.energy;
   // A short, attribute-free request is more likely to be a title than a
   // conversational instruction. Resolve it against the local catalogue first
   // so a provider stall cannot delay a straightforward named request. It is an
@@ -504,7 +506,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     && literal.kind === 'track'
     && Boolean(literal.title?.trim())
     && !literal.artist && !literal.album
-    && !literal.genre && !literal.language && !literal.mood
+    && !literal.genre && !literal.language && !literal.mood && !literal.energy
     && !(isGreetingLikeRequest(literal.title!) || isGenericRequestPhrase(literal.title!))
     // One-word asks are the high-confidence local-first case. Multi-word
     // text can be an unseparated artist+title ("Queen Bohemian Rhapsody") or
@@ -519,7 +521,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     && literal.kind === 'track'
     && Boolean(literal.title?.trim())
     && !literal.artist && !literal.album
-    && !literal.genre && !literal.language && !literal.mood
+    && !literal.genre && !literal.language && !literal.mood && !literal.energy
     && !(isGreetingLikeRequest(literal.title!) || isGenericRequestPhrase(literal.title!));
   // These forms already carry all the identity/attribute information the
   // deterministic resolver needs. Calling the interpreter first only adds a
@@ -530,7 +532,8 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     && (Boolean(literal.album?.trim())
       || Boolean(literal.genre?.trim())
       || Boolean(literal.language?.trim())
-      || Boolean(literal.mood?.trim()));
+      || Boolean(literal.mood?.trim())
+      || Boolean(literal.energy?.trim()));
   const explicitNoMatchCue = /\b(?:no\s+such|doesn['’]?t\s+exist|does\s+not\s+exist|not\s+in\s+(?:the\s+)?(?:library|catalog(?:ue)?))\b/iu.test(literal.title || '');
   // A framed, unquoted multi-word name is still an identity claim when no
   // artist/attribute is present. Keep a miss honest instead of letting a model
@@ -548,7 +551,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // Conversational DJ agent. On any failure fall through to the stateless
   // cascade below, so a request is never dropped.
   // The agent is reserved for evidence-heavy identification. Named, mood,
-  // genre and language requests must use the shared deterministic
+  // energy, genre, and language requests must use the shared deterministic
   // resolver so every listener request follows the same deterministic path. Lyric and film
   // descriptions still use the existing web-aware agent path.
   const needsEvidenceIdentification = isLyricOrFilmDescription(text) && !framedTitleOnly;
@@ -685,7 +688,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     matched = {
       ...matched,
       kind: 'track', title: literal.title, artist: null, album: null,
-      genre: null, language: null, mood: null,
+      genre: null, language: null, mood: null, energy: null,
       scope: 'song', literal: false, titleOnly: true,
     };
   }
@@ -811,6 +814,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
             genres: row.genres,
             genre: row.genre ?? undefined,
             moods: row.moods,
+            energy: row.energy,
           }));
       },
     },
@@ -834,6 +838,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
       || Boolean(matched.releaseContext) || Boolean(matched.similarTo),
     signal,
     moodSongs: async mood => { await library.load(); return library.songsByMood(mood); },
+    energySongs: async energy => { await library.load(); return library.songsByEnergy(energy); },
     languageSongs: async language => {
       await library.load();
       return requestSongs(library.songsByLanguage(canonicalLanguage(language) || language));
@@ -959,10 +964,13 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // Substitutions need honest fixed copy. A real match keeps the screened
   // persona-language acknowledgement; optional preference misses stay private.
   let ack = `Couldn't match that request exactly — here's an alternative from the library.`;
-  if (selection.outcome === 'matched') {
+  if (selection.outcome === 'matched' || selection.outcome === 'partial') {
     const screened = screenAck(matched.ack, text, 'Found a match — your track is on the way.');
     if (screened.guard) flagGuard(entry, screened.guard);
     ack = screened.ack;
+    if (selection.outcome === 'partial' && selection.unmetPreferences?.length) {
+      ack += ` I matched the song, but not every preference was available.`;
+    }
   }
 
   // 3. DJ intro. On a miss, flag it (and pass the cleaned name, when one
@@ -1041,7 +1049,9 @@ function typedResolution(entry: ListenerRequestEntry): ListenerRequestResolution
   const legacyOutcome = String(entry.outcome || 'no-match');
   const outcome: ListenerResolutionOutcome = legacyOutcome === 'already-queued' || legacyOutcome === 'cooldown'
     ? legacyOutcome
-    : legacyOutcome === 'unsupported' || legacyOutcome === 'chat'
+    : legacyOutcome === 'partial'
+      ? 'partial'
+      : legacyOutcome === 'unsupported' || legacyOutcome === 'chat'
         ? 'unsupported'
         : legacyOutcome === 'timeout'
           ? 'timeout'

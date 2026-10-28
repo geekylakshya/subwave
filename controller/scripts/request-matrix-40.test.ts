@@ -99,6 +99,7 @@ const selectionCases: SelectionCase[] = [
   { name: 'Punjabi language request', text: 'play Punjabi music', id: 'sadi-gali' },
   { name: 'genre request', text: 'play some jazz', id: 'calm-jazz' },
   { name: 'mood request', text: 'play romantic music', id: 'tum-hi-ho' },
+  { name: 'energy request', text: 'play high energy music', id: 'sadi-gali' },
   { name: 'combined language and mood', text: 'play romantic Hindi music', id: 'tum-hi-ho' },
   { name: 'named similarity', text: 'play something like Tum Hi Ho', id: 'similar-tum' },
   { name: 'generic similarity fallback', text: 'play something like this', id: 'similar-tum' },

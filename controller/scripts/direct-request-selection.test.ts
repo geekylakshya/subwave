@@ -807,6 +807,18 @@ test('model-free requests retain combined genre, energy, and language constraint
   assert.equal(rockPunjabi.language, 'Punjabi');
 });
 
+test('energy-only interpretation terms are not promoted to a title', () => {
+  assert.equal(requestedTitle({
+    title: null,
+    artist: null,
+    genre: null,
+    language: null,
+    mood: null,
+    energy: 'high',
+    search_terms: ['upbeat'],
+  }), null);
+});
+
 test('model-free requests recognise album framing', () => {
   const match = modelFreeRequest('play the album Fearless');
   assert.equal(match.album, 'Fearless');

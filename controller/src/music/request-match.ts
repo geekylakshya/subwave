@@ -308,11 +308,11 @@ function headsLiteral(literal: string, term: string): boolean {
 }
 
 // The search terms that can be names: never the reading's own artist in any
-// spelling ("Beatles" for The Beatles), nor a term carrying its mood, genre or
-// language word ("calm Queen songs").
+// spelling ("Beatles" for The Beatles), nor a term carrying its mood, genre,
+// language, or energy word ("calm Queen songs", "upbeat music").
 export function nameSearchTerms(match: RequestMatch): string[] {
   const artist = artistIdentityKey(match.artist);
-  const attributes = [match.genre, match.language, match.mood].map(requestName).filter(Boolean);
+  const attributes = [match.genre, match.language, match.mood, match.energy].map(requestName).filter(Boolean);
   return (match.search_terms || []).filter(term => {
     const key = requestName(term);
     return !!key && artistIdentityKey(term) !== artist && !attributes.some(word => ` ${key} `.includes(` ${word} `));
@@ -584,11 +584,11 @@ export function requestedTitle(match: RequestMatch, text?: string): string | nul
   if (match.album) return null;
   const terms = nameSearchTerms(match).map(term => term.trim());
   // The tolerant schema reads an omitted title as null, so a null title beside
-  // a mood, genre or language is #1961's reply shape: a small model guessed
+  // a mood, genre, language, or energy is #1961's reply shape: a small model guessed
   // attributes and left the song in search_terms. The term is the title when
   // the listener's own words name it with only request framing around it;
   // "something calm for an overcast evening" stays a vibe.
-  if (match.title === null && (match.mood || match.genre || match.language)) {
+  if (match.title === null && (match.mood || match.genre || match.language || match.energy)) {
     return text === undefined ? null : terms.find(term => namedInRequest(text, term, [match.artist, match.album])) || null;
   }
   return terms[0] || null;

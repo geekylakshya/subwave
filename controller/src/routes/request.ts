@@ -226,6 +226,7 @@ function recordOutcome(entry) {
       pickSource: entry.pickSource || null,
       intent: entry.intent ?? null,
       mood: entry.mood ?? null,
+      energy: entry.energy ?? null,
       scope: entry.scope ?? null,
       sort: entry.sort ?? null,
       artist: entry.artist ?? null,
@@ -707,6 +708,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   }
   queue.log('intent', `"${text}" → ${matched.intent || '(no intent)'}`, {
     mood: matched.mood,
+    energy: matched.energy,
     scope: matched.scope,
     sort: matched.sort,
     artist: matched.artist,
@@ -732,6 +734,7 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   entry.path = 'cascade';
   entry.intent = matched.intent || null;
   entry.mood = matched.mood || null;
+  entry.energy = matched.energy || null;
   entry.scope = matched.scope || null;
   entry.sort = matched.sort || null;
   entry.artist = matched.artist || null;

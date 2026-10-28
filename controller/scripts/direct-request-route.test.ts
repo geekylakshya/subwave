@@ -800,6 +800,13 @@ test('translated language selects the eligible recording rather than merely refu
   assert.equal(queue.upcoming[0].track.id, french.id);
 });
 
+test('energy is retained in the durable request outcome', async () => {
+  modelOutput = { title: exact.title, artist: 'Queen', energy: 'high' };
+  const result = await submit(`play ${exact.title} by Queen`);
+  assert.equal(result.outcome, 'partial');
+  assert.equal(requestLog.snapshot(1)[0].energy, 'high');
+});
+
 test('Punjabi request accepts ISO language metadata and Punjabi genre tags', async () => {
   const punjabi = { ...exact, id: 'punjabi-recording', title: 'Punjabi Song', artist: 'Punjabi Artist', genre: 'Punjabi Pop', language: 'pa' };
   catalogueSongs = [punjabi];

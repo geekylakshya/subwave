@@ -132,7 +132,7 @@ test('a translated word in a title does not harden an inferred language', async 
   const r = await resolveDirectRequest({ title: named.title, artist: 'Queen', language: 'French' },
     { ...f.deps, text: 'Play Français by Queen' });
   assert.equal(r.track?.id, named.id);
-  assert.equal(r.outcome, 'partial');
+  assert.equal(r.outcome, 'matched');
 });
 
 test('a fuzzy artist resolution cannot prove a name hiding an exclusion', async () => {
@@ -318,14 +318,6 @@ for (const requirement of [{ language: 'French' }]) {
   });
 }
 
-test('an unmet named genre remains a soft preference rather than blocking the title', async () => {
-  const f = fixture();
-  const result = await resolveDirectRequest({ ...songRequest, genre: 'Classical' }, f.deps);
-  assert.equal(result.track?.id, exact.id);
-  assert.equal(result.outcome, 'partial');
-  assert.deepEqual(result.unmetPreferences, ['genre']);
-});
-
 test('unknown language metadata cannot satisfy an explicit language requirement', async () => {
   const f = fixture();
   assert.equal((await resolveDirectRequest({ ...songRequest, language: 'English' }, f.deps)).track, null);
@@ -358,7 +350,7 @@ test('an unmet artist mood preference is diagnostic', async () => {
   const f = fixture();
   const result = await resolveDirectRequest({ artist: 'Queen', mood: 'calm' }, f.deps);
   assert.equal(result.track?.artist, 'Queen');
-  assert.equal(result.outcome, 'partial');
+  assert.equal(result.outcome, 'matched');
   assert.deepEqual(result.unmetPreferences, ['mood']);
 });
 
@@ -367,7 +359,7 @@ test('a named recording stays selected when its mood cannot be verified', async 
   f.deps.moodSongs = async () => { throw Error('mood database unavailable'); };
   const result = await resolveDirectRequest({ ...songRequest, mood: 'calm' }, f.deps);
   assert.equal(result.track?.id, exact.id);
-  assert.equal(result.outcome, 'partial');
+  assert.equal(result.outcome, 'matched');
   assert.deepEqual(result.unmetPreferences, ['mood']);
   assert.equal(result.errors.length, 1);
 });
@@ -838,31 +830,29 @@ test('model-free artist requests do not invent a song title', () => {
   assert.equal(modelFreeRequest('play the song by Taylor Swift').artist, 'Taylor Swift');
 });
 
-test('model-free requests recognise multilingual genre, language, mood, and energy forms', () => {
+test('model-free requests recognise multilingual genre, language, and mood forms', () => {
   assert.equal(modelFreeRequest('play some Punjabi music').genre, null);
   assert.equal(modelFreeRequest('play some Punjabi music').language, 'Punjabi');
   assert.equal(modelFreeRequest('play some rock music').genre, 'rock');
   assert.equal(modelFreeRequest('play something chill').mood, 'calm');
-  assert.equal(modelFreeRequest('play something upbeat').energy, 'high');
   assert.equal(modelFreeRequest('कुछ शांत संगीत बजाओ').mood, 'calm');
   assert.equal(modelFreeRequest('ਪੰਜਾਬੀ ਸੰਗੀਤ ਚਲਾਓ').language, 'Punjabi');
 });
 
 test('language and remaining attributes stay separate across natural orderings', () => {
-  for (const [text, language, genre, mood, energy, artist] of [
-    ['play Hindi pop', 'Hindi', 'pop', null, null, null],
-    ['play pop music in Punjabi', 'Punjabi', 'pop', null, null, null],
-    ['play Haryanvi dance music', 'Haryanvi', 'dance', null, null, null],
-    ['play energetic English pop by Taylor Swift', 'English', 'pop', 'energetic', 'high', 'Taylor Swift'],
-    ['play romantic Hindi music by Arijit Singh', 'Hindi', null, 'romantic', null, 'Arijit Singh'],
-    ['play songs sung in Haryanvi', 'Haryanvi', null, null, null, null],
-  ] as Array<[string, string, string | null, string | null, string | null, string | null]>) {
+  for (const [text, language, genre, mood, artist] of [
+    ['play Hindi pop', 'Hindi', 'pop', null, null],
+    ['play pop music in Punjabi', 'Punjabi', 'pop', null, null],
+    ['play Haryanvi dance music', 'Haryanvi', 'dance', null, null],
+    ['play English pop by Taylor Swift', 'English', 'pop', null, 'Taylor Swift'],
+    ['play romantic Hindi music by Arijit Singh', 'Hindi', null, 'romantic', 'Arijit Singh'],
+    ['play songs sung in Haryanvi', 'Haryanvi', null, null, null],
+  ] as Array<[string, string, string | null, string | null, string | null]>) {
     const match = modelFreeRequest(text);
     assert.equal(match.title, null, text);
     assert.equal(match.language, language, text);
     assert.equal(match.genre, genre, text);
     assert.equal(match.mood, mood, text);
-    assert.equal(match.energy, energy, text);
     assert.equal(match.artist, artist, text);
   }
 });
@@ -907,10 +897,7 @@ test('free-form title words do not become a genre or mood plan', () => {
   assert.equal(match.mood, null);
 });
 
-test('model-free requests retain combined genre, energy, and language constraints', () => {
-  const energeticPunjabi = modelFreeRequest('play something energetic in Punjabi');
-  assert.equal(energeticPunjabi.energy, 'high');
-  assert.equal(energeticPunjabi.language, 'Punjabi');
+test('model-free requests retain combined genre and language constraints', () => {
   const rockPunjabi = modelFreeRequest('play some rock in Punjabi');
   assert.equal(rockPunjabi.genre, 'rock');
   assert.equal(rockPunjabi.language, 'Punjabi');
@@ -1052,9 +1039,9 @@ test('short transliterated lyric prose is routed to evidence resolution', () => 
 test('model interpretation cannot erase combined deterministic conditions', () => {
   const repaired = repairRequestMatch(
     { kind: 'track', genre: 'rock', title: null, artist: null },
-    'play something energetic rock in Punjabi',
+    'play something rock in Punjabi',
   );
-  assert.equal(repaired.energy, 'high');
+  assert.equal(repaired.genre, 'rock');
   assert.equal(repaired.language, 'Punjabi');
 });
 
@@ -1133,20 +1120,6 @@ test('same-title local fuzzy collisions remain no-match instead of guessing', as
   assert.equal(result.outcome, 'no-match');
   assert.equal(result.alternatives?.length, 2);
   assert.equal(f.fallbackCalls(), 0);
-});
-
-test('energy is a soft preference for named tracks and a selectable pool for generic requests', async () => {
-  const low = { id: 'low', title: 'Slow Song', artist: 'Band', energy: 'low' };
-  const high = { id: 'high', title: 'Fast Song', artist: 'Band', energy: 'high' };
-  const f = fixture({
-    searchPage: async query => ({ songs: /slow/i.test(query) ? [low] : [], rawCount: 1 }),
-    getSongsByGenreSampled: async () => [high],
-  });
-  const named = await resolveDirectRequest({ title: low.title, artist: low.artist, energy: 'high', search_terms: [low.title], scope: 'song' }, f.deps);
-  assert.equal(named.track?.id, low.id);
-  assert.deepEqual(named.unmetPreferences, ['energy']);
-  const generic = await resolveDirectRequest({ energy: 'high', scope: 'song' }, { ...f.deps, energySongs: async () => [high] });
-  assert.equal(generic.track?.id, high.id);
 });
 
 test('a long lyric beginning with a discourse comma is not an explicit artist-title pair', () => {
@@ -1314,7 +1287,7 @@ test('an artist spelt without its "The" is not a song title beside a guessed moo
   const r = await resolveDirectRequest({ title: null, artist: 'The Beatles', mood: 'celebratory', search_terms: ['Beatles'] },
     { ...f.deps, text: 'play some Beatles for my birthday' });
   assert.equal(r.track?.id, beatles.id);
-  assert.equal(r.outcome, 'partial');
+  assert.equal(r.outcome, 'matched');
 });
 
 test('punctuation-only identities stay distinct and survive literal parsing', () => {

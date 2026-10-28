@@ -125,7 +125,9 @@ async function submit(text = 'Queen, Bohemian Rhapsody', maxPolls = 250) {
   for (let n = 0; n < maxPolls; n++) {
     const result: any = await (await realFetch(`${base}/request/${accepted.requestId}`)).json();
     if (result.status !== 'pending') {
-      if (!agentResult && !agentError) assert.equal(agentCalls, 0, 'Direct bypasses the agent, including when its failure could be caught');
+      if (settings.get().llm?.requestMatching !== 'agentic' && !agentResult && !agentError) {
+        assert.equal(agentCalls, 0, 'Direct mode bypasses the agent');
+      }
       return result;
     }
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -183,8 +185,7 @@ test('short transliterated lyric prose also goes through the evidence agent', as
   assert.equal(agentCalls, 1);
 });
 
-test('language-plus-genre requests stay on deterministic resolution', async () => {
-  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+test('direct mode keeps language-plus-genre requests on deterministic resolution', async () => {
   const punjabiRock = { id: 'punjabi-rock', title: 'Punjabi Rock Fixture', artist: 'Fixture Punjabi Artist', genre: 'Rock', language: 'Punjabi' };
   catalogueSongs = [punjabiRock];
   genreSongs = [punjabiRock];
@@ -194,6 +195,66 @@ test('language-plus-genre requests stay on deterministic resolution', async () =
   assert.equal(result.outcome, 'matched');
   assert.equal(result.track.title, punjabiRock.title);
   assert.equal(agentCalls, 0);
+});
+
+test('agentic matching sends compound exclusion requests to the agent first', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  const nonQueen = { id: 'non-queen', title: 'Fixture Outside Queen', artist: 'Fixture Artist' };
+  agentResult = {
+    object: { id: nonQueen.id, ack: 'Here is a track outside that artist.' },
+    steps: 1,
+    toolCalls: [{ name: 'searchLibrary' }],
+    extras: { seen: new Map([[nonQueen.id, nonQueen]]) },
+  };
+
+  const result = await submit('Play anything except Queen');
+
+  assert.equal(result.outcome, 'matched');
+  assert.equal(result.track.title, nonQueen.title);
+  assert.equal(agentCalls, 1);
+  assert.equal(bodies.length, 0, 'an agent match must not fall through to direct interpretation');
+});
+
+test('agentic matching sends recording-condition requests to the agent first', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  const instrumental = { id: 'instrumental-1990s', title: 'Fixture Instrumental', artist: 'Fixture Artist' };
+  agentResult = {
+    object: { id: instrumental.id, ack: 'Here is an instrumental track from that era.' },
+    steps: 1,
+    toolCalls: [{ name: 'searchLibrary' }],
+    extras: { seen: new Map([[instrumental.id, instrumental]]) },
+  };
+
+  const result = await submit('Play instrumental tracks from the 1990s');
+
+  assert.equal(result.outcome, 'matched');
+  assert.equal(result.track.title, instrumental.title);
+  assert.equal(agentCalls, 1);
+  assert.equal(bodies.length, 0, 'an agent match must not fall through to direct interpretation');
+});
+
+test('an agentic null result falls through to the deterministic resolver', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  agentResult = { object: {}, toolCalls: [], extras: { seen: new Map() } };
+
+  const result = await submit();
+
+  assert.equal(result.outcome, 'matched');
+  assert.equal(result.track.title, exact.title);
+  assert.equal(agentCalls, 1);
+  assert.equal(bodies.length, 1);
+});
+
+test('an agent infrastructure failure falls through to the deterministic resolver', async () => {
+  await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  agentError = new Error('synthetic request-agent failure');
+
+  const result = await submit();
+
+  assert.equal(result.outcome, 'matched');
+  assert.equal(result.track.title, exact.title);
+  assert.equal(agentCalls, 1);
+  assert.equal(bodies.length, 1);
 });
 
 test('a song request naming only a film goes through evidence identification', async () => {
@@ -309,20 +370,15 @@ test('a missing short title fails without selecting an unrelated fallback', asyn
 
 test('a framed impossible title stays no-match instead of taking an agent vibe fallback', async () => {
   await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  agentResult = { object: {}, toolCalls: [], extras: { seen: new Map() } };
   catalogueSongs = [filler];
   searchEmpty = true;
-  agentResult = {
-    object: { id: filler.id, ack: 'Unrelated fallback' },
-    steps: 1,
-    toolCalls: [{ name: 'searchLibrary' }],
-    extras: { seen: new Map([[filler.id, filler]]) },
-  };
   const result = await submit('play qzxv impossible recording 918273');
   assert.equal(result.status, 'failed');
   assert.equal(result.outcome, 'no-match');
   assert.match(result.message, /couldn.t find|could not find|no match|nothing .* matched/i);
   assert.equal(queue.upcoming.length, 0);
-  assert.equal(agentCalls, 0, 'a framed title must not enter the evidence agent');
+  assert.equal(agentCalls, 1, 'agentic mode tries the agent before direct fallback');
 });
 
 test('a one-word artist remains artist-capable after a title miss', async () => {
@@ -346,8 +402,9 @@ test('a stalled interpreter settles the accepted request instead of leaving it p
   assert.equal(queue.upcoming.length, 0);
 });
 
-test('agentic matching cannot replace an explicit voice request with another artist track', async () => {
+test('an agent failure cannot replace an explicit voice request with another artist track', async () => {
   await settings.update({ llm: { requestMatching: 'agentic' } } as never);
+  agentResult = { object: {}, toolCalls: [], extras: { seen: new Map() } };
   catalogueSongs = [
     { id: 'blank-space', title: 'Blank Space', artist: 'Taylor Swift' },
     { id: 'patient-zero', title: 'Patient Zero', artist: 'Taylor Swift' },
@@ -358,7 +415,7 @@ test('agentic matching cannot replace an explicit voice request with another art
   assert.equal(result.track.title, 'Patient Zero');
   assert.equal(result.track.artist, 'Taylor Swift');
   assert.equal(queue.upcoming[0].track.id, 'patient-zero');
-  assert.equal(agentCalls, 0, 'explicit title and artist requests bypass agentic matching');
+  assert.equal(agentCalls, 1, 'agentic mode tries the agent before deterministic fallback');
 });
 
 test('a failed interpreter falls back to a bounded title/artist parser', async () => {

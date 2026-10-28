@@ -461,12 +461,11 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     });
   }
 
-  // The literal parser is the authority for an explicit title+artist pair.
-  // Such a request is an identity claim, so it bypasses the conversational
-  // agent and uses the bounded catalogue resolver below. This is both faster
-  // for voice clients and prevents an agent from turning "title by artist"
-  // into a popular song by that artist. Vague, mood, similarity and lyric
-  // requests still use the agent, including its existing web-search tool.
+  // The literal parser remains the authority for an explicit title+artist
+  // pair when the request reaches the deterministic fallback. Agentic mode
+  // still gives the conversational agent first refusal, while the bounded
+  // catalogue resolver protects the identity claim if that agent is disabled,
+  // unavailable or returns no usable result.
   const literal = modelFreeMatch(text);
   const lyricLike = isLyricOrFilmDescription(text);
   // A framed request with a concrete, attribute-free name is still a named

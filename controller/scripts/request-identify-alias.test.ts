@@ -229,13 +229,13 @@ test('two same-title recordings with no artist evidence are a no-match, not the 
   const adele = { id: 'hello-adele', title: 'Hello', artist: 'Adele', album: '25' };
   const richie = { id: 'hello-richie', title: 'Hello', artist: 'Lionel Richie', album: "Can't Slow Down" };
   const cases = [
-    { origin: 'http://search.tie.fixture', content: 'Hello lyrics. Hello, it is me, I was wondering.', expected: { candidates: [], note: 'could not find the described song in this library' } },
+    { origin: 'http://search.tie.fixture', reference: 'hello it is me', content: 'Hello lyrics. Hello, it is me, I was wondering.', expected: { candidates: [], note: 'could not find the described song in this library' } },
     // The web naming one performer is the artist evidence that breaks the tie.
-    { origin: 'http://search.tie-adele.fixture', content: 'Hello lyrics. The Adele song opens: hello, it is me.', expected: { candidates: [adele] } },
+    { origin: 'http://search.tie-adele.fixture', reference: 'hello it is me Adele', content: 'Hello lyrics. The Adele song opens: hello, it is me.', expected: { candidates: [adele] } },
   ];
 
   try {
-    for (const { origin, content, expected } of cases) {
+    for (const { origin, reference, content, expected } of cases) {
       await settings.update({
         llm: { provider: 'openai-compatible', model: 'fixture-model', compatibleMode: 'local', baseUrl: 'http://llm.tie.fixture/v1', fallback: { enabled: false } },
         search: { provider: 'searxng', baseUrl: origin },
@@ -259,7 +259,7 @@ test('two same-title recordings with no artist evidence are a no-match, not the 
       }) as typeof fetch;
 
       const built: any = identifyTool.build({ collect: (songs: any[]) => songs } as any);
-      const result = await built.execute({ reference: 'hello it is me' }, {} as any);
+      const result = await built.execute({ reference }, {} as any);
       assert.deepEqual(result, expected, origin);
     }
   } finally {

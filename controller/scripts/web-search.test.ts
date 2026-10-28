@@ -1,6 +1,6 @@
 // Brave response fixtures (#623), SearXNG response fixtures and URL pins
 // (#1353). Recorded JSON keeps parser coverage tied to real provider shapes.
-// The dispatcher memo must separate recency windows for segment and picker tools.
+// The dispatcher keeps provider and recency selection deterministic.
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { createTempDir } from './test-utils/temp-dir.js';
 
 process.env.STATE_DIR = createTempDir(join(tmpdir(), 'subwave-web-search-'));
-const { parseBraveResponse, buildSearxngUrl, parseSearxngResponse, searchWeb, searchCacheSize, isWebSearchProviderError } =
+const { parseBraveResponse, buildSearxngUrl, parseSearxngResponse, searchWeb, isWebSearchProviderError } =
   await import('../src/skills/web-search.js');
 const settings = await import('../src/settings.js');
 const here = dirname(fileURLToPath(import.meta.url));
@@ -191,127 +191,6 @@ test('the pin rides alongside time_range, not instead of it', () => {
 test('a base URL with a path still resolves to /search', () => {
   const url = buildSearxngUrl({ baseUrl: 'http://searx.lan:8888/', query: 'x' });
   assert.equal(url.pathname, '/search');
-});
-
-test('dispatcher cache separates recency windows and reuses each answer', async t => {
-  await settings.load();
-  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://search.test' } });
-  const windows: Array<string | null> = [];
-  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
-    const url = new URL(input instanceof Request ? input.url : input);
-    windows.push(url.searchParams.get('time_range'));
-    return new Response(JSON.stringify({ results: [{ title: 'Foo', content: `window ${windows.at(-1)}` }] }));
-  });
-  const all = await searchWeb('recency-cache-regression');
-  const week = await searchWeb('recency-cache-regression', { recency: 'week' });
-  assert.deepEqual(windows, [null, 'week']);
-  assert.notDeepEqual(all, week, 'the two windows have their own data');
-  assert.deepEqual(await searchWeb('RECENCY-CACHE-REGRESSION'), all);
-  assert.deepEqual(await searchWeb('RECENCY-CACHE-REGRESSION', { recency: 'week' }), week);
-  assert.equal(windows.length, 2, 'repeats of both windows use their cached answers');
-});
-
-test('empty provider responses are retried instead of cached for the full TTL', async t => {
-  await settings.load();
-  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://empty-search.test' } });
-  let calls = 0;
-  t.mock.method(globalThis, 'fetch', async () => {
-    calls++;
-    return new Response(JSON.stringify({ results: [] }));
-  });
-  const query = `empty-cache-regression-${Date.now()}`;
-  assert.deepEqual(await searchWeb(query), { answer: '', results: [] });
-  assert.deepEqual(await searchWeb(query), { answer: '', results: [] });
-  assert.equal(calls, 2, 'an empty result must not be reused from the long-lived cache');
-  assert.ok(searchCacheSize() >= 0);
-});
-
-test('dispatcher cache is isolated by SearXNG base URL and engine selection', async t => {
-  await settings.load();
-  const calls: string[] = [];
-  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request) => {
-    const url = new URL(input instanceof Request ? input.url : input);
-    calls.push(url.toString());
-    return Response.json({ results: [{ title: url.host, content: url.searchParams.get('engines') || 'default' }] });
-  });
-  const query = `provider-config-cache-${Date.now()}`;
-
-  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://first.test', searxngEngines: 'google' } });
-  const first = await searchWeb(query);
-  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://second.test', searxngEngines: 'wikipedia' } });
-  const second = await searchWeb(query);
-
-  assert.equal(calls.length, 2, 'each provider configuration gets its own cache entry');
-  assert.notDeepEqual(first, second);
-  assert.match(calls[0], /first\.test/);
-  assert.match(calls[0], /engines=google/);
-  assert.match(calls[1], /second\.test/);
-  assert.match(calls[1], /engines=wikipedia/);
-});
-
-test('concurrent identical searches share one provider request', async t => {
-  await settings.load();
-  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://dedupe.test', searxngEngines: '' } });
-  let calls = 0;
-  let release!: () => void;
-  const blocked = new Promise<void>(resolve => { release = resolve; });
-  t.mock.method(globalThis, 'fetch', async () => {
-    calls++;
-    await blocked;
-    return Response.json({ results: [{ title: 'Shared', content: 'one result' }] });
-  });
-  const query = `concurrent-search-${Date.now()}`;
-  const first = searchWeb(query);
-  const second = searchWeb(query);
-  await new Promise(resolve => setImmediate(resolve));
-  const callsWhilePending = calls;
-  release();
-  assert.deepEqual(await first, await second);
-  assert.equal(callsWhilePending, 1);
-  assert.equal(calls, 1);
-});
-
-test('aborting the last waiting caller aborts the shared provider fetch', async t => {
-  await settings.load();
-  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://abort.test', searxngEngines: '' } });
-  let providerSignal: AbortSignal | undefined;
-  t.mock.method(globalThis, 'fetch', async (_input: string | URL | Request, init?: RequestInit) => {
-    providerSignal = init?.signal as AbortSignal | undefined;
-    await new Promise<never>((_, reject) => {
-      providerSignal?.addEventListener('abort', () => reject(providerSignal?.reason), { once: true });
-    });
-    throw new Error('unreachable');
-  });
-  const controller = new AbortController();
-  const request = searchWeb(`abort-search-${Date.now()}`, { signal: controller.signal });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.ok(providerSignal, 'provider should receive the resolver signal');
-  controller.abort(new Error('cancelled'));
-  await assert.rejects(request, /cancelled/);
-  assert.equal(providerSignal.aborted, true);
-});
-
-test('one aborted caller does not cancel a shared search still needed by another', async t => {
-  await settings.load();
-  await settings.update({ search: { provider: 'searxng', baseUrl: 'https://shared-abort.test', searxngEngines: '' } });
-  let providerSignal: AbortSignal | undefined;
-  let release!: () => void;
-  const blocked = new Promise<void>(resolve => { release = resolve; });
-  t.mock.method(globalThis, 'fetch', async (_input: string | URL | Request, init?: RequestInit) => {
-    providerSignal = init?.signal as AbortSignal | undefined;
-    await blocked;
-    return Response.json({ results: [{ title: 'Shared', content: 'evidence' }] });
-  });
-  const firstController = new AbortController();
-  const query = `shared-abort-${Date.now()}`;
-  const first = searchWeb(query, { signal: firstController.signal });
-  const second = searchWeb(query);
-  await new Promise(resolve => setImmediate(resolve));
-  firstController.abort(new Error('first caller cancelled'));
-  await assert.rejects(first, /first caller cancelled/);
-  assert.equal(providerSignal?.aborted, false);
-  release();
-  assert.equal((await second).results[0]?.title, 'Shared');
 });
 
 test('rate limits become typed provider failures and are never cached', async t => {

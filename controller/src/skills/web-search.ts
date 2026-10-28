@@ -59,14 +59,6 @@ const cache = new BoundedKeyMap<{ val: SearchResponse; at: number }>({
   maxKeys: CACHE_MAX_KEYS,
   isLive: (rec, now) => now - rec.at < CACHE_TTL_MS,
 });
-type InFlightSearch = {
-  promise: Promise<SearchResponse>;
-  controller: AbortController;
-  consumers: number;
-  settled: boolean;
-};
-const inFlight = new Map<string, InFlightSearch>();
-
 // Test seam.
 export function searchCacheSize(): number {
   return cache.size;
@@ -75,100 +67,13 @@ export function searchCacheSize(): number {
 async function memo(
   key: string,
   ttl: number,
-  fn: (signal: AbortSignal) => Promise<SearchResponse>,
-  signal?: AbortSignal,
+  fn: () => Promise<SearchResponse>,
 ): Promise<SearchResponse> {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < ttl) return hit.val;
-  let shared = inFlight.get(key);
-  if (!shared) {
-    const controller = new AbortController();
-  // Publish the promise before starting the provider call. Some fetch seams
-  // invoke their mock synchronously; starting `fn()` first leaves a tiny race
-  // where two same-tick callers both miss the in-flight map.
-    const request = Promise.resolve().then(() => fn(controller.signal)).then(val => {
-      // Empty responses are usually transient provider failures or upstream
-      // timeouts represented as a successful empty JSON response. Caching them
-      // for the full TTL turns one bad search into a 30-minute outage for the
-      // request resolver. Keep useful evidence cached, but let the next request
-      // retry an empty result immediately.
-      if (val.answer.trim() || val.results.length > 0) cache.set(key, { val, at: Date.now() });
-      return val;
-    });
-    shared = { promise: request, controller, consumers: 0, settled: false };
-    inFlight.set(key, shared);
-    const clear = () => {
-      shared!.settled = true;
-      if (inFlight.get(key) === shared) inFlight.delete(key);
-    };
-    request.then(clear, clear);
-  }
-  shared.consumers++;
-  const reason = signal?.reason;
-  return awaitWithAbort(shared.promise, signal, () => {
-    shared!.consumers--;
-    if (!shared!.settled && shared!.consumers === 0) shared!.controller.abort(reason);
-  });
-}
-
-function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, onDone: () => void): Promise<T> {
-  if (!signal) return promise.finally(onDone);
-  if (signal.aborted) {
-    onDone();
-    return Promise.reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
-  }
-  return new Promise<T>((resolve, reject) => {
-    let finished = false;
-    const abort = () => {
-      if (finished) return;
-      finished = true;
-      cleanup();
-      onDone();
-      reject(signal.reason || new DOMException('The operation was aborted', 'AbortError'));
-    };
-    const cleanup = () => signal.removeEventListener('abort', abort);
-    signal.addEventListener('abort', abort, { once: true });
-    promise.then(
-      value => {
-        if (finished) return;
-        finished = true;
-        cleanup();
-        onDone();
-        resolve(value);
-      },
-      error => {
-        if (finished) return;
-        finished = true;
-        cleanup();
-        onDone();
-        reject(error);
-      },
-    );
-  });
-}
-
-function normalizedSearchQuery(query: string): string {
-  return query.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en');
-}
-
-/**
- * Cache identity follows the selected provider configuration. A live settings
- * change must never reuse evidence fetched from another SearXNG instance or
- * another engine set.
- */
-export function searchCacheKey(
-  query: string,
-  opts?: { recency?: 'day' | 'week' | 'month' },
-): string {
-  const search = settings.get().search;
-  const provider = search?.provider || 'duckduckgo';
-  return JSON.stringify({
-    provider,
-    baseUrl: provider === 'searxng' ? String(search?.baseUrl || '').trim().replace(/\/+$/, '') : '',
-    engines: provider === 'searxng' ? String(search?.searxngEngines || '').trim() : '',
-    recency: opts?.recency || '',
-    query: normalizedSearchQuery(query),
-  });
+  const val = await fn();
+  cache.set(key, { val, at: Date.now() });
+  return val;
 }
 
 export async function tavilySearch(query: string, signal?: AbortSignal): Promise<SearchResponse> {
@@ -470,22 +375,22 @@ export function parseBraveResponse(data: unknown): SearchResponse {
 
 // Provider dispatcher — reads the active provider from live settings on every
 // call so admin-UI changes take effect immediately. Wraps the backend in a
-// 30-min memo. Cache key includes recency so two callsites with different
-// recency hints don't share results.
+// 30-min memo. Cache key includes the provider and recency so two callsites
+// with different backends or hints don't share results.
 export async function searchWeb(
   query: string,
   opts?: { recency?: 'day' | 'week' | 'month'; signal?: AbortSignal },
 ): Promise<SearchResponse> {
   const provider = settings.get().search?.provider || 'duckduckgo';
   const recency = opts?.recency;
-  const key = searchCacheKey(query, opts);
+  const key = `${provider}:${recency || ''}:${query.toLowerCase()}`;
   try {
-    return await memo(key, CACHE_TTL_MS, sharedSignal => {
-      if (provider === 'searxng') return searxngSearch(query, recency, sharedSignal);
-      if (provider === 'tavily') return tavilySearch(query, sharedSignal);
-      if (provider === 'brave') return braveSearch(query, recency, sharedSignal);
-      return duckduckgoSearch(query, sharedSignal);
-    }, opts?.signal);
+    return await memo(key, CACHE_TTL_MS, () => {
+      if (provider === 'searxng') return searxngSearch(query, recency, opts?.signal);
+      if (provider === 'tavily') return tavilySearch(query, opts?.signal);
+      if (provider === 'brave') return braveSearch(query, recency, opts?.signal);
+      return duckduckgoSearch(query, opts?.signal);
+    });
   } catch (error) {
     if (opts?.signal?.aborted) throw error;
     throw typedProviderError(provider, error);

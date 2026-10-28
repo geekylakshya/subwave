@@ -10,14 +10,12 @@ import {
   languageDisplayName,
   resolveLanguageCode,
   canonicalLanguage,
-  resolveRequestEnergy,
   resolveRequestGenre as resolveRequestGenreAlias,
   resolveRequestMood,
   looksLikeLyricRequest,
   isLyricOrFilmDescription,
   LYRIC_CUE,
   hasUnspacedNativeScript,
-  type RequestEnergy,
 } from './request-normalize.js';
 import { bpmCompat, keyCompat } from './mix.js';
 
@@ -34,7 +32,6 @@ export interface RequestMatch {
   genre?: string | null;
   language?: string | null;
   mood?: string | null;
-  energy?: RequestEnergy | null;
   sort?: string | null;
   scope?: string;
   search_terms?: string[];
@@ -170,7 +167,7 @@ function titleSearchVariants(value: string): string[] {
 export interface RequestSelection {
   track: RequestSong | null;
   source: string;
-  outcome: 'matched' | 'partial' | 'substituted' | 'cooldown' | 'already-queued' | 'no-match' | 'unsupported';
+  outcome: 'matched' | 'substituted' | 'cooldown' | 'already-queued' | 'no-match' | 'unsupported';
   errors: string[];
   unmetPreferences?: string[];
   unsupported?: string[];
@@ -211,7 +208,6 @@ export function directRequestUnsupported(text: string, match: RequestMatch = {})
     const lastWord = prefixWords[prefixWords.length - 1] || '';
     const genericFrame = /(?:anything|something|music|songs?|tracks?|a\s+song|a\s+track)\s*$/iu.test(prefix);
     const recognisedAttribute = !!(resolveRequestMood(lastWord)
-      || resolveRequestEnergy(lastWord)
       || resolveRequestGenreAlias(lastWord)
       || requestLanguageCode(lastWord));
     if (genericFrame || recognisedAttribute) reasons.add('exclusions');
@@ -727,7 +723,7 @@ export function rankRequestCandidates(
 const ATTRIBUTE_CONNECTORS = new Set(['and', 'or', 'in', 'en', 'de', 'में', 'ਵਿੱਚ', 'vibes', 'vibe']);
 
 function knownAttributeToken(token: string): boolean {
-  return !!(resolveRequestMood(token) || resolveRequestEnergy(token)
+  return !!(resolveRequestMood(token)
     || resolveRequestGenreAlias(token) || requestLanguageCode(token));
 }
 
@@ -756,11 +752,11 @@ export function isFramedTitleOnlyRequest(text: string, literal: RequestMatch): b
     && literal.kind === 'track'
     && Boolean(literal.title?.trim())
     && !literal.artist && !literal.album
-    && !literal.genre && !literal.language && !literal.mood && !literal.energy
+    && !literal.genre && !literal.language && !literal.mood
     && /^(?:please\s+)?(?:play|queue|request|put\s+on)\b/iu.test(text)
     && !hasUnspacedNativeScript(text)
     && !LYRIC_CUE.test(text)
-    && !/\b(?:album|artist|genre|language|mood|energy)\b/iu.test(text)
+    && !/\b(?:album|artist|genre|language|mood)\b/iu.test(text)
     && !/^(?:please\s+)?(?:play|queue|request|put\s+on)\s+(?:some|something|anything|music|a\s+song|a\s+track)\b/iu.test(text);
 }
 
@@ -772,7 +768,7 @@ export function modelFreeRequest(text: string): RequestMatch {
     const album = unquote(albumPhrase[1]);
     return {
       kind: 'track', title: null, album, artist: null, genre: null, language: null,
-      mood: null, energy: null, sort: null, scope: 'album', search_terms: album ? [album] : [],
+      mood: null, sort: null, scope: 'album', search_terms: album ? [album] : [],
       intent: album ? `Wants a track from the album ${album}.` : 'Wants a track from an album.', ack: '',
     };
   }
@@ -791,7 +787,7 @@ export function modelFreeRequest(text: string): RequestMatch {
     && !/["'“‘]/u.test(cleaned)) {
     return {
       kind: 'track', title: null, album: null, artist: null, genre: null,
-      language: null, mood: null, energy: null, sort: null, scope: 'song',
+      language: null, mood: null, sort: null, scope: 'song',
       search_terms: [], intent: 'Wants more like the current track.', ack: '',
     };
   }
@@ -803,7 +799,7 @@ export function modelFreeRequest(text: string): RequestMatch {
     const seed = modelFreeRequest(`play ${namedSimilarity[1]}`);
     return {
       kind: 'track', title: null, album: null, artist: null, genre: null,
-      language: null, mood: null, energy: null, sort: null, scope: 'song',
+      language: null, mood: null, sort: null, scope: 'song',
       search_terms: [],
       similarTo: {
         title: seed.title || null,
@@ -820,7 +816,6 @@ export function modelFreeRequest(text: string): RequestMatch {
   const languagePhrase = attributeBody.match(/(?:^|\s+)(?:in|en|de|में|ਵਿੱਚ)\s+([\p{L}][\p{L} -]*?)[.!?]*$/iu);
   const attributeCore = languagePhrase ? attributeBody.slice(0, languagePhrase.index).trim() : attributeBody;
   const inferredMood = !lyricLike ? resolveRequestMood(attributeCore) : null;
-  const inferredEnergy = !lyricLike ? resolveRequestEnergy(attributeCore) : null;
   const inferredGenre = !lyricLike ? resolveRequestGenreAlias(attributeCore) : null;
   // A recognised genre name is not automatically a language. If the same
   // value is also an unambiguous language name ("Punjabi music"), preserve
@@ -837,9 +832,9 @@ export function modelFreeRequest(text: string): RequestMatch {
     : !lyricLike && genreLanguage
       ? genreLanguage
     : null;
-  if ((inferredMood || inferredEnergy || inferredGenre || inferredLanguage)
+  if ((inferredMood || inferredGenre || inferredLanguage)
     && isAttributeOnlyRequest(attributeBody, languagePhrase, [
-      inferredMood, inferredEnergy, inferredGenre, inferredLanguage,
+      inferredMood, inferredGenre, inferredLanguage,
     ])
     && !/\s+(?:by|from)\s+/iu.test(cleaned)
     && !/[\u0000,]|\s[-–—]\s/u.test(cleaned)
@@ -848,7 +843,6 @@ export function modelFreeRequest(text: string): RequestMatch {
       && !/\b(?:genre|style)\b/iu.test(cleaned);
     const conditions = [
       inferredMood ? `Wants ${inferredMood} music.` : '',
-      inferredEnergy ? `Wants ${inferredEnergy}-energy music.` : '',
       inferredGenre ? `Wants ${inferredGenre} music.` : '',
       languageRequested ? `Wants ${inferredLanguage}-language music.` : '',
     ].filter(Boolean);
@@ -856,7 +850,7 @@ export function modelFreeRequest(text: string): RequestMatch {
       kind: 'track', title: null, album: null, artist: null,
       genre: inferredGenre,
       language: languageRequested ? inferredLanguage : null,
-      mood: inferredMood, energy: inferredEnergy, sort: null, scope: 'song', search_terms: [],
+      mood: inferredMood, sort: null, scope: 'song', search_terms: [],
       unsupported: [], intent: conditions.join(' '), ack: '',
     };
   }
@@ -893,7 +887,7 @@ export function modelFreeRequest(text: string): RequestMatch {
   const genericPair = by && /^(?:(?:the|a|some|my)\s+)?(?:song|track|tune|music)$/iu.test(unquote(by[1]));
   if (artistOnly || knownMood || genericPair) return { kind: 'track', artist: unquote(artistOnly?.[1] || describedArtist?.[2] || by![2]), title: null,
     unverifiedConditions, language: language?.[1] || null, mood: knownMood ? resolveRequestMood(describedArtist?.[1]) : null,
-    energy: resolveRequestEnergy(describedArtist?.[1]), album: null, search_terms: [], scope: 'song', ack: '' };
+    album: null, search_terms: [], scope: 'song', ack: '' };
   // `from` is ambiguous in a title-only request. Keep the complete wording as
   // the first identity hypothesis and retain the split form as verified
   // soundtrack/album context. The resolver only accepts the split form when
@@ -912,7 +906,7 @@ export function modelFreeRequest(text: string): RequestMatch {
       if (/^(?:a\s+)?(?:song|track|music|one)$/iu.test(titleBefore)) {
         return {
           kind: 'track', title: null, album: null, artist: null,
-          genre: null, language: null, mood: null, sort: null, energy: null,
+          genre: null, language: null, mood: null, sort: null,
           scope: 'song', search_terms: [], unsupported: ['film identification'],
           intent: 'Identify a song from a film or show.', ack: '',
         };
@@ -920,7 +914,7 @@ export function modelFreeRequest(text: string): RequestMatch {
       return {
         kind: 'track', title: wholeTitle, album: null, artist: null,
         genre: null, language: language?.[1] || null, mood: null, sort: null,
-        energy: null, reversible: false, search_terms: [wholeTitle], scope: 'song',
+        reversible: false, search_terms: [wholeTitle], scope: 'song',
         releaseContext: { name: contextName, kind: contextKind, title: titleBefore, wholeTitle },
         intent: 'Wants a named recording with soundtrack or album context.', ack: '',
       };
@@ -963,7 +957,7 @@ export function classifyListenerRequest(text: string, literal = modelFreeRequest
     || /\b(?:lyrics?|words|line)\s+(?:are|goes?|containing|that has)\b/iu.test(normalized)) {
     return 'lyrics-or-description';
   }
-  if (literal.album || literal.genre || literal.language || literal.mood || literal.energy || literal.scope === 'album') {
+  if (literal.album || literal.genre || literal.language || literal.mood || literal.scope === 'album') {
     return 'attributes';
   }
   const generic = /^(?:please\s+)?(?:play|queue|put on|request)\s+(?:me\s+)?(?:anything|something|music|a song|a track)|^(?:anything|something|surprise me|more like this)$/iu;
@@ -999,7 +993,7 @@ export function repairRequestMatch(match: RequestMatch, text: string): RequestMa
   // Preserve every deterministic constraint the model omitted. This is
   // especially important for combined requests such as "energetic rock in
   // Punjabi": the model may identify the intent but return only one field.
-  for (const key of ['mood', 'energy', 'genre', 'language'] as const) {
+  for (const key of ['mood', 'genre', 'language'] as const) {
     if (!match[key] && literal[key]) match = { ...match, [key]: literal[key] };
   }
   // A song quoted right after the request's framing is explicit even if the
@@ -1093,12 +1087,10 @@ export function normalizeRequestMatch(match: RequestMatch, options: { moods?: re
   const mood = match.mood ? resolveRequestMood(match.mood, options.moods || []) || match.mood : null;
   // The request schema currently emits only the three supported values. Keep
   // legacy or hand-written callers safe as well: an unknown model value must
-  // not leak into pool lookup as if it were a valid energy bucket.
-  const energy = match.energy ? resolveRequestEnergy(match.energy) : null;
   const language = match.language && resolveLanguageCode(match.language)
     ? (languageDisplayName(match.language) || match.language)
     : match.language || null;
-  return { ...match, mood, energy, language };
+  return { ...match, mood, language };
 }
 
 // One chronological scale; precise original dates precede release/year fallbacks.
@@ -1117,7 +1109,6 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   queuedIds: Set<string>;
   currentId?: string | null;
   moodSongs(mood: string): Promise<RequestSong[]>;
-  energySongs?(energy: RequestEnergy): Promise<RequestSong[]>;
   languageSongs?(language: string): Promise<RequestSong[]>;
   fallbackSongs(): Promise<RequestSong[]>;
   similarSongs?(): Promise<RequestSong[]>;
@@ -1162,16 +1153,12 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
   // Once a named song missed, a pool draw only stands in for it.
   let standingIn = false;
   const moodPool = match.mood ? await safe('mood tracks', () => deps.moodSongs(match.mood!), []) : [];
-  const energyPool = match.energy && deps.energySongs
-    ? await safe('energy tracks', () => deps.energySongs!(match.energy!), [])
-    : [];
   const languagePool = match.language && deps.languageSongs
     ? await safe('language tracks', () => deps.languageSongs!(canonicalLanguage(match.language!) || match.language!), [])
     : [];
   const moodIds = new Set(moodPool.map(song => song.id));
   const moodMatches = (song: RequestSong) => !match.mood || moodIds.has(song.id)
     || Boolean(song.moods?.some(m => requestName(m) === requestName(match.mood)));
-  const energyMatches = (song: RequestSong) => !match.energy || requestName(song.energy) === requestName(match.energy);
   let resolvedArtistName = match.artist;
   // The complete "X from Y" wording is a title in its own right ("Postcards
   // from Italy"), so only the split "X" reading has to prove Y in the
@@ -1218,12 +1205,10 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     const moodScore = overlap((similaritySeed.moods || []).map(requestName), (song.moods || []).map(requestName));
     const languageScore = similaritySeed.language && song.language
       ? Number(requestLanguageTagMatches(similaritySeed.language, song.language)) : 0;
-    const energyScore = similaritySeed.energy && song.energy
-      ? Number(requestName(similaritySeed.energy) === requestName(song.energy)) : 0;
     const tempoScore = bpmCompat(similaritySeed.bpm ?? null, song.bpm ?? null);
     const keyScore = keyCompat(similaritySeed.musicalKey ?? null, song.musicalKey ?? null);
     return 0.55 * audio + 0.14 * genreScore + 0.10 * moodScore + 0.08 * languageScore
-      + 0.05 * energyScore + 0.05 * tempoScore + 0.03 * keyScore;
+      + 0.05 * tempoScore + 0.03 * keyScore;
   };
   const choose = (songs: RequestSong[]) => {
     if (match.similarTo && similaritySeed) {
@@ -1231,8 +1216,7 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     }
     const score = (song: RequestSong) => Number(!!match.mood && moodMatches(song))
       + Number(!!match.genre && !requiredGenre && genreMatches(song))
-      + Number(!!match.language && !requiredLanguage && languageMatches(song))
-      + Number(!!match.energy && energyMatches(song));
+      + Number(!!match.language && !requiredLanguage && languageMatches(song));
     const best = songs.reduce((best, song) => Math.max(best, score(song)), 0);
     const pool = songs.filter(song => score(song) === best);
     if (deps.choose) return deps.choose(pool);
@@ -1303,9 +1287,9 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     const track = choose(pool.filter(eligible));
     const named = exact && !standingIn;
     if (track) {
-      const unmetPreferences = [!moodMatches(track) && 'mood', !genreMatches(track) && 'genre', !languageMatches(track) && 'language', !energyMatches(track) && 'energy'].filter((value): value is string => !!value);
-      const outcome = named ? (unmetPreferences.length ? 'partial' : 'matched') : 'substituted';
-      return { track, source, outcome, errors, unmetPreferences };
+      const unmetPreferences = [!moodMatches(track) && 'mood', !genreMatches(track) && 'genre', !languageMatches(track) && 'language']
+        .filter((value): value is string => !!value);
+      return { track, source, outcome: named ? 'matched' : 'substituted', errors, unmetPreferences };
     }
     // Preserve the requested identity for an honest refusal, never replace an
     // exact recording merely because it is queued or on cooldown.
@@ -1331,13 +1315,13 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
         errors,
       };
     }
-    const unmetPreferences = [!moodMatches(track) && 'mood', !genreMatches(track) && 'genre', !languageMatches(track) && 'language', !energyMatches(track) && 'energy'].filter((value): value is string => !!value);
     return {
       track,
       source,
-      outcome: unmetPreferences.length ? 'partial' : 'matched',
+      outcome: 'matched',
       errors,
-      unmetPreferences,
+      unmetPreferences: [!moodMatches(track) && 'mood', !genreMatches(track) && 'genre', !languageMatches(track) && 'language']
+        .filter((value): value is string => !!value),
     };
   };
   const refusal = (): RequestSelection | null => held ? {
@@ -1619,10 +1603,6 @@ export async function resolveDirectRequest(match: RequestMatch, deps: {
     }
     if (match.mood) {
       const result = select(moodPool, `library-mood:${match.mood}`);
-      if (result) return result;
-    }
-    if (match.energy) {
-      const result = select(energyPool, `library-energy:${match.energy}`);
       if (result) return result;
     }
     // A genre/language may be absent from Navidrome's genre index even though

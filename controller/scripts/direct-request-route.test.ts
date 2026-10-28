@@ -505,7 +505,7 @@ test('a named song in an unavailable language does not queue the wrong language'
 test('unmet mood stays diagnostic when the requested artist is matched', async () => {
   modelOutput = { artist: 'Queen', mood: 'calm', search_terms: ['Queen'] };
   const result = await submit('Play something calm by Queen');
-  assert.equal(result.outcome, 'partial');
+  assert.equal(result.outcome, 'matched');
   assert.equal(result.track.artist, 'Queen');
   assert.doesNotMatch(result.ack, /alternative|verify the requested mood/);
   assert.equal(queue.upcoming.length, 1);
@@ -522,7 +522,7 @@ test('an artist mood description is not restored as a literal song title', async
 test('failed interpretation can preserve an artist and treat mood as a preference', async () => {
   modelError = true;
   const result = await submit('Play something calm by Queen');
-  assert.equal(result.outcome, 'partial');
+  assert.equal(result.outcome, 'matched');
   assert.equal(result.track.artist, 'Queen');
 });
 
@@ -643,7 +643,7 @@ for (const metadata of [{ genre: undefined }, { language: undefined }, { genre: 
     catalogueSongs = [{ ...exact, ...metadata }, filler];
     modelOutput = { artist: 'Queen', search_terms: ['Bohemian Rhapsody', 'Queen'], genre: 'rock', mood: 'celebratory', language: 'English' };
     const result = await submit();
-    assert.equal(result.outcome, 'partial');
+    assert.equal(result.outcome, 'matched');
     assert.equal(queue.upcoming[0].track.id, exact.id);
     assert.doesNotMatch(result.ack, /alternative|verify the requested mood/);
     assert.ok(requestLog.snapshot(1)[0].unmetPreferences.includes('mood'));
@@ -653,7 +653,7 @@ for (const metadata of [{ genre: undefined }, { language: undefined }, { genre: 
 test('review: condition words inside a named title do not make a guessed genre explicit', async () => {
   catalogueSongs = [{ ...exact, title: 'Jazz Song', genre: undefined }];
   modelOutput = { artist: 'Queen', title: 'Jazz Song', genre: 'Jazz' };
-  assert.equal((await submit('Queen, Jazz Song')).outcome, 'partial');
+  assert.equal((await submit('Queen, Jazz Song')).outcome, 'matched');
 });
 
 test('review: explicit language still constrains fallback after interpreter failure', async () => {
@@ -862,7 +862,7 @@ for (const text of issuePhrasings) {
     artistSongs = [killerQueen];
     genreSongs = [filler];
     const result = await submit(text);
-    assert.equal(result.outcome, 'partial');
+    assert.equal(result.outcome, 'matched');
     assert.equal(queue.upcoming[0].track.id, exact.id);
   });
 
@@ -883,7 +883,7 @@ test('#1961: a reply that names no artist still keeps a song the listener named'
   modelOutput = { ...issueReply, artist: null, search_terms: ['Bohemian Rhapsody'] };
   genreSongs = [filler];
   const result = await submit('play Bohemian Rhapsody');
-  assert.equal(result.outcome, 'partial');
+  assert.equal(result.outcome, 'matched');
   assert.equal(queue.upcoming[0].track.id, exact.id);
 });
 
@@ -894,7 +894,7 @@ for (const text of ['Queen, Bohemian Rhapsody', 'Bohemian Rhapsody by Queen', 'Q
     modelOutput = { ...issueReply, artist: null };
     genreSongs = [filler];
     const result = await submit(text);
-    assert.equal(result.outcome, 'partial');
+    assert.equal(result.outcome, 'matched');
     assert.equal(queue.upcoming[0].track.id, exact.id);
   });
 
@@ -915,7 +915,7 @@ for (const text of ['Play Bohemian Rhapsody by Queen, it is my birthday', 'Bohem
     modelOutput = issueReply;
     artistSongs = [killerQueen];
     const result = await submit(text);
-    assert.equal(result.outcome, 'partial');
+    assert.equal(result.outcome, 'matched');
     assert.equal(queue.upcoming[0].track.id, exact.id);
   });
 
@@ -944,7 +944,7 @@ test('a model that respells a name with "The" cannot turn a word in it into a ha
   catalogueSongs = [filler, heyYou];
   modelOutput = { kind: 'track', title: 'Hey You', artist: 'The Rock Steady Crew', genre: 'rock', search_terms: ['Hey You'] };
   const result = await submit('Hey You by Rock Steady Crew');
-  assert.equal(result.outcome, 'partial');
+  assert.equal(result.outcome, 'matched');
   assert.equal(queue.upcoming[0].track.id, heyYou.id);
 });
 
@@ -1016,7 +1016,7 @@ for (const [open, close] of [['"', '"'], ['“', '”'], ["'", "'"], ['‘', '�
     artistSongs = [wrong];
     modelOutput = { title: null, artist: 'Queen', genre: 'rock', mood: 'celebratory', search_terms: [wrong.title] };
     const result = await submit(`Play ${open}Bohemian Rhapsody${close}`);
-    assert.equal(result.outcome, 'partial');
+    assert.equal(result.outcome, 'matched');
     assert.equal(queue.upcoming[0].track.id, exact.id);
   });
 }

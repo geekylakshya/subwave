@@ -545,16 +545,16 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
     && !/["'“‘]/u.test(text);
   const literalIdentityFrame = !/^\s*(?:please\s+)?(?:play|queue|request|put\s+on)\s+(?:anything|something|some|music|songs?|tracks?|a\s+song|a\s+track)\b/iu.test(text);
 
-  // Conversational DJ agent. On any failure fall through to the stateless
-  // cascade below, so a request is never dropped.
-  // The agent is reserved for evidence-heavy identification. Named, mood,
-  // genre and language requests must use the shared deterministic
-  // resolver so every listener request follows the same deterministic path. Lyric and film
-  // descriptions still use the existing web-aware agent path.
+  // Conversational DJ agent. On any non-evidence failure fall through to the
+  // stateless cascade below, so a request is never dropped. Agentic mode is
+  // intentionally agent-first for the shipped request-matching contract;
+  // deterministic-first routing belongs to a separate follow-up policy.
   const needsEvidenceIdentification = isLyricOrFilmDescription(text) && !framedTitleOnly;
-  if (!explicitNamedRequest && !likelyShortTitle && !forcedNamedTitle && !titleOnlyNamedRequest && needsEvidenceIdentification && djAgent.requestMatchingEnabled()) {
-    entry.stages.push('web-evidence');
-    entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
+  if (djAgent.requestMatchingEnabled()) {
+    if (needsEvidenceIdentification) {
+      entry.stages.push('web-evidence');
+      entry.evidenceSource = settings.get().search?.provider || 'duckduckgo';
+    }
     try {
       const agentRes = await djAgent.runRequest(queue, { requester, text, signal, introBudgetMs: () => requestIntroTimeoutMs(entry) });
       throwIfRequestResolutionAborted(signal);
@@ -599,13 +599,13 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
         });
       }
     } catch (err) {
-      if (err instanceof RequestIdentificationMiss) {
+      if (needsEvidenceIdentification && err instanceof RequestIdentificationMiss) {
         entry.path = 'agent';
         entry.pickSource = 'agent:evidence-miss';
         entry.outcome = 'no-match';
         return failed(EVIDENCE_MISS_REFUSAL);
       }
-      if (isWebSearchProviderError(err)) {
+      if (needsEvidenceIdentification && isWebSearchProviderError(err)) {
         entry.path = 'agent';
         entry.pickSource = 'agent:provider-error';
         entry.outcome = 'provider-error';

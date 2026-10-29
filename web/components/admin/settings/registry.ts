@@ -152,6 +152,7 @@ export const RESTART_PATHS: readonly string[] = [
   'station',
   'privacy.listenerAuth',
   'crossfadeDuration',
+  'transitions.equalPowerCrossfade',
   'ducking.voice',
   'ducking.intro',
   'archive.enabled',
@@ -304,8 +305,8 @@ export const SETTINGS_INDEX: readonly IndexEntry[] = [
   { label: 'Lyrics', section: 'library', card: 'Enrichment', keywords: 'lyrics embed text' },
 
   // ── web search ─────────────────────────────────────────────────────────────
-  { label: 'Provider', section: 'search', card: 'Provider', keywords: 'duckduckgo tavily brave searxng live facts' },
-  { label: 'API key', section: 'search', card: 'Provider', keywords: 'tavily brave token search_api_key' },
+  { label: 'Provider', section: 'search', card: 'Provider', keywords: 'duckduckgo tavily brave searxng keenable live facts' },
+  { label: 'API key', section: 'search', card: 'Provider', keywords: 'tavily brave keenable token search_api_key' },
   { label: 'SearXNG URL', section: 'search', card: 'Provider', keywords: 'self hosted meta search json' },
   { label: 'Engines', section: 'search', card: 'Provider', keywords: 'searxng engines pin restrict google duckduckgo wikipedia' },
 
@@ -347,6 +348,7 @@ export const SETTINGS_INDEX: readonly IndexEntry[] = [
   { label: 'Stem cache', section: 'broadcast', card: 'Stem transitions', keywords: 'demucs drums bass vocals disk' },
   { label: 'Stem cache budget', section: 'broadcast', card: 'Stem transitions', keywords: 'gb evict oldest' },
   { label: 'Stem-blend seams', section: 'broadcast', card: 'Stem transitions', keywords: 'drums carry under intro blend' },
+  { label: 'Crossfade curve', section: 'broadcast', card: 'Crossfade', keywords: 'equal power linear dip fade shape' },
   { label: 'Sweep', section: 'broadcast', card: 'DJ transition effects', keywords: 'transition effect filter gear change clash dj mode' },
   { label: 'Washout', section: 'broadcast', card: 'DJ transition effects', keywords: 'transition effect echo tail dub exit length cap dj mode' },
   { label: 'Blend', section: 'broadcast', card: 'DJ transition effects', keywords: 'transition effect spectral handover locked pair dj mode' },

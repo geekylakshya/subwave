@@ -2821,7 +2821,7 @@ export const SETTINGS_LOUDNESS_SOURCES = [
   'measured',
 ] as const;
 
-export const SETTINGS_SEARCH_PROVIDERS = ['duckduckgo', 'tavily', 'brave', 'searxng'] as const;
+export const SETTINGS_SEARCH_PROVIDERS = ['duckduckgo', 'tavily', 'brave', 'searxng', 'keenable'] as const;
 
 /**
  * Cap for the optional SearXNG `engines=` pin. Generous on purpose — the value
@@ -3073,6 +3073,7 @@ export const transitionsPatchSchema = settingsBlockOf({
   // save-time refusal. Do not add one here.
   pairDrain: settingsBoolLike(),
   stemBlends: settingsBoolLike(),
+  equalPowerCrossfade: settingsBoolLike(),
   effects: transitionEffectsPatchSchema,
 });
 

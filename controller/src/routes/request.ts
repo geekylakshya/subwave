@@ -28,7 +28,7 @@ import {
 } from '../middleware/ratelimit.js';
 import { validatePublicBody } from '../middleware/validate.js';
 import { listenerRequestSchema } from '../schemas/request.js';
-import { classifyListenerRequest, directRequestUnsupported, isFramedTitleOnlyRequest, isRefusedOutcome, isLyricOrFilmDescription, isGreetingLikeRequest, isGenericRequestPhrase, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, requestName, requestTitleSimilarity, resolveDirectRequest } from '../music/request-match.js';
+import { classifyListenerRequest, classifyUnsupportedLabels, directRequestUnsupported, isFramedTitleOnlyRequest, isRefusedOutcome, isLyricOrFilmDescription, isGreetingLikeRequest, isGenericRequestPhrase, modelFreeRequest, nameSearchTerms, normalizeRequestMatch, pinExplicitRequestMatch, repairRequestMatch, requestArtistMatches, requestName, requestTitleSimilarity, resolveDirectRequest } from '../music/request-match.js';
 import { canonicalLanguage } from '../music/request-normalize.js';
 import { requestWaitClause } from '../broadcast/queue/pure.js';
 import { matchedRequestLookups, matchedRequestStandIn } from '../util/request-claim.js';
@@ -237,6 +237,7 @@ function recordOutcome(entry) {
       lookupErrors: entry.lookupErrors ?? [],
       interpretationFallback: entry.interpretationFallback ?? false,
       unsupported: entry.unsupported ?? [],
+      ignoredUnsupported: entry.ignoredUnsupported ?? [],
       unmetPreferences: entry.unmetPreferences ?? [],
       provider: entry.provider ?? null,
       providerFailure: entry.providerFailure ?? null,
@@ -694,6 +695,13 @@ async function resolveRequestCore(entry: ListenerRequestEntry, signal?: AbortSig
   // Named and unquoted title-only misses remain no-match even after repair.
   const exactTitleOnlyRequest = framedTitleOnly || titleOnlyNamedRequest;
   const unsupported = directRequestUnsupported(text, matched);
+  // Labels naming no condition ("dedication") were dropped above; keep them
+  // visible to the operator.
+  const ignoredUnsupported = matched.kind === 'chat' ? [] : classifyUnsupportedLabels(matched.unsupported).ignored;
+  if (ignoredUnsupported.length) {
+    entry.ignoredUnsupported = ignoredUnsupported;
+    queue.log('request', `matcher's unsupported label(s) name no refusable condition, ignored: ${ignoredUnsupported.join(', ')}`);
+  }
   if (unsupported.length) {
     entry.path = 'cascade';
     entry.pickSource = 'unsupported';

@@ -6,6 +6,9 @@ import { useStationOrigin } from '@/lib/stationOrigin';
 import { withStreamAuth } from '@/lib/stationAuth';
 import { loadVolumePref, saveVolumePref } from '@/lib/volume';
 import { createPausedMediaUrl } from '@/lib/pausedMedia';
+import { useStationClient } from '@/lib/stationClient';
+import { SKIP_CUSHION_SECONDS } from '@/lib/idleSkip';
+import { skipIdleSilence } from '@/lib/idleSkipPlayback';
 
 // Reconnect backoff for the watchdog's error path: quick first retry, doubling to a minute.
 const RECONNECT_BASE_MS = 500;
@@ -59,11 +62,19 @@ export interface UsePlayerOptions {
   /** Whether the station is configured to serve `/stream.opus` (the setting, not a
    *  live mount probe). null/undefined = not known yet; the upgrade waits. */
   opusEnabled?: boolean | null;
+  /** The station's advertised stream.bufferSeconds (useStationFeed.bufferMs).
+   *  0/undefined = not known yet, and nothing is skipped. */
+  bufferSeconds?: number;
+  /** Told how many ms of that buffer the current connection skipped (#2072),
+   *  and 0 whenever a connection starts or ends. useStationFeed takes it as
+   *  `leadTrimMs`, so listener surfaces track this listener's real offset. */
+  onLeadTrim?: (ms: number) => void;
 }
 
 // Owns the <audio> element + tune-in state. The consumer renders the <audio> tag, so skins can tap it.
-export function usePlayer({ initialVolume = 1, opusEnabled = null }: UsePlayerOptions = {}): Player {
+export function usePlayer({ initialVolume = 1, opusEnabled = null, bufferSeconds = 0, onLeadTrim }: UsePlayerOptions = {}): Player {
   const { streams } = useStationOrigin();
+  const client = useStationClient();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const gen = useRef(0);
   const tunedInRef = useRef(false);
@@ -87,6 +98,23 @@ export function usePlayer({ initialVolume = 1, opusEnabled = null }: UsePlayerOp
     el.load();
     releasePausedMedia();
   }, [releasePausedMedia]);
+  // The skip over a woken station's stale idle silence (#2072): one run per
+  // connection, cancelled when the connection ends. The latest buffer, client
+  // and trim callback are read through refs, so play() and the watchdog's
+  // reconnect always see them.
+  const idleSkipCancel = useRef<(() => void) | null>(null);
+  const bufferSecondsRef = useRef(bufferSeconds);
+  const clientRef = useRef(client);
+  const onLeadTrimRef = useRef(onLeadTrim);
+  useEffect(() => { bufferSecondsRef.current = bufferSeconds; }, [bufferSeconds]);
+  useEffect(() => { clientRef.current = client; }, [client]);
+  useEffect(() => { onLeadTrimRef.current = onLeadTrim; }, [onLeadTrim]);
+  // Back to 1x and to the advertised offset.
+  const endIdleSkip = useCallback(() => {
+    idleSkipCancel.current?.();
+    idleSkipCancel.current = null;
+    onLeadTrimRef.current?.(0);
+  }, []);
   // audioRef.current mirrored into state so the listener effect can depend on it:
   // refs don't notify on attach, so a swapped element has to announce itself.
   const [audioEl, setAudioEl] = useState<HTMLAudioElement | null>(null);
@@ -98,13 +126,14 @@ export function usePlayer({ initialVolume = 1, opusEnabled = null }: UsePlayerOp
       ++gen.current;
       tunedInRef.current = false;
       clearWatchdog();
+      endIdleSkip();
       unloadAudio(audioRef.current);
       setPlaybackState('none');
       setStatus('idle');
     }
     audioRef.current = el;
     setAudioEl(el);
-  }, [clearWatchdog, unloadAudio]);
+  }, [clearWatchdog, endIdleSkip, unloadAudio]);
   // SSR + first render use the MP3 URL so markup agrees; the effect below upgrades to Opus.
   const [streamUrl, setStreamUrl] = useState<string>(streams.mp3);
   const [volume, setVolume] = useState(initialVolume);
@@ -129,6 +158,23 @@ export function usePlayer({ initialVolume = 1, opusEnabled = null }: UsePlayerOp
   useEffect(() => { streamUrlRef.current = streamUrl; }, [streamUrl]);
   useEffect(() => { streamsRef.current = streams; }, [streams]);
   useEffect(() => { volumeRef.current = volume; }, [volume]);
+
+  // Call right after setting a fresh src. Only the MP3 mount is sized: it is
+  // CBR, so its burst is bufferSeconds long. Opus is CBR too since #2138, but on
+  // an older broadcast image it is VBR, and idle silence costs it so few bytes
+  // that its burst reaches back past the pause into the music before it
+  // (measured). The player can't tell which it is tuned to, so an Opus listener
+  // plays it out as before.
+  const startIdleSkip = useCallback((el: HTMLAudioElement) => {
+    endIdleSkip();
+    const buffer = bufferSecondsRef.current;
+    if (streamUrlRef.current !== streamsRef.current.mp3 || !(buffer > SKIP_CUSHION_SECONDS)) return;
+    idleSkipCancel.current = skipIdleSilence(el, {
+      bufferSeconds: buffer,
+      readState: signal => clientRef.current.state({ signal }),
+      onTrim: ms => onLeadTrimRef.current?.(ms),
+    });
+  }, [endIdleSkip]);
 
   useEffect(() => {
     if (audioRef.current) audioRef.current.volume = volume;
@@ -196,6 +242,7 @@ export function usePlayer({ initialVolume = 1, opusEnabled = null }: UsePlayerOp
       }
       const myGen = ++gen.current;
       audio.src = freshStreamUrl(streamUrlRef.current, myGen);
+      startIdleSkip(audio);
       audio.volume = volumeRef.current;
       setStatus('connecting');
       const p = audio.play();
@@ -273,7 +320,7 @@ export function usePlayer({ initialVolume = 1, opusEnabled = null }: UsePlayerOp
       el.removeEventListener('timeupdate', onTimeUpdate);
       el.removeEventListener('error', onError);
     };
-  }, [audioEl, clearWatchdog, unloadAudio]);
+  }, [audioEl, clearWatchdog, startIdleSkip, unloadAudio]);
 
   // Idle cutoff (#343): a tab with no activity for IDLE_TUNE_OUT_MS is tuned out
   // so it doesn't sit on the mount as a phantom listener. Sweeps once a minute.
@@ -305,6 +352,7 @@ export function usePlayer({ initialVolume = 1, opusEnabled = null }: UsePlayerOp
     ++gen.current;
     tunedInRef.current = false;
     clearWatchdog();
+    endIdleSkip();
     setPlaybackState('none');
     setStatus('idle');
     if (audioRef.current) unloadAudio(audioRef.current);
@@ -317,6 +365,7 @@ export function usePlayer({ initialVolume = 1, opusEnabled = null }: UsePlayerOp
     ++gen.current;
     tunedInRef.current = false;
     clearWatchdog();
+    endIdleSkip();
     setPlaybackState('paused');
     setStatus('idle');
     const el = audioRef.current;
@@ -349,6 +398,7 @@ export function usePlayer({ initialVolume = 1, opusEnabled = null }: UsePlayerOp
     clearWatchdog();
     el.src = freshStreamUrl(streamUrlRef.current, myGen);
     el.load();
+    startIdleSkip(el);
     releasePausedMedia();
     el.volume = volume;
     // Commands and event handlers read this synchronously, including repeated

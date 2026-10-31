@@ -7,34 +7,45 @@ import { adminResponse } from '../../../lib/admin-query';
 import { Input } from '../../ui/input';
 import { Label } from '../../ui/label';
 import {
-  Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup,
+  Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup, SelectLabel,
 } from '../../ui/select';
-import { SETTINGS_SEARXNG_ENGINES_MAX } from '@/lib/schemas.generated';
+import {
+  SEARCH_PROVIDER_CATALOG, SEARCH_PROVIDER_GROUPS, SETTINGS_SEARCH_PROVIDERS, SETTINGS_SEARXNG_ENGINES_MAX,
+  type SearchProviderEntry, type SearchProviderGroup,
+} from '@/lib/schemas.generated';
 import { Card, Btn, Pill } from '../ui';
 import {
   SectionHeader, SaveBar, KeyStatus, KeyTestResult,
   type SectionProps,
 } from './shared';
 
-const SEARCH_PROVIDER_LABELS: Record<string, string> = {
-  duckduckgo: 'DuckDuckGo (free, no key)',
-  tavily: 'Tavily (paid web search)',
-  brave: 'Brave Search (API key, free monthly credits)',
-  searxng: 'SearXNG (self-hosted)',
-  keenable: 'Keenable (free, no key needed)',
-};
-
-// Providers that authenticate with SEARCH_API_KEY. They share the key slot —
-// the controller probes the right endpoint based on the provider we send along.
-// `optional` marks a provider that works without a key (the key raises limits).
-const KEYED_PROVIDERS: Record<string, { name: string; placeholder: string; keyUrl: string; optional?: boolean }> = {
-  tavily: { name: 'Tavily', placeholder: 'tvly-…', keyUrl: 'https://app.tavily.com/home' },
-  brave: { name: 'Brave Search', placeholder: 'BSA…', keyUrl: 'https://api-dashboard.search.brave.com/app/keys' },
-  keenable: { name: 'Keenable', placeholder: 'keen_…', keyUrl: 'https://keenable.ai/console', optional: true },
-};
+// Labels, hints and key fields come from the search catalogue
+// (controller/src/schemas/settings.ts, mirrored by gen:schemas).
+const searchProvider = (id: string | undefined): SearchProviderEntry | undefined =>
+  SEARCH_PROVIDER_CATALOG.find(p => p.id === id);
 
 const searchProviderLabel = (id: string | undefined): string =>
-  (id && SEARCH_PROVIDER_LABELS[id]) || id || '—';
+  searchProvider(id)?.label || id || '—';
+
+const SEARCH_GROUP_LABELS: Record<SearchProviderGroup, string> = {
+  keyless: 'No key needed',
+  keyed: 'Needs an API key',
+  'self-hosted': 'Self-hosted',
+};
+
+// The server's providers under their Select groups, in SEARCH_PROVIDER_GROUPS
+// order, each keeping the server's order. An id the catalogue doesn't know
+// goes last, under "Other".
+export function groupSearchProviders(ids: readonly string[]): { label: string; ids: string[] }[] {
+  const known = new Set<string>(SEARCH_PROVIDER_CATALOG.map(p => p.id));
+  return [
+    ...SEARCH_PROVIDER_GROUPS.map(group => ({
+      label: SEARCH_GROUP_LABELS[group],
+      ids: ids.filter(id => searchProvider(id)?.group === group),
+    })),
+    { label: 'Other', ids: ids.filter(id => !known.has(id)) },
+  ].filter(g => g.ids.length > 0);
+}
 
 interface SearchSectionProps extends SectionProps {
   adminFetch: (path: string, init?: RequestInit) => Promise<Response>;
@@ -81,9 +92,12 @@ export function SearchSection({ data, form, setForm, busy, saveSettings, adminFe
   });
 
   const savedSearch = data.values?.search || {};
-  const providers = data.search?.providers || ['duckduckgo', 'tavily', 'brave', 'searxng', 'keenable'];
+  const providers = data.search?.providers || [...SETTINGS_SEARCH_PROVIDERS];
   const provider = form.search.provider;
-  const keyed = KEYED_PROVIDERS[provider];
+  const entry = searchProvider(provider);
+  // Keyed providers share the SEARCH_API_KEY slot; the controller probes the
+  // right endpoint based on the provider sent along with a key test.
+  const keyed = entry && entry.key !== 'none' ? entry : undefined;
   const searchDirty = provider !== savedSearch.provider
     || (!!keyed
         && form.search.apiKey
@@ -163,36 +177,29 @@ export function SearchSection({ data, form, setForm, busy, saveSettings, adminFe
             >
               <SelectTrigger className="max-w-[360px]" aria-label="Provider"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectGroup>
-                  {providers.map(p => (
-                    <SelectItem key={p} value={p}>{searchProviderLabel(p)}</SelectItem>
-                  ))}
-                </SelectGroup>
+                {groupSearchProviders(providers).map(g => (
+                  <SelectGroup key={g.label}>
+                    <SelectLabel>{g.label}</SelectLabel>
+                    {g.ids.map(p => (
+                      <SelectItem key={p} value={p}>{searchProviderLabel(p)}</SelectItem>
+                    ))}
+                  </SelectGroup>
+                ))}
               </SelectContent>
             </Select>
-            <div className="field-hint">
-              {provider === 'duckduckgo'
-                ? 'DuckDuckGo Instant Answer, free and keyless. Useful for definitions and well-known entities; silent otherwise. The segment director treats silence as a valid outcome.'
-                : provider === 'tavily'
-                ? 'Tavily, paid web search with full results and an answer summary. Needs an API key.'
-                : provider === 'brave'
-                ? 'Brave Search API: real web + news results for artist queries. Metered billing with $5/month in free credits (~1,000 queries; a card on file is required). SUB/WAVE caches every search for 30 minutes.'
-                : provider === 'keenable'
-                ? 'Keenable web search: real web results with no signup or API key, rate limited per IP. An optional Keenable key raises the limit. SUB/WAVE caches every search for 30 minutes.'
-                : 'SearXNG, self-hosted meta-search aggregating Google, Brave, DDG and more. No API key needed, just a running SearXNG instance.'}
-            </div>
+            <div className="field-hint">{entry?.hint}</div>
           </div>
 
           {keyed && (
             <>
               <div className="field">
-                <Label>{keyed.name} API key{keyed.optional ? ' (optional)' : ''}</Label>
+                <Label>{keyed.keyName} API key{keyed.key === 'optional' ? ' (optional)' : ''}</Label>
                 <div className="flex flex-wrap items-stretch gap-2 sm:flex-nowrap">
                   <Input
                     type="password"
                     autoComplete="off"
                     value={form.search.apiKey === 'set' ? '' : form.search.apiKey}
-                    placeholder={form.search.apiKey === 'set' ? '•••••• (key on file)' : keyed.placeholder}
+                    placeholder={form.search.apiKey === 'set' ? '•••••• (key on file)' : keyed.keyPlaceholder}
                     onChange={(e: ChangeEvent<HTMLInputElement>) =>
                       setForm(f => ({ ...f, search: { ...f.search, apiKey: e.target.value } }))
                     }
@@ -210,15 +217,28 @@ export function SearchSection({ data, form, setForm, busy, saveSettings, adminFe
                   </Btn>
                 </div>
                 <div className="field-hint">
-                  {keyed.optional && <>Not needed to search; a key raises the rate limit. </>}
-                  Get one at <a href={keyed.keyUrl} target="_blank" rel="noreferrer" className="underline">{keyed.keyUrl.replace(/^https:\/\//, '')}</a>.
+                  {keyed.key === 'optional' && <>Not needed to search; a key raises the rate limit. </>}
+                  {keyed.keyPrefix && <>Only a <code>{keyed.keyPrefix}…</code> key is used: any other key on file, such as one saved for Tavily or Brave, is ignored and searches run keyless. </>}
+                  Get one at <a href={keyed.keyUrl} target="_blank" rel="noreferrer" className="underline">{keyed.keyUrl?.replace(/^https:\/\//, '')}</a>.
                   Stored alongside the other admin settings. Falls back to
                   <code> SEARCH_API_KEY</code> in <code>.env</code> when blank. Set
                   one or the other, not both.
                 </div>
               </div>
-              {/* A keyless provider isn't "missing" anything, so skip the red banner. */}
-              {(!keyed.optional || apiKeySet) && <KeyStatus envVar="SEARCH_API_KEY" present={apiKeySet} />}
+              {/* A keyless provider isn't "missing" anything, so skip the red banner,
+                  and a key on file may be another provider's, which a prefix-gated
+                  provider ignores, so "ready to use" would overclaim. */}
+              {keyed.key !== 'optional' && <KeyStatus envVar="SEARCH_API_KEY" present={apiKeySet} />}
+              {/* The controller knows whether the key Keenable would send is a keen_
+                  one. A saved key already shows in the field's placeholder, so only
+                  an env key needs saying. */}
+              {provider === 'keenable' && data.search?.keenableKeySource === 'env' && (
+                <KeyStatus
+                  envVar="SEARCH_API_KEY"
+                  present
+                  detail={<><code>SEARCH_API_KEY</code> holds a Keenable key, so searches use it and get the higher rate limit.</>}
+                />
+              )}
               {keyTest && <KeyTestResult result={keyTest} />}
             </>
           )}

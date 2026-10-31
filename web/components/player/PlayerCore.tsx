@@ -8,6 +8,7 @@ import {
   useContext,
   useMemo,
   useRef,
+  useState,
   type Dispatch,
   type ReactNode,
   type RefObject,
@@ -81,9 +82,12 @@ export function usePlayerActions(): PlayerActions {
 
 export function PlayerCoreProvider({ children }: { children: ReactNode }) {
   const client = useStationClient();
+  // How much of the buffer the player skipped on its current connection
+  // (#2072). Held here because the feed, which needs it, renders first.
+  const [leadTrimMs, setLeadTrimMs] = useState(0);
   // Feed first: usePlayer's Opus upgrade is gated on the mount the station says
   // it actually serves (#1300).
-  const feed = useStationFeed();
+  const feed = useStationFeed({ leadTrimMs });
   const {
     audioRef,
     attachAudio,
@@ -99,7 +103,7 @@ export function PlayerCoreProvider({ children }: { children: ReactNode }) {
     toggleMute,
     muted,
     idleStopped,
-  } = usePlayer({ opusEnabled: feed.opusEnabled });
+  } = usePlayer({ opusEnabled: feed.opusEnabled, bufferSeconds: feed.bufferMs / 1000, onLeadTrim: setLeadTrimMs });
 
   // Only an explicit false is offline — see PlayerAudio.offline.
   const offline = feed.streamOnline === false;
@@ -180,15 +184,15 @@ export function PlayerCoreProvider({ children }: { children: ReactNode }) {
   // into every feed consumer.
   const {
     nowPlaying, context, dj, activeShow, listeners, streamOnline,
-    llmTokens, state, session, trackStartedAt, opusEnabled, timezone, locale, leadMs,
+    llmTokens, state, session, trackStartedAt, opusEnabled, timezone, locale, leadMs, bufferMs,
   } = feed;
   const feedValue = useMemo<StationFeed>(
     () => ({
       nowPlaying, context, dj, activeShow, listeners, streamOnline,
-      llmTokens, state, session, trackStartedAt, opusEnabled, timezone, locale, leadMs,
+      llmTokens, state, session, trackStartedAt, opusEnabled, timezone, locale, leadMs, bufferMs,
     }),
     [nowPlaying, context, dj, activeShow, listeners, streamOnline,
-     llmTokens, state, session, trackStartedAt, opusEnabled, timezone, locale, leadMs],
+     llmTokens, state, session, trackStartedAt, opusEnabled, timezone, locale, leadMs, bufferMs],
   );
 
   const { latencyMs, quality } = signal;

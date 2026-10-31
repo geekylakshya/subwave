@@ -107,6 +107,7 @@ export interface ListenerRequestEntry {
   finalReason?: string | null;
   providerFailure?: string | null;
   unsupported?: string[];
+  ignoredUnsupported?: string[];
   unmetPreferences?: string[];
   lookupErrors?: string[];
   stages?: string[];
